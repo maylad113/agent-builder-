@@ -55,7 +55,7 @@ interface TableConfig {
 const TABLES: Record<string, TableConfig> = {
   businesses: {
     table: 'businesses',
-    jsonColumns: ['hours', 'services', 'faqs', 'policies'],
+    jsonColumns: ['hours', 'services', 'faqs', 'policies', 'holidays', 'allowedWidgetOrigins'],
     booleanColumns: []
   },
   agents: {
@@ -116,7 +116,7 @@ const TABLES: Record<string, TableConfig> = {
   integrations: {
     table: 'integrations',
     jsonColumns: ['configData'],
-    booleanColumns: ['connected', 'credentialsSet']
+    booleanColumns: ['credentialsSet']
   },
   templates: {
     table: 'templates',
@@ -454,6 +454,8 @@ export class AppDatabase {
       },
       communicationStyle: 'Friendly, welcoming, respectful, and direct.',
       status: 'ACTIVE',
+      holidays: [],
+      allowedWidgetOrigins: [], // empty => localhost allowed in dev (widget security)
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -713,7 +715,7 @@ Never invent prices, hours, services, or availability that do not exist in the d
         id: 'integ-1',
         businessId: 'biz-tonys-barber',
         provider: 'google_calendar',
-        connected: false,
+        state: 'NOT_CONFIGURED',
         statusMessage: 'Not configured',
         credentialsSet: false
       },
@@ -721,7 +723,7 @@ Never invent prices, hours, services, or availability that do not exist in the d
         id: 'integ-2',
         businessId: 'biz-tonys-barber',
         provider: 'meta_instagram',
-        connected: false,
+        state: 'NOT_CONFIGURED',
         statusMessage: 'Not configured',
         credentialsSet: false
       },
@@ -729,7 +731,7 @@ Never invent prices, hours, services, or availability that do not exist in the d
         id: 'integ-3',
         businessId: 'biz-tonys-barber',
         provider: 'twilio_sms',
-        connected: false,
+        state: 'NOT_CONFIGURED',
         statusMessage: 'Not configured',
         credentialsSet: false
       },
@@ -737,7 +739,7 @@ Never invent prices, hours, services, or availability that do not exist in the d
         id: 'integ-4',
         businessId: 'biz-tonys-barber',
         provider: 'voice_ai',
-        connected: false,
+        state: 'NOT_CONFIGURED',
         statusMessage: 'Not configured',
         credentialsSet: false
       }

@@ -49,58 +49,18 @@ async function retrieveKnowledgeChunks(businessId: string, query: string): Promi
   return results.map(r => `[${r.chunk.type.toUpperCase()}] ${r.chunk.title}: ${r.chunk.content}`);
 }
 
-export async function processAgentMessage(params: {
-  tenantId: string;
-  userMessage: string;
-  conversationId?: string;
-  channel?: ChannelType;
-  customerName?: string;
-  customerPhone?: string;
-  /** When set (simulator only), run against a specific DRAFT/TESTING version
-   * instead of the live PUBLISHED config. Production calls never set this. */
-  versionId?: string;
-}): Promise<RuntimeExecutionResult> {
-  const startTime = Date.now();
-  const executionId = `exec-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
-  const { tenantId, userMessage, channel = 'web_chat' } = params;
-
-  // 1. Resolve Tenant & Business Information
-  const business = db.businesses.find(b => b.id === tenantId);
-  if (!business) {
-    throw new Error(`Business not found for ID: ${tenantId}`);
-  }
-
-  // 2. Load Active Agent Configuration
-  const agent = db.agents.find(a => a.businessId === tenantId && (a.status === 'ACTIVE' || a.status === 'READY' || a.status === 'TESTING'))
-    || db.agents.find(a => a.businessId === tenantId); // Fallback to any agent for business
-
-  if (!agent) {
-    throw new Error(`No agent configured for business: ${business.name}`);
-  }
-
-  // Resolve the effective config: production uses the agent row (which mirrors
-  // the PUBLISHED version). The simulator may pass a versionId to run a
-  // DRAFT/TESTING version without touching the live agent.
-  let effectiveSystemPrompt = agent.systemPrompt;
-  let effectiveConfig = agent.structuredConfig;
-  let effectiveModel = agent.model;
-  if (params.versionId) {
-    const { getVersionForSim } = await import('./agentVersions');
-    const resolved = getVersionForSim(agent.id, params.versionId);
-    effectiveSystemPrompt = resolved.systemPrompt;
-    effectiveConfig = resolved.structuredConfig;
-    effectiveModel = resolved.model;
-  }
-
-  // 3. Resolve or Create Conversation (TENANT-SCOPED: a customer can never
-  //    load another tenant's conversation by supplying its id — the lookup
-  //    requires both id AND businessId == tenantId.)
-  let conversation = params.conversationId 
+/**
+ * Resolve or create a conversation for the incoming message. TENANT-SCOPED: a
+ * customer can never load another tenant's conversation by supplying its id —
+ * the lookup requires both id AND businessId == tenantId.
+ */
+function ensureConversation(params: { tenantId: string; conversationId?: string; customerName?: string; customerPhone?: string; }, business: { id: string; name: string; }, channel: ChannelType): import('../types').Conversation {
+  const tenantId = params.tenantId;
+  let conversation = params.conversationId
     ? db.conversations.find(c => c.id === params.conversationId && c.businessId === tenantId)
     : null;
 
   if (!conversation) {
-    // Find customer or create guest customer
     const name = params.customerName || 'Customer';
     const phone = params.customerPhone || '+1000000000';
     let customer = db.customers.find(c => c.businessId === tenantId && (c.phone === phone || c.name === name));
@@ -129,6 +89,92 @@ export async function processAgentMessage(params: {
     };
     db.conversations.push(conversation);
   }
+  return conversation;
+}
+
+export async function processAgentMessage(params: {
+  tenantId: string;
+  userMessage: string;
+  conversationId?: string;
+  channel?: ChannelType;
+  customerName?: string;
+  customerPhone?: string;
+  /** When set (simulator only), run against a specific DRAFT/TESTING version
+   * instead of the live PUBLISHED config. Production calls never set this. */
+  versionId?: string;
+  /** When true (simulator), allow DRAFT/TESTING versions. When false
+   * (production default), the runtime MUST use the PUBLISHED version only and
+   * refuses to run against a non-published agent. */
+  simulator?: boolean;
+}): Promise<RuntimeExecutionResult> {
+  const startTime = Date.now();
+  const executionId = `exec-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
+  const { tenantId, userMessage, channel = 'web_chat', simulator = !!params.versionId } = params;
+
+  // 1. Resolve Tenant & Business Information
+  const business = db.businesses.find(b => b.id === tenantId);
+  if (!business) {
+    throw new Error(`Business not found for ID: ${tenantId}`);
+  }
+
+  // 2. Load Active Agent Configuration
+  // Production conversations MUST use the PUBLISHED agent version. The simulator
+  // (simulator=true, with an optional versionId) may use DRAFT/TESTING. We never
+  // fall back to an arbitrary non-published agent in production.
+  const agent = db.agents.find(a => a.businessId === tenantId);
+
+  if (!agent) {
+    throw new Error(`No agent configured for business: ${business.name}`);
+  }
+
+  // Resolve the effective config.
+  //  - Simulator (versionId set): use that DRAFT/TESTING version's snapshot.
+  //  - Simulator (no versionId): use the PUBLISHED version (or agent row as a
+  //    last resort — the simulator is a trusted owner tool).
+  //  - Production: use the PUBLISHED version only. If none is published yet, the
+  //    agent is not live; the runtime refuses and escalates to a human rather
+  //    than serving an un-published config to a real customer.
+  let effectiveSystemPrompt = agent.systemPrompt;
+  let effectiveConfig = agent.structuredConfig;
+  let effectiveModel = agent.model;
+  if (params.versionId) {
+    const { getVersionForSim } = await import('./agentVersions');
+    const resolved = getVersionForSim(agent.id, params.versionId);
+    effectiveSystemPrompt = resolved.systemPrompt;
+    effectiveConfig = resolved.structuredConfig;
+    effectiveModel = resolved.model;
+  } else if (!simulator) {
+    // PRODUCTION path: published version only.
+    const { getPublishedVersion } = await import('./agentVersions');
+    const pub = getPublishedVersion(agent.id);
+    if (!pub) {
+      // No published version — refuse to serve customers. Return a graceful
+      // human-escalation rather than the raw agent row (which may be a draft).
+      const conv = ensureConversation(params, business, channel);
+      return {
+        reply: "I'm having trouble connecting to the assistant service right now. I've notified the team and someone will follow up with you shortly.",
+        conversationId: conv.id,
+        status: 'WAITING_FOR_HUMAN',
+        debug: {
+          systemPrompt: '',
+          retrievedKnowledge: [],
+          toolCalls: [],
+          latencyMs: Date.now() - startTime,
+          tokensUsed: 0,
+          model: effectiveModel || 'none',
+          executionId
+        }
+      };
+    }
+    effectiveSystemPrompt = pub.systemPrompt;
+    effectiveConfig = pub.structuredConfig;
+    effectiveModel = pub.model;
+  }
+
+  // 3. Resolve or Create Conversation (TENANT-SCOPED: a customer can never
+  //    load another tenant's conversation by supplying its id — the lookup
+  //    requires both id AND businessId == tenantId.)
+  const conversation = ensureConversation(params, business, channel);
 
   // HUMAN HANDOFF GUARD: when a human team member has taken over (HUMAN_HANDLING)
   // or the conversation is resolved, the AI must NOT autonomously answer. The

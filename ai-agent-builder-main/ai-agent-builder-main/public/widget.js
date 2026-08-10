@@ -236,9 +236,9 @@
     messagesDiv.scrollTop = messagesDiv.scrollHeight;
 
     try {
-      const res = await fetch(apiOrigin + '/api/runtime/chat', {
+      const res = await fetch(apiOrigin + '/api/runtime/chat?business=' + encodeURIComponent(businessId), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'x-business-id': businessId },
         body: JSON.stringify({
           tenantId: businessId,
           userMessage: text,

@@ -32,12 +32,20 @@ function makeApp() {
 
 const app = makeApp();
 
+const EXTERNAL_ORIGIN = 'https://business.example';
+
 beforeAll(async () => {
-  // ensure a business exists for the widget to address
+  // A business must allow-list the origins permitted to embed its widget
+  // (P1.2). The seed business has an empty list; configure it so the external
+  // origin used by these tests is allowed. This mirrors the real production
+  // flow: the operator sets allowedWidgetOrigins before embedding the widget.
+  const biz = db.businesses.find(b => b.id === 'biz-tonys-barber');
+  if (biz) {
+    biz.allowedWidgetOrigins = [EXTERNAL_ORIGIN, 'http://localhost:5173'];
+    db.businesses.update(biz);
+  }
 });
 afterAll(() => { db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
-
-const EXTERNAL_ORIGIN = 'https://business.example';
 
 describe('widget cross-origin (Phase 17)', () => {
   it('reflects the request Origin and allows cross-origin POST', async () => {
@@ -52,7 +60,7 @@ describe('widget cross-origin (Phase 17)', () => {
   });
 
   it('handles OPTIONS preflight with 204 and CORS headers', async () => {
-    const res = await request(app).options('/api/runtime/chat').set('Origin', EXTERNAL_ORIGIN);
+    const res = await request(app).options('/api/runtime/chat?business=biz-tonys-barber').set('Origin', EXTERNAL_ORIGIN);
     expect(res.status).toBe(204);
     expect(res.headers['access-control-allow-origin']).toBe(EXTERNAL_ORIGIN);
     expect(res.headers['access-control-allow-methods']).toMatch(/POST/);

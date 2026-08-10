@@ -2,11 +2,18 @@
 
 Persistent memory for this repository. Read first when working on this project.
 
-## Current state (2026-08-10)
-- 68 tests across 12 files, all passing. `npx tsc --noEmit` clean, `npm run build` clean.
-- Production server verified: `node dist/server.cjs` applies 5 migrations, health/SPA/widget.js all 200.
-- Phases implemented/verified: 1 (preserve), 2 (SQLite+pgvector-path documented), 3 (auth+IDOR), 4 (agent versions), 5 (runtime), 6 (RAG), 7 (fact-safe agent generation, NEEDS_INPUT), 8 (tools), 9 (appt overlap race), 10 (order oversell race), 17 (widget cross-origin CORS), 18 (human handoff), 19 (provider usage metadata), 20 (readiness gate), 22 (request-id/rate-limit/secure-headers), 23 (prod build), 31 (security audit), 32 (env docs).
-- Phases BLOCKED on external credentials: 13 (Google Calendar), 14 (Meta/Instagram), 15 (Twilio), 16 (Voice). Provider interfaces + NOT_CONFIGURED status exist; real provider code + official-API validation needs the corresponding credentials. Missing these does NOT break startup (verified by tests/noOptionalEnv.test.ts).
+## Current state (2026-08-10, hardening pass)
+- **75 tests across 14 files, all passing.** `npx tsc --noEmit` clean, `npm run build` clean.
+- Migration count is now **6** (added `006_integration_states_widget_origins.sql`).
+- Production server verified: `node dist/server.cjs` applies 6 migrations, health/SPA/widget.js all 200, widget chat from disallowed origin returns 403, integration validate with bogus creds returns ERROR (live Google API probe).
+- Hardening pass completed:
+  - **P1.1 Integration lifecycle**: `src/server/integrations.ts` defines `IntegrationProvider` (Google/Meta/Twilio/Voice) with real API-probe `validate()`. `IntegrationConfig.state` replaces the old `connected` boolean (NOT_CONFIGURED/CONFIGURING/CONNECTED/ERROR/DISCONNECTED). The PUT route no longer accepts `state`/`connected` from the client; the ONLY path to CONNECTED is POST `/:id/credentials` + POST `/:id/validate`. Credentials are server-side only (never in the DB row or API response).
+  - **P1.2 Widget origin enforcement**: `src/server/widgetSecurity.ts`. `/runtime/chat` OPTIONS+POST enforce `business.allowedWidgetOrigins`. Widget sends `?business=` query + `x-business-id` header so the preflight can resolve the tenant.
+  - **P1.3 Published-version enforcement**: `agentRuntime.processAgentMessage` adds a `simulator` flag; production path uses `getPublishedVersion()` ONLY and escalates to a human (never serves a draft) when no version is published. The old `ACTIVE||READY||TESTING` fallback-to-any-agent is removed.
+  - **P1.4 Order transaction rollback**: `tools.ts` order creation now THROWS inside `db.sqlite.transaction()` (only a throw rolls back in better-sqlite3); caught outside and returned as a failure. Failed multi-item orders leave inventory unchanged (no partial deduction).
+  - **P2 Session cookie**: `secure` flag is now `process.env.NODE_ENV === 'production'`.
+  - **Mass-assignment**: PUT `/businesses/:id` uses an allowlist (never `Object.assign`); supports new `holidays` + `allowedWidgetOrigins`.
+- Phases BLOCKED on external credentials: 13 (Google Calendar), 14 (Meta/Instagram), 15 (Twilio), 16 (Voice). The provider interfaces + real official-API validation code now EXIST (Phase 11/P1.1); a missing optional credential leaves the integration NOT_CONFIGURED and does NOT break startup (verified by tests/noOptionalEnv.test.ts). To fully connect, supply the matching env vars / OAuth tokens via the credentials endpoint.
 
 ## Stack
 - TypeScript + Vite (frontend React 19) + Express (backend) in one process.
@@ -30,6 +37,8 @@ Persistent memory for this repository. Read first when working on this project.
 - `src/server/security.ts` — `requestId`, `rateLimit`, `secureHeaders` (Phase 22).
 - `src/server/agentVersions.ts` — DRAFT/TESTING/PUBLISHED/ARCHIVED lifecycle.
 - `src/server/embeddings.ts` — RAG embeddings (Gemini) + keyword fallback.
+- `src/server/integrations.ts` — `IntegrationProvider` abstraction (Google/Meta/Twilio/Voice) + credential store (server-side only) + `runValidation` (only path to CONNECTED).
+- `src/server/widgetSecurity.ts` — per-business widget origin allow-list + CORS header builder.
 - `public/widget.js` — embeddable chat widget; derives `apiOrigin` from script src for cross-origin embedding.
 
 ## Required vs optional env vars (see .env.example)

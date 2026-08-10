@@ -90,7 +90,7 @@ export function setSessionCookie(res: Response, sessionId: string): void {
   res.cookie(SESSION_COOKIE, value, {
     httpOnly: true,
     sameSite: 'lax',
-    secure: false, // HTTP localhost dev; set true behind HTTPS
+    secure: process.env.NODE_ENV === 'production', // HTTPS-only in production
     path: '/',
     maxAge: SESSION_TTL_MS
   });

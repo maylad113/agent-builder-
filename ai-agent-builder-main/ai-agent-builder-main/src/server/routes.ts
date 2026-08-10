@@ -10,6 +10,10 @@ import {
 import { indexChunk, removeEmbedding } from './embeddings';
 import { assertActivatable, readinessSnapshot } from './readiness';
 import { rateLimit, RATE_LIMITS } from './security';
+import {
+  getProvider, runValidation, storeCredentials, getCredentials, clearCredentials
+} from './integrations';
+import { widgetCorsHeaders } from './widgetSecurity';
 import { Business, Agent, KnowledgeChunk, Product, Appointment, Order, User, Conversation, AgentVersion } from '../types';
 import { verifyPassword } from './passwords';
 import {
@@ -200,7 +204,7 @@ router.post('/businesses', requireAuth, requireRole('PLATFORM_OWNER'), (req: Req
       id: `integ-${Date.now()}-${prov}`,
       businessId: newBiz.id,
       provider: prov,
-      connected: false,
+      state: 'NOT_CONFIGURED',
       statusMessage: 'Not configured',
       credentialsSet: false
     });
@@ -234,7 +238,30 @@ router.put(
   requireResourceAccess(req => db.businesses.find(b => b.id === req.params.id), b => (b as Business).id),
   (req: Request, res: Response) => {
     const biz = res.locals.resource as Business;
-    Object.assign(biz, req.body, { updatedAt: new Date().toISOString() });
+    // Allowlist only the updatable fields. Never trust `id`, `createdAt`, or
+    // arbitrary keys from the frontend (prevents mass-assignment).
+    const {
+      name, type, description, location, language, currency, timezone,
+      hours, services, pricingNotes, faqs, policies, communicationStyle, status,
+      holidays, allowedWidgetOrigins
+    } = req.body || {};
+    if (typeof name === 'string') biz.name = name;
+    if (type) biz.type = type;
+    if (typeof description === 'string') biz.description = description;
+    if (typeof location === 'string') biz.location = location;
+    if (language) biz.language = language;
+    if (typeof currency === 'string') biz.currency = currency;
+    if (typeof timezone === 'string') biz.timezone = timezone;
+    if (Array.isArray(hours)) biz.hours = hours;
+    if (Array.isArray(services)) biz.services = services;
+    if (typeof pricingNotes === 'string') biz.pricingNotes = pricingNotes;
+    if (Array.isArray(faqs)) biz.faqs = faqs;
+    if (policies && typeof policies === 'object') biz.policies = policies;
+    if (typeof communicationStyle === 'string') biz.communicationStyle = communicationStyle;
+    if (status) biz.status = status;
+    if (Array.isArray(holidays)) biz.holidays = holidays;
+    if (Array.isArray(allowedWidgetOrigins)) biz.allowedWidgetOrigins = allowedWidgetOrigins;
+    biz.updatedAt = new Date().toISOString();
     db.businesses.update(biz);
     res.json(biz);
   }
@@ -626,31 +653,37 @@ router.post(
 // tool calls, latency) which is developer-only and must not leak to customers.
 // The runtime itself is tenant-scoped and never trusts a frontend-supplied
 // conversation id across tenants.
-// OPTIONS preflight for the cross-origin widget (Phase 17).
+// OPTIONS preflight for the cross-origin widget. Origin is enforced per-business
+// (P1.2): only origins in the target business's allowedWidgetOrigins are allowed;
+// unknown origins receive 403.
 router.options('/runtime/chat', (req: Request, res: Response) => {
+  // The browser preflight cannot send the custom x-business-id value (preflight
+  // only lists header names). Resolve the tenant from the `business` query param
+  // the widget appends, then enforce the per-business origin allow-list.
+  const tenantId = (req.query.business as string) || (req.headers['x-business-id'] as string) || undefined;
   const origin = req.headers.origin;
-  if (origin) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  const headers = tenantId ? widgetCorsHeaders(tenantId, origin) : null;
+  if (!headers) {
+    return res.status(403).end();
   }
+  for (const [k, v] of Object.entries(headers)) res.setHeader(k, String(v));
   return res.status(204).end();
 });
 
 router.post('/runtime/chat', rateLimit({ ...RATE_LIMITS.public, prefix: 'chat' }), (req: Request, res: Response, next: NextFunction) => {
-  // CORS for the embeddable widget (Phase 17): the widget loads on external
-  // business websites (different origin) and POSTs to this endpoint. We allow
-  // any origin because tenancy is enforced by tenantId, not by origin, and
-  // rate limiting + payload limits provide abuse protection. Only the public
-  // chat endpoint is exposed cross-origin; authenticated dashboard routes are
-  // not.
+  // Per-business origin enforcement (P1.2): the widget may only POST from an
+  // origin the business explicitly allow-listed. This prevents cross-tenant
+  // impersonation and arbitrary-origin abuse. Tenancy is still enforced by
+  // tenantId inside the runtime; origin is an additional layer.
+  const { tenantId } = req.body || {};
   const origin = req.headers.origin;
-  if (origin) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  const headers = tenantId ? widgetCorsHeaders(tenantId, origin) : null;
+  if (origin && !headers) {
+    // Unknown origin: reject. Don't reflect the origin.
+    return res.status(403).json({ error: 'Origin not allowed.' });
+  }
+  if (headers) {
+    for (const [k, v] of Object.entries(headers)) res.setHeader(k, String(v));
   }
   if (req.method === 'OPTIONS') {
     return res.status(204).end();
@@ -718,7 +751,8 @@ router.post(
         channel: channel || 'web_chat',
         customerName,
         customerPhone,
-        versionId
+        versionId,
+        simulator: true
       });
       res.json(result);
     } catch (err: any) {
@@ -1046,33 +1080,122 @@ router.put(
 router.get('/integrations', requireAuth, requireTenantScope, (req: Request, res: Response) => {
   const businessId = res.locals.businessId as string | null;
   const items = businessId ? db.integrations.filter(i => i.businessId === businessId) : db.integrations.toJSON();
-  res.json(items);
+  // Never leak credentials. configData holds only non-secret config.
+  res.json(items.map(({ ...i }) => i));
 });
 
+/**
+ * Update an integration's NON-SECRET configData only.
+ * CRITICAL: this route NEVER accepts `state`/`connected`/`credentialsSet` from
+ * the frontend. State transitions to CONNECTED only via POST /:id/validate,
+ * which runs the real provider validation. Credentials are stored server-side
+ * via the /:id/credentials route and never persisted to configData.
+ */
 router.put(
   '/integrations/:id',
   requireAuth,
   requireResourceAccess(req => db.integrations.find(i => i.id === req.params.id)),
   (req: Request, res: Response) => {
     const integ = res.locals.resource as any;
+    const { configData } = req.body;
+    // Only non-secret configData is accepted; never `state`/`connected`.
+    if (configData && typeof configData === 'object' && !Array.isArray(configData)) {
+      integ.configData = { ...integ.configData, ...configData };
+    }
+    integ.updatedAt = new Date().toISOString();
+    db.integrations.update(integ);
+    res.json(integ);
+  }
+);
 
-    const { connected, statusMessage, credentialsSet, configData } = req.body;
-    if (typeof connected === 'boolean') integ.connected = connected;
-    if (statusMessage) integ.statusMessage = statusMessage;
-    if (typeof credentialsSet === 'boolean') integ.credentialsSet = credentialsSet;
-    if (configData) integ.configData = configData;
-    integ.lastSync = new Date().toISOString();
+/**
+ * Submit credentials for an integration (server-side only). Stores them in
+ * process memory (never in the DB row, never returned to the client) and marks
+ * the integration CONFIGURING. Does NOT set CONNECTED — that requires /validate.
+ */
+router.post(
+  '/integrations/:id/credentials',
+  requireAuth,
+  requireResourceAccess(req => db.integrations.find(i => i.id === req.params.id)),
+  (req: Request, res: Response) => {
+    const integ = res.locals.resource as any;
+    const credentials = req.body?.credentials;
+    if (!credentials || typeof credentials !== 'object' || Array.isArray(credentials)) {
+      return res.status(400).json({ error: 'credentials object is required.' });
+    }
+    storeCredentials(integ.id, credentials);
+    integ.credentialsSet = true;
+    integ.state = 'CONFIGURING';
+    integ.lastError = undefined;
+    integ.statusMessage = 'Credentials received — pending validation.';
+    integ.updatedAt = new Date().toISOString();
     db.integrations.update(integ);
 
     db.auditLogs.push({
       id: `log-${Date.now()}`,
       businessId: integ.businessId,
-      action: 'INTEGRATION_UPDATED',
-      details: `Integration ${integ.provider} set to ${integ.connected ? 'Configured/Connected' : 'Not configured'}.`,
+      action: 'INTEGRATION_CREDENTIALS_SET',
+      details: `Credentials submitted for ${integ.provider}. Validation required to connect.`,
       timestamp: new Date().toISOString()
     });
 
-    res.json(integ);
+    res.json({ id: integ.id, state: integ.state, statusMessage: integ.statusMessage });
+  }
+);
+
+/**
+ * Validate an integration against the real provider. This is the ONLY path to
+ * CONNECTED. The provider's validate() must succeed; otherwise state=ERROR.
+ */
+router.post(
+  '/integrations/:id/validate',
+  requireAuth,
+  requireResourceAccess(req => db.integrations.find(i => i.id === req.params.id)),
+  async (req: Request, res: Response) => {
+    const integ = res.locals.resource as any;
+    const provider = getProvider(integ.provider);
+    const credentials = getCredentials(integ.id) || {};
+    if (!integ.credentialsSet && Object.keys(credentials).length === 0) {
+      return res.status(400).json({ error: 'No credentials stored. Submit credentials first.' });
+    }
+    const outcome = await runValidation(provider, integ.id, integ.configData, credentials);
+    integ.state = outcome.state;
+    integ.statusMessage = outcome.statusMessage;
+    integ.lastError = outcome.lastError;
+    integ.lastValidatedAt = new Date().toISOString();
+    if (outcome.meta && Object.keys(outcome.meta).length) {
+      integ.configData = { ...(integ.configData || {}), ...outcome.meta };
+    }
+    if (outcome.state === 'CONNECTED') integ.lastSync = new Date().toISOString();
+    db.integrations.update(integ);
+
+    db.auditLogs.push({
+      id: `log-${Date.now()}`,
+      businessId: integ.businessId,
+      action: outcome.state === 'CONNECTED' ? 'INTEGRATION_CONNECTED' : 'INTEGRATION_VALIDATION_FAILED',
+      details: `Integration ${integ.provider} validation: ${outcome.statusMessage}`,
+      timestamp: new Date().toISOString()
+    });
+
+    res.json({ id: integ.id, state: integ.state, statusMessage: integ.statusMessage, lastError: integ.lastError });
+  }
+);
+
+/** Disconnect an integration (clears stored credentials, state=DISCONNECTED). */
+router.post(
+  '/integrations/:id/disconnect',
+  requireAuth,
+  requireResourceAccess(req => db.integrations.find(i => i.id === req.params.id)),
+  (req: Request, res: Response) => {
+    const integ = res.locals.resource as any;
+    clearCredentials(integ.id);
+    integ.credentialsSet = false;
+    integ.state = 'DISCONNECTED';
+    integ.statusMessage = 'Disconnected by operator.';
+    integ.lastError = undefined;
+    integ.updatedAt = new Date().toISOString();
+    db.integrations.update(integ);
+    res.json({ id: integ.id, state: integ.state, statusMessage: integ.statusMessage });
   }
 );
 

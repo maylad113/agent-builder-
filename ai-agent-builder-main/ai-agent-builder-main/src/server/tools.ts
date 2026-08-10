@@ -581,26 +581,35 @@ export async function executeAgentTool(
         const orderId = `ord-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
         const nowIso = new Date().toISOString();
 
-        const orderTxn = db.sqlite.transaction((): { ok: true; order: any; totalAmount: number; orderItems: any[] } | { ok: false; error: string } => {
+        // The transaction THROWS on any failure so better-sqlite3 rolls back
+        // EVERY mutation made inside it (inventory decrements, customer create,
+        // order insert). Returning a failure value does NOT roll back — only a
+        // thrown exception triggers ROLLBACK. This guarantees a failed multi-
+        // item order leaves inventory completely unchanged (no partial deduction).
+        class OrderTxnError extends Error {
+          constructor(public error: string) { super(error); this.name = 'OrderTxnError'; }
+        }
+
+        const runOrderTxn = db.sqlite.transaction((): { order: any; totalAmount: number; orderItems: any[] } => {
           const orderItems: Array<{ productId: string; productName: string; quantity: number; price: number }> = [];
           let totalAmount = 0;
 
-          // Re-read each product inside the transaction and verify stock with a
-          // row-level lock-equivalent: better-sqlite3 is synchronous so the
-          // transaction serializes these writes. Check + decrement are atomic,
-          // preventing two concurrent orders from overselling the same stock.
+          // Re-read each product inside the transaction and verify stock.
+          // better-sqlite3 is synchronous so the transaction serializes these
+          // writes — check + decrement are atomic, preventing two concurrent
+          // orders from overselling the same stock.
           for (const item of items) {
             const product = db.products.find(p => p.businessId === tenantId && p.id === item.productId);
             if (!product) {
-              return { ok: false, error: `Product ID ${item.productId} not found.` };
+              throw new OrderTxnError(`Product ID ${item.productId} not found.`);
             }
             if (product.inventory < item.quantity) {
-              return { ok: false, error: `Insufficient stock for ${product.name}. Available: ${product.inventory}, Requested: ${item.quantity}` };
+              throw new OrderTxnError(`Insufficient stock for ${product.name}. Available: ${product.inventory}, Requested: ${item.quantity}`);
             }
-            // Never allow negative inventory.
             product.inventory -= item.quantity;
+            // Guard against negative inventory even if the check above raced.
             if (product.inventory < 0) {
-              return { ok: false, error: `Insufficient stock for ${product.name}.` };
+              throw new OrderTxnError(`Insufficient stock for ${product.name}.`);
             }
             db.products.update(product);
 
@@ -633,13 +642,17 @@ export async function executeAgentTool(
           };
           db.orders.push(newOrder);
 
-          return { ok: true, order: newOrder, totalAmount, orderItems };
+          return { order: newOrder, totalAmount, orderItems };
         });
 
-        const result = orderTxn();
-
-        if (isFail(result)) {
-          return { success: false, error: result.error };
+        let result: { order: any; totalAmount: number; orderItems: any[] };
+        try {
+          result = runOrderTxn();
+        } catch (e) {
+          if (e instanceof OrderTxnError) {
+            return { success: false, error: e.error };
+          }
+          throw e; // unexpected — let the runtime's error handling deal with it
         }
 
         return {
