@@ -1,0 +1,6 @@
+{
+  "name": "AI Agent Factory",
+  "description": "Multi-tenant SaaS platform to create, configure, test, deploy, and manage AI business agents for local businesses.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
