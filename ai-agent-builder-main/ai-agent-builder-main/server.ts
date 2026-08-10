@@ -2,9 +2,11 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
+import http from 'http';
 import { router as apiRouter } from './src/server/routes';
 import { webhookRouter } from './src/server/webhooks';
 import { requestId, rateLimit, secureHeaders, RATE_LIMITS } from './src/server/security';
+import { db } from './src/server/db';
 
 // Resolve the project root in both run modes:
 //  - dev (`tsx server.ts`): executed as ESM, so import.meta.url points at this file.
@@ -75,9 +77,28 @@ async function startServer() {
     res.status(status).json({ error: message });
   });
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 AI Agent Factory SaaS Server listening on http://0.0.0.0:${PORT}`);
   });
+
+  // Graceful shutdown: stop accepting new connections, drain in-flight, close
+  // the SQLite handle (WAL checkpoint) so no data is lost on container restart.
+  let shuttingDown = false;
+  const shutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n[server] ${signal} received, shutting down gracefully...`);
+    server.close((err) => {
+      if (err) console.error('[server] error closing HTTP server:', err);
+      try { db.close(); } catch (e) { console.error('[server] error closing DB:', e); }
+      console.log('[server] shutdown complete.');
+      process.exit(err ? 1 : 0);
+    });
+    // Hard exit if drain stalls (e.g. a hung connection) so orchestrators can recycle.
+    setTimeout(() => { console.error('[server] forced exit after shutdown timeout.'); process.exit(1); }, 10_000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 startServer().catch(err => {

@@ -108,3 +108,47 @@ describe('widget Origin-header bypass (production)', () => {
     }
   });
 });
+
+describe('product input validation', () => {
+  it('rejects a product with a negative price', async () => {
+    const r = await owner.post('/api/products').send({ businessId: bizBId, name: 'Bad', price: -5, inventory: 1 });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/price/i);
+  });
+
+  it('rejects a product with negative inventory', async () => {
+    const r = await owner.post('/api/products').send({ businessId: bizBId, name: 'Bad2', price: 10, inventory: -3 });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/inventory/i);
+  });
+
+  it('rejects a product with no name', async () => {
+    const r = await owner.post('/api/products').send({ businessId: bizBId, price: 10, inventory: 1 });
+    expect(r.status).toBe(400);
+  });
+
+  it('accepts a valid product and audits it', async () => {
+    const r = await owner.post('/api/products').send({ businessId: bizBId, name: 'Valid Product', price: 199, inventory: 50 });
+    expect(r.status).toBe(201);
+    expect(r.body.price).toBe(199);
+    expect(r.body.inventory).toBe(50);
+    const audited = db.auditLogs.find(l => l.action === 'PRODUCT_CREATED' && l.businessId === bizBId);
+    expect(audited).toBeTruthy();
+  });
+});
+
+describe('templates endpoint requires authentication', () => {
+  it('returns 401 without a session cookie', async () => {
+    const r = await request(app).get('/api/templates');
+    expect(r.status).toBe(401);
+  });
+});
+
+describe('health endpoint reports DB connectivity', () => {
+  it('returns 200 and db:connected when the DB is reachable', async () => {
+    const r = await request(app).get('/api/health');
+    expect(r.status).toBe(200);
+    expect(r.body.db).toBe('connected');
+    expect(r.body.status).toBe('ok');
+  });
+});

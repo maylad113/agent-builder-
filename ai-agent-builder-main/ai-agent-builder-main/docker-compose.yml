@@ -1,0 +1,38 @@
+services:
+  agentfactory:
+    build: .
+    image: ai-agent-factory:latest
+    container_name: agentfactory
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # REQUIRED — generate once: openssl rand -hex 32
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET must be set}
+      NODE_ENV: production
+      PORT: "3000"
+      DB_PATH: /app/data/agentfactory.db
+      # Optional — uncomment/add the integrations you use
+      # GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      # GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      # GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      # GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-}
+      # META_APP_ID: ${META_APP_ID:-}
+      # META_APP_SECRET: ${META_APP_SECRET:-}
+      # META_VERIFY_TOKEN: ${META_VERIFY_TOKEN:-}
+      # TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      # TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      # TWILIO_PHONE_NUMBER: ${TWILIO_PHONE_NUMBER:-}
+      # VOICE_AI_API_KEY: ${VOICE_AI_API_KEY:-}
+      # VOICE_AI_ENDPOINT: ${VOICE_AI_ENDPOINT:-}
+    volumes:
+      - agentfactory-data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/api/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  agentfactory-data:

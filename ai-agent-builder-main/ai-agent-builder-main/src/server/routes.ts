@@ -58,7 +58,20 @@ function paginate<T>(items: T[], req: Request, res: Response): T[] {
 
 // Health Check (public)
 router.get('/health', (req: Request, res: Response) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  // Lightweight DB liveness probe so a load-balancer/healthcheck can detect a
+  // wedged database, not just a live process.
+  let dbOk = false;
+  try {
+    db.sqlite.prepare('SELECT 1').get();
+    dbOk = true;
+  } catch {
+    dbOk = false;
+  }
+  res.status(dbOk ? 200 : 503).json({
+    status: dbOk ? 'ok' : 'degraded',
+    db: dbOk ? 'connected' : 'unreachable',
+    timestamp: new Date().toISOString()
+  });
 });
 
 // =========================================
@@ -78,7 +91,7 @@ router.get('/auth/me', (req: Request, res: Response) => {
 // sets the signed HttpOnly cookie. A missing SESSION_SECRET in production is
 // reported as a clear JSON 500 (not an HTML crash page) so operators can
 // diagnose it without the app becoming unresponsive.
-router.post('/auth/login', (req: Request, res: Response) => {
+router.post('/auth/login', rateLimit({ ...RATE_LIMITS.auth, max: 10, prefix: 'login' }), (req: Request, res: Response) => {
   const { email, password } = req.body ?? {};
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required.' });
@@ -347,6 +360,8 @@ router.post('/businesses/:id/duplicate', requireAuth, requireRole('PLATFORM_OWNE
     clonedChunk.businessId = newBizId;
     clonedChunk.createdAt = new Date().toISOString();
     db.knowledgeChunks.push(clonedChunk);
+    // Re-index under the new chunk id so RAG retrieval works for the clone.
+    indexChunk(clonedChunk).catch(() => {/* non-fatal: keyword fallback still works */});
   });
 
   // Clone Products
@@ -944,17 +959,36 @@ router.get('/products', requireAuth, requireTenantScope, (req: Request, res: Res
 router.post('/products', requireAuth, requireTenantScope, (req: Request, res: Response) => {
   const { name, sku, price, inventory, description, category } = req.body;
   const businessId = res.locals.businessId as string | null;
+  if (!businessId) return res.status(400).json({ error: 'Invalid businessId.' });
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return res.status(400).json({ error: 'Product name is required.' });
+  }
+  const priceNum = Number(price);
+  const inventoryNum = Number(inventory);
+  if (!Number.isFinite(priceNum) || priceNum < 0) {
+    return res.status(400).json({ error: 'price must be a non-negative number.' });
+  }
+  if (!Number.isFinite(inventoryNum) || inventoryNum < 0) {
+    return res.status(400).json({ error: 'inventory must be a non-negative number.' });
+  }
   const prod: Product = {
     id: `prod-${Date.now()}`,
     businessId,
-    name,
-    sku: sku || `SKU-${Date.now()}`,
-    price: Number(price) || 0,
-    inventory: Number(inventory) || 0,
-    description: description || '',
-    category: category || 'General'
+    name: String(name).slice(0, 200),
+    sku: sku ? String(sku).slice(0, 100) : `SKU-${Date.now()}`,
+    price: priceNum,
+    inventory: Math.floor(inventoryNum),
+    description: typeof description === 'string' ? description.slice(0, 2000) : '',
+    category: category ? String(category).slice(0, 100) : 'General'
   };
   db.products.push(prod);
+  db.auditLogs.push({
+    id: `log-${Date.now()}`,
+    businessId,
+    action: 'PRODUCT_CREATED',
+    details: `Product "${prod.name}" created (SKU ${prod.sku}, inventory ${prod.inventory}).`,
+    timestamp: new Date().toISOString()
+  });
   res.status(201).json(prod);
 });
 
@@ -1274,8 +1308,8 @@ router.get('/analytics/overview', requireAuth, requireRole('PLATFORM_OWNER'), (r
   });
 });
 
-// Global UI data (industry templates) — non-sensitive, left public.
-router.get('/templates', (req: Request, res: Response) => {
+// Global UI data (industry templates) — authenticated users only.
+router.get('/templates', requireAuth, (req: Request, res: Response) => {
   res.json(db.templates);
 });
 
