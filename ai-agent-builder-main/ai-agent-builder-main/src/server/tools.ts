@@ -7,6 +7,42 @@ export interface ToolContext {
   channel?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Time helpers (HH:MM strings). Pure functions, no I/O.
+// ---------------------------------------------------------------------------
+
+/** "14:30" -> minutes since midnight (870). Tolerant of missing minutes. */
+function timeToMinutes(t: string): number {
+  const [h, m] = String(t || '').split(':').map(n => parseInt(n, 10) || 0);
+  return h * 60 + m;
+}
+
+/** minutes since midnight -> "HH:MM" (zero-padded). */
+function minutesToTime(min: number): string {
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
+}
+
+/** Add a duration in minutes to a HH:MM start time -> HH:MM end time. */
+function addMinutes(start: string, durationMinutes: number): string {
+  return minutesToTime(timeToMinutes(start) + Math.max(1, durationMinutes));
+}
+
+/**
+ * Do two [start, end) intervals overlap? Used for appointment overlap
+ * detection. Adjacent appointments (one ends exactly when the other starts) do
+ * NOT overlap, so back-to-back bookings are allowed.
+ */
+function intervalsOverlap(aStart: string, aEnd: string, bStart: string, bEnd: string): boolean {
+  return timeToMinutes(aStart) < timeToMinutes(bEnd) && timeToMinutes(bStart) < timeToMinutes(aEnd);
+}
+
+/** Type guard: narrow a transaction result to its failure branch. */
+function isFail<T>(r: { ok: true } | { ok: false; error: string } | T): r is { ok: false; error: string } {
+  return typeof r === 'object' && r !== null && (r as any).ok === false;
+}
+
 // Gemini Function Declarations Schema for tool calling
 export const agentToolDeclarations: FunctionDeclaration[] = [
   {
@@ -287,79 +323,102 @@ export async function executeAgentTool(
       case 'book_appointment': {
         const { customerName, customerPhone, serviceIdOrName, date, startTime, notes } = args;
 
-        // Service resolution
-        const service = business.services.find(s => 
-          s.id === serviceIdOrName || 
+        if (!customerName || !customerPhone || !serviceIdOrName || !date || !startTime) {
+          return { success: false, error: 'customerName, customerPhone, serviceIdOrName, date and startTime are required to book.' };
+        }
+
+        // Service resolution (NO fabrication: if no service matches, fail honestly).
+        const service = business.services.find(s =>
+          s.id === serviceIdOrName ||
+          s.name.toLowerCase() === String(serviceIdOrName).toLowerCase() ||
           s.name.toLowerCase().includes(String(serviceIdOrName).toLowerCase())
-        ) || business.services[0]; // fallback to primary service if match ambiguous
-
-        // Check if slot is already occupied
-        const existing = db.appointments.find(a => 
-          a.businessId === tenantId && 
-          a.date === date && 
-          a.startTime === startTime && 
-          a.status !== 'CANCELLED'
         );
-
-        if (existing) {
-          return {
-            success: false,
-            error: `The slot at ${startTime} on ${date} is already booked. Please choose another time slot using check_availability.`
-          };
+        if (!service) {
+          return { success: false, error: `Service "${serviceIdOrName}" was not found. Available services: ${business.services.map(s => s.name).join(', ') || 'none'}.` };
         }
 
-        // Find or create customer
-        let customer = db.customers.find(c => c.businessId === tenantId && c.phone === customerPhone);
-        if (!customer) {
-          customer = {
-            id: `cust-${Date.now()}`,
+        const duration = Math.max(1, service.durationMinutes || 30);
+        const endTime = addMinutes(startTime, duration);
+
+        // Validate the slot falls within business hours for that day.
+        const dateObj = new Date(`${date}T00:00:00Z`);
+        const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+        const dayName = dayNames[dateObj.getUTCDay()];
+        const dayHours = business.hours.find(h => h.day === dayName);
+        if (!dayHours || !dayHours.isOpen) {
+          return { success: false, error: `The business is closed on ${dayName}. Cannot book for ${date}.` };
+        }
+        if (timeToMinutes(startTime) < timeToMinutes(dayHours.openTime) || timeToMinutes(endTime) > timeToMinutes(dayHours.closeTime)) {
+          return { success: false, error: `Requested time ${startTime}-${endTime} is outside opening hours (${dayHours.openTime}-${dayHours.closeTime}) on ${dayName}.` };
+        }
+
+        // TRANSACTIONAL booking with overlap prevention. The overlap check and
+        // the INSERT run inside one SQLite transaction. better-sqlite3 is
+        // synchronous and serializes writes, so the transaction makes the
+        // check-then-insert atomic: two concurrent bookings for an overlapping
+        // slot cannot both succeed — the second sees the first's row.
+        const appointmentId = `app-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+        const customerId = `cust-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+        const nowIso = new Date().toISOString();
+
+        const bookTxn = db.sqlite.transaction((): { ok: true; appointment: any } | { ok: false; error: string } => {
+          // Re-check for an overlapping (not just identical) non-cancelled
+          // appointment for this tenant on this date. Back-to-back (adjacent)
+          // appointments are allowed; true overlaps are rejected.
+          const overlapping = db.appointments.filter(
+            a => a.businessId === tenantId && a.date === date && a.status !== 'CANCELLED'
+          );
+          for (const a of overlapping) {
+            if (intervalsOverlap(startTime, endTime, a.startTime, a.endTime)) {
+              return { ok: false, error: `The time ${startTime}-${endTime} on ${date} overlaps an existing appointment (${a.startTime}-${a.endTime}). Please choose another slot using check_availability.` };
+            }
+          }
+
+          // Find or create the customer inside the transaction.
+          let customer = db.customers.find(c => c.businessId === tenantId && c.phone === customerPhone);
+          if (!customer) {
+            customer = { id: customerId, businessId: tenantId, name: customerName, phone: customerPhone, createdAt: nowIso };
+            db.customers.push(customer);
+          }
+
+          const staff = db.staffMembers.find(s => s.businessId === tenantId);
+
+          const newAppointment = {
+            id: appointmentId,
             businessId: tenantId,
-            name: customerName,
-            phone: customerPhone,
-            createdAt: new Date().toISOString()
+            serviceId: service.id,
+            serviceName: service.name,
+            staffMemberId: staff?.id,
+            staffName: staff?.name,
+            customerId: customer.id,
+            customerName,
+            customerPhone,
+            date,
+            startTime,
+            endTime,
+            status: 'CONFIRMED' as const,
+            notes: notes || 'Booked via AI Assistant',
+            createdAt: nowIso
           };
-          db.customers.push(customer);
-        }
+          db.appointments.push(newAppointment);
 
-        // Calculate end time
-        const startHour = parseInt(startTime.split(':')[0], 10);
-        const startMin = parseInt(startTime.split(':')[1] || '0', 10);
-        const totalMinutes = startHour * 60 + startMin + (service?.durationMinutes || 30);
-        const endHour = Math.floor(totalMinutes / 60);
-        const endMin = totalMinutes % 60;
-        const endTime = `${endHour.toString().padStart(2, '0')}:${endMin.toString().padStart(2, '0')}`;
+          db.auditLogs.push({
+            id: `log-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+            businessId: tenantId,
+            action: 'APPOINTMENT_BOOKED',
+            details: `Appointment #${newAppointment.id} booked for ${customerName} (${service.name} at ${startTime}-${endTime} on ${date})`,
+            timestamp: nowIso
+          });
 
-        // Select staff member if available
-        const staff = db.staffMembers.find(s => s.businessId === tenantId);
-
-        const newAppointment = {
-          id: `app-${Date.now()}`,
-          businessId: tenantId,
-          serviceId: service ? service.id : 'srv-1',
-          serviceName: service ? service.name : 'Haircut',
-          staffMemberId: staff?.id,
-          staffName: staff?.name,
-          customerId: customer.id,
-          customerName,
-          customerPhone,
-          date,
-          startTime,
-          endTime,
-          status: 'CONFIRMED' as const,
-          notes: notes || 'Booked via AI Assistant',
-          createdAt: new Date().toISOString()
-        };
-
-        db.appointments.push(newAppointment);
-
-        // Audit Log
-        db.auditLogs.push({
-          id: `log-${Date.now()}`,
-          businessId: tenantId,
-          action: 'APPOINTMENT_BOOKED',
-          details: `Appointment #${newAppointment.id} booked for ${customerName} (${service.name} at ${startTime} on ${date})`,
-          timestamp: new Date().toISOString()
+          return { ok: true, appointment: newAppointment };
         });
+
+        const result = bookTxn();
+
+        if (isFail(result)) {
+          return { success: false, error: result.error };
+        }
+        const newAppointment = result.appointment;
 
         return {
           success: true,
@@ -416,16 +475,54 @@ export async function executeAgentTool(
 
       case 'reschedule_appointment': {
         const { appointmentId, newDate, newTime } = args;
+        if (!appointmentId || !newDate || !newTime) {
+          return { success: false, error: 'appointmentId, newDate and newTime are required.' };
+        }
         const app = db.appointments.find(a => a.businessId === tenantId && a.id === appointmentId);
-
         if (!app) {
           return { success: false, error: 'Appointment not found.' };
         }
+        if (app.status === 'CANCELLED') {
+          return { success: false, error: 'Cannot reschedule a cancelled appointment.' };
+        }
 
-        app.date = newDate;
-        app.startTime = newTime;
-        app.status = 'RESCHEDULED';
-        db.appointments.update(app);
+        // Recompute end time from the service duration so the moved slot stays correct.
+        const service = business.services.find(s => s.id === app.serviceId) ||
+          business.services.find(s => s.name === app.serviceName);
+        const duration = Math.max(1, service?.durationMinutes || 30);
+        const newEndTime = addMinutes(newTime, duration);
+
+        // Validate the new slot is within business hours.
+        const dateObj = new Date(`${newDate}T00:00:00Z`);
+        const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+        const dayName = dayNames[dateObj.getUTCDay()];
+        const dayHours = business.hours.find(h => h.day === dayName);
+        if (!dayHours || !dayHours.isOpen) {
+          return { success: false, error: `The business is closed on ${dayName}.` };
+        }
+        if (timeToMinutes(newTime) < timeToMinutes(dayHours.openTime) || timeToMinutes(newEndTime) > timeToMinutes(dayHours.closeTime)) {
+          return { success: false, error: `Requested time ${newTime}-${newEndTime} is outside opening hours on ${dayName}.` };
+        }
+
+        // Transactional overlap check (excluding the appointment being moved).
+        const rescheduleTxn = db.sqlite.transaction(() => {
+          const others = db.appointments.filter(
+            a => a.businessId === tenantId && a.date === newDate && a.status !== 'CANCELLED' && a.id !== app.id
+          );
+          for (const a of others) {
+            if (intervalsOverlap(newTime, newEndTime, a.startTime, a.endTime)) {
+              return { ok: false as const, error: `The time ${newTime}-${newEndTime} on ${newDate} overlaps an existing appointment (${a.startTime}-${a.endTime}).` };
+            }
+          }
+          app.date = newDate;
+          app.startTime = newTime;
+          app.endTime = newEndTime;
+          app.status = 'RESCHEDULED';
+          db.appointments.update(app);
+          return { ok: true as const };
+        });
+        const r = rescheduleTxn();
+        if (isFail(r)) return { success: false, error: r.error };
 
         return {
           success: true,
@@ -434,6 +531,7 @@ export async function executeAgentTool(
             status: 'RESCHEDULED',
             newDate,
             newTime,
+            newEndTime,
             message: `Appointment #${app.id} successfully rescheduled to ${newDate} at ${newTime}.`
           }
         };
@@ -469,66 +567,91 @@ export async function executeAgentTool(
 
       case 'create_order': {
         const { customerName, customerPhone, items } = args;
-        const orderItems: Array<{ productId: string; productName: string; quantity: number; price: number }> = [];
-        let totalAmount = 0;
 
+        if (!customerName || !customerPhone || !Array.isArray(items) || items.length === 0) {
+          return { success: false, error: 'customerName, customerPhone and a non-empty items list are required.' };
+        }
+        // Validate item shape up front (before the transaction).
         for (const item of items) {
-          const product = db.products.find(p => p.businessId === tenantId && p.id === item.productId);
-          if (!product) {
-            return { success: false, error: `Product ID ${item.productId} not found.` };
+          if (!item?.productId || !Number.isInteger(item.quantity) || item.quantity <= 0) {
+            return { success: false, error: 'Each item needs a productId and a positive integer quantity.' };
           }
-          if (product.inventory < item.quantity) {
-            return { success: false, error: `Insufficient stock for ${product.name}. Available: ${product.inventory}, Requested: ${item.quantity}` };
-          }
-
-          product.inventory -= item.quantity; // Deduct inventory safely
-          db.products.update(product);
-          const itemTotal = product.price * item.quantity;
-          totalAmount += itemTotal;
-          orderItems.push({
-            productId: product.id,
-            productName: product.name,
-            quantity: item.quantity,
-            price: product.price
-          });
         }
 
-        // Customer lookup
-        let customer = db.customers.find(c => c.businessId === tenantId && c.phone === customerPhone);
-        if (!customer) {
-          customer = {
-            id: `cust-${Date.now()}`,
+        const orderId = `ord-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+        const nowIso = new Date().toISOString();
+
+        const orderTxn = db.sqlite.transaction((): { ok: true; order: any; totalAmount: number; orderItems: any[] } | { ok: false; error: string } => {
+          const orderItems: Array<{ productId: string; productName: string; quantity: number; price: number }> = [];
+          let totalAmount = 0;
+
+          // Re-read each product inside the transaction and verify stock with a
+          // row-level lock-equivalent: better-sqlite3 is synchronous so the
+          // transaction serializes these writes. Check + decrement are atomic,
+          // preventing two concurrent orders from overselling the same stock.
+          for (const item of items) {
+            const product = db.products.find(p => p.businessId === tenantId && p.id === item.productId);
+            if (!product) {
+              return { ok: false, error: `Product ID ${item.productId} not found.` };
+            }
+            if (product.inventory < item.quantity) {
+              return { ok: false, error: `Insufficient stock for ${product.name}. Available: ${product.inventory}, Requested: ${item.quantity}` };
+            }
+            // Never allow negative inventory.
+            product.inventory -= item.quantity;
+            if (product.inventory < 0) {
+              return { ok: false, error: `Insufficient stock for ${product.name}.` };
+            }
+            db.products.update(product);
+
+            const itemTotal = product.price * item.quantity;
+            totalAmount += itemTotal;
+            orderItems.push({
+              productId: product.id,
+              productName: product.name,
+              quantity: item.quantity,
+              price: product.price
+            });
+          }
+
+          // Customer lookup/create inside the transaction.
+          let customer = db.customers.find(c => c.businessId === tenantId && c.phone === customerPhone);
+          if (!customer) {
+            customer = { id: `cust-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`, businessId: tenantId, name: customerName, phone: customerPhone, createdAt: nowIso };
+            db.customers.push(customer);
+          }
+
+          const newOrder = {
+            id: orderId,
             businessId: tenantId,
-            name: customerName,
-            phone: customerPhone,
-            createdAt: new Date().toISOString()
+            customerId: customer.id,
+            customerName,
+            items: orderItems,
+            totalAmount,
+            status: 'PENDING' as const,
+            createdAt: nowIso
           };
-          db.customers.push(customer);
+          db.orders.push(newOrder);
+
+          return { ok: true, order: newOrder, totalAmount, orderItems };
+        });
+
+        const result = orderTxn();
+
+        if (isFail(result)) {
+          return { success: false, error: result.error };
         }
-
-        const newOrder = {
-          id: `ord-${Date.now()}`,
-          businessId: tenantId,
-          customerId: customer.id,
-          customerName,
-          items: orderItems,
-          totalAmount,
-          status: 'PENDING' as const,
-          createdAt: new Date().toISOString()
-        };
-
-        db.orders.push(newOrder);
 
         return {
           success: true,
           data: {
-            orderId: newOrder.id,
+            orderId: result.order.id,
             status: 'PENDING',
             customerName,
-            totalAmount,
+            totalAmount: result.totalAmount,
             currency: business.currency,
-            items: orderItems,
-            message: `Order #${newOrder.id} created successfully! Total: ${totalAmount} ${business.currency}.`
+            items: result.orderItems,
+            message: `Order #${result.order.id} created successfully! Total: ${result.totalAmount} ${business.currency}.`
           }
         };
       }
@@ -580,6 +703,8 @@ export async function executeAgentTool(
           const conv = db.conversations.find(c => c.id === conversationId);
           if (conv) {
             conv.status = 'WAITING_FOR_HUMAN';
+            conv.handoffReason = reason || 'Customer requested human assistance.';
+            conv.handoffRequestedAt = new Date().toISOString();
             db.conversations.update(conv);
           }
         }

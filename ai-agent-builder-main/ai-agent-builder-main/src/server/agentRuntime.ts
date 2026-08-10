@@ -1,6 +1,7 @@
 import { GoogleGenAI, GenerateContentParameters, Part } from '@google/genai';
 import { db } from './db';
 import { agentToolDeclarations, executeAgentTool } from './tools';
+import { retrieveRelevant } from './embeddings';
 import { ChannelType, ToolCallRecord } from '../types';
 
 let aiClient: GoogleGenAI | null = null;
@@ -27,6 +28,8 @@ export interface RuntimeExecutionResult {
   reply: string;
   conversationId: string;
   status: string;
+  /** Internal diagnostics. NEVER sent to the customer-facing widget; only
+   *  returned to authenticated simulator/developer callers via the wrapper. */
   debug: {
     systemPrompt: string;
     retrievedKnowledge: string[];
@@ -34,24 +37,16 @@ export interface RuntimeExecutionResult {
     latencyMs: number;
     tokensUsed: number;
     model: string;
+    executionId: string;
   };
 }
 
-// Retrieve relevant business knowledge for context window grounding
-function retrieveKnowledgeChunks(businessId: string, query: string): string[] {
-  const chunks = db.knowledgeChunks.filter(k => k.businessId === businessId);
-  const qLower = query.toLowerCase();
-
-  const matched = chunks.filter(c => {
-    const titleMatch = c.title.toLowerCase().includes(qLower);
-    const tagMatch = c.tags.some(t => qLower.includes(t.toLowerCase()));
-    const contentMatch = c.content.toLowerCase().split(' ').some(word => word.length > 3 && qLower.includes(word));
-    return titleMatch || tagMatch || contentMatch;
-  });
-
-  // If no specific match, return top 3 chunks as general business context
-  const selected = matched.length > 0 ? matched : chunks.slice(0, 3);
-  return selected.map(s => `[${s.type.toUpperCase()}] ${s.title}: ${s.content}`);
+// Retrieve relevant business knowledge for context window grounding.
+// Semantic (cosine over Gemini embeddings) with a tenant-scoped keyword
+// fallback when embeddings are unavailable (no API key / nothing indexed).
+async function retrieveKnowledgeChunks(businessId: string, query: string): Promise<string[]> {
+  const results = await retrieveRelevant(businessId, query, 4);
+  return results.map(r => `[${r.chunk.type.toUpperCase()}] ${r.chunk.title}: ${r.chunk.content}`);
 }
 
 export async function processAgentMessage(params: {
@@ -61,8 +56,12 @@ export async function processAgentMessage(params: {
   channel?: ChannelType;
   customerName?: string;
   customerPhone?: string;
+  /** When set (simulator only), run against a specific DRAFT/TESTING version
+   * instead of the live PUBLISHED config. Production calls never set this. */
+  versionId?: string;
 }): Promise<RuntimeExecutionResult> {
   const startTime = Date.now();
+  const executionId = `exec-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
   const { tenantId, userMessage, channel = 'web_chat' } = params;
 
   // 1. Resolve Tenant & Business Information
@@ -79,9 +78,25 @@ export async function processAgentMessage(params: {
     throw new Error(`No agent configured for business: ${business.name}`);
   }
 
-  // 3. Resolve or Create Conversation
+  // Resolve the effective config: production uses the agent row (which mirrors
+  // the PUBLISHED version). The simulator may pass a versionId to run a
+  // DRAFT/TESTING version without touching the live agent.
+  let effectiveSystemPrompt = agent.systemPrompt;
+  let effectiveConfig = agent.structuredConfig;
+  let effectiveModel = agent.model;
+  if (params.versionId) {
+    const { getVersionForSim } = await import('./agentVersions');
+    const resolved = getVersionForSim(agent.id, params.versionId);
+    effectiveSystemPrompt = resolved.systemPrompt;
+    effectiveConfig = resolved.structuredConfig;
+    effectiveModel = resolved.model;
+  }
+
+  // 3. Resolve or Create Conversation (TENANT-SCOPED: a customer can never
+  //    load another tenant's conversation by supplying its id — the lookup
+  //    requires both id AND businessId == tenantId.)
   let conversation = params.conversationId 
-    ? db.conversations.find(c => c.id === params.conversationId)
+    ? db.conversations.find(c => c.id === params.conversationId && c.businessId === tenantId)
     : null;
 
   if (!conversation) {
@@ -115,6 +130,58 @@ export async function processAgentMessage(params: {
     db.conversations.push(conversation);
   }
 
+  // HUMAN HANDOFF GUARD: when a human team member has taken over (HUMAN_HANDLING)
+  // or the conversation is resolved, the AI must NOT autonomously answer. The
+  // customer's message is still stored (so the human sees it), but the runtime
+  // returns a holding reply and never calls the model or any tool.
+  if (conversation.status === 'HUMAN_HANDLING') {
+    const holdingReply =
+      'A team member is currently handling our conversation and will reply to you shortly. Thank you for your patience.';
+    db.messages.push({
+      id: `msg-${Date.now()}-agent`,
+      conversationId: conversation.id,
+      sender: 'system',
+      content: holdingReply,
+      channel,
+      timestamp: new Date().toISOString()
+    });
+    conversation.lastMessageAt = new Date().toISOString();
+    db.conversations.update(conversation);
+    return {
+      reply: holdingReply,
+      conversationId: conversation.id,
+      status: conversation.status,
+      debug: {
+        systemPrompt: '',
+        retrievedKnowledge: [],
+        toolCalls: [],
+        latencyMs: Date.now() - startTime,
+        tokensUsed: 0,
+        model: effectiveModel || 'gemini-3.6-flash',
+        executionId
+      }
+    };
+  }
+
+  if (conversation.status === 'RESOLVED') {
+    const holdingReply =
+      'This conversation has been marked as resolved. If you need further help, please start a new conversation or ask a team member to reopen this one.';
+    return {
+      reply: holdingReply,
+      conversationId: conversation.id,
+      status: conversation.status,
+      debug: {
+        systemPrompt: '',
+        retrievedKnowledge: [],
+        toolCalls: [],
+        latencyMs: Date.now() - startTime,
+        tokensUsed: 0,
+        model: effectiveModel || 'gemini-3.6-flash',
+        executionId
+      }
+    };
+  }
+
   // Save incoming customer message
   db.messages.push({
     id: `msg-${Date.now()}-user`,
@@ -126,11 +193,11 @@ export async function processAgentMessage(params: {
   });
 
   // 4. Retrieve RAG Knowledge Chunks
-  const retrievedKnowledge = retrieveKnowledgeChunks(tenantId, userMessage);
+  const retrievedKnowledge = await retrieveKnowledgeChunks(tenantId, userMessage);
 
   // 5. Build Grounded System Prompt
-  const structured = agent.structuredConfig;
-  const fullSystemPrompt = `${agent.systemPrompt}
+  const structured = effectiveConfig;
+  const fullSystemPrompt = `${effectiveSystemPrompt}
 
 BUSINESS CONTEXT & FACTS:
 - Business Name: ${business.name}
@@ -174,12 +241,19 @@ CRITICAL MANDATES:
   const toolCallRecords: ToolCallRecord[] = [];
   let finalReply = '';
 
+  // Real token usage from the provider's usageMetadata, accumulated across
+  // the tool loop (Phase 19). Hoisted outside try so the catch block and the
+  // usage recording block can read them.
+  let providerInputTokens = 0;
+  let providerOutputTokens = 0;
+  const providerModel = effectiveModel || 'gemini-3.6-flash';
+
   try {
     const ai = getGeminiClient();
 
     // Call Gemini Model
     const reqParameters: GenerateContentParameters = {
-      model: agent.model || 'gemini-3.6-flash',
+      model: providerModel,
       contents: contents as any,
       config: {
         systemInstruction: fullSystemPrompt,
@@ -189,6 +263,18 @@ CRITICAL MANDATES:
     };
 
     let response = await ai.models.generateContent(reqParameters);
+
+    const accumulateUsage = (r: typeof response) => {
+      const um = r?.usageMetadata;
+      if (um) {
+        // promptTokenCount accumulates full context on each turn; we take the
+        // final turn's prompt count plus the sum of generated candidate tokens
+        // across all turns to approximate total input/output usage.
+        providerInputTokens = um.promptTokenCount ?? providerInputTokens;
+        providerOutputTokens += um.candidatesTokenCount ?? 0;
+      }
+    };
+    accumulateUsage(response);
 
     // Handle Tool Execution Loop (up to 3 iterations for multi-step tool calls)
     let maxToolLoops = 3;
@@ -238,26 +324,36 @@ CRITICAL MANDATES:
 
       // Call Gemini again with function results
       response = await ai.models.generateContent({
-        model: agent.model || 'gemini-3.6-flash',
+        model: providerModel,
         contents: contents as any,
         config: {
           systemInstruction: fullSystemPrompt,
           tools: activeTools.length > 0 ? [{ functionDeclarations: activeTools }] : undefined
         }
       });
+      accumulateUsage(response);
     }
 
     finalReply = response.text || "I'm sorry, I couldn't process that request properly. How else may I assist you?";
   } catch (err: any) {
-    console.error('Gemini Agent Runtime Error:', err);
-    finalReply = `I'm having trouble connecting to the assistant service right now. I'll connect you with the business owner directly. (${err.message || 'AI Provider Error'})`;
+    // Log the real error internally with the execution id for support; never
+    // expose the provider's error message/stack to the customer.
+    console.error(`[runtime] ${executionId} Gemini error:`, err?.message || err);
+    finalReply =
+      "I'm having trouble connecting to the assistant service right now. I've notified the team and someone will follow up with you shortly.";
     
     // Auto-escalate conversation status on AI error
     conversation.status = 'WAITING_FOR_HUMAN';
   }
 
   const latencyMs = Date.now() - startTime;
-  const tokensEstimate = Math.ceil((fullSystemPrompt.length + userMessage.length + finalReply.length) / 4);
+  // Prefer real provider usage metadata; fall back to a length-based estimate
+  // only when the provider omits usage (e.g. error path / no API key).
+  const realTokens = providerInputTokens + providerOutputTokens;
+  const usedInputTokens = providerInputTokens > 0 ? providerInputTokens : 0;
+  const usedOutputTokens = providerOutputTokens > 0 ? providerOutputTokens : 0;
+  const tokensUsed = realTokens > 0 ? realTokens : Math.ceil((fullSystemPrompt.length + userMessage.length + finalReply.length) / 4);
+  const usedModel = providerModel;
 
   // Update conversation record
   conversation.lastMessageAt = new Date().toISOString();
@@ -275,7 +371,9 @@ CRITICAL MANDATES:
     timestamp: new Date().toISOString()
   });
 
-  // Track Usage
+  // Track Usage (Phase 19): real provider token counts when available.
+  // Aggregate per business per day; agent/model/provider recorded for later
+  // per-conversation breakdown.
   const todayStr = new Date().toISOString().split('T')[0];
   let usage = db.usageRecords.find(u => u.businessId === tenantId && u.date === todayStr);
   if (!usage) {
@@ -287,13 +385,25 @@ CRITICAL MANDATES:
       estimatedCostUsd: 0,
       requestsCount: 0,
       voiceMinutes: 0,
-      smsCount: 0
+      smsCount: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      provider: 'google'
     };
     db.usageRecords.push(usage);
   }
-  usage.tokensUsed += tokensEstimate;
-  usage.estimatedCostUsd += (tokensEstimate / 1000) * 0.0001; // $0.0001 per 1k tokens estimate
+  usage.tokensUsed += tokensUsed;
+  usage.inputTokens = (usage.inputTokens ?? 0) + usedInputTokens;
+  usage.outputTokens = (usage.outputTokens ?? 0) + usedOutputTokens;
+  // Cost estimate from real input/output token counts when available;
+  // otherwise from the total estimate. Rates are illustrative placeholders
+  // for the future billing tier (no charges are ever executed).
+  const pricedInput = usedInputTokens;
+  const pricedOutput = usedOutputTokens;
+  usage.estimatedCostUsd += ((pricedInput * 0.0000001) + (pricedOutput * 0.0000004))
+    || (tokensUsed / 1000) * 0.0001;
   usage.requestsCount += 1;
+  if (!usage.model) usage.model = usedModel;
   db.usageRecords.update(usage);
 
   return {
@@ -305,8 +415,9 @@ CRITICAL MANDATES:
       retrievedKnowledge,
       toolCalls: toolCallRecords,
       latencyMs,
-      tokensUsed: tokensEstimate,
-      model: agent.model || 'gemini-3.6-flash'
+      tokensUsed,
+      model: usedModel,
+      executionId
     }
   };
 }
@@ -327,29 +438,35 @@ Generate a structured AI agent configuration for the following business:
 - Name: ${businessInput.name}
 - Type: ${businessInput.type}
 - Description: ${businessInput.description}
-- Operating Hours: ${businessInput.hours || 'Standard business hours'}
-- Services: ${businessInput.services || 'General local services'}
+- Operating Hours: ${businessInput.hours || 'NOT PROVIDED'}
+- Services: ${businessInput.services || 'NOT PROVIDED'}
+
+CRITICAL RULES — violate these and the configuration is useless:
+1. NEVER invent business facts. If a price, duration, hour, policy, or service
+   name was NOT provided in the input above, you MUST output the literal string
+   "NEEDS_INPUT" for that field. Do NOT guess, round, or estimate.
+2. You MAY suggest STRUCTURE (e.g. "Would appointment booking help?") and ask
+   clarifying questions, but the values for services/prices/hours must come
+   ONLY from the input or be "NEEDS_INPUT".
+3. System prompt and personality may be generated, but must instruct the agent
+   to never state prices/hours/services that the business has not configured.
 
 Return a JSON object conforming strictly to this format:
 {
   "agentName": "Suggested agent name",
-  "systemPrompt": "Comprehensive system instructions for the AI receptionist",
-  "personality": {
-    "tone": "friendly",
-    "behavior": "service",
-    "language": "en"
-  },
+  "systemPrompt": "Comprehensive system instructions; must tell the agent to never invent prices, hours, or services and to escalate when unsure.",
+  "personality": { "tone": "friendly", "behavior": "service", "language": "en" },
   "goals": ["Goal 1", "Goal 2", "Goal 3"],
   "allowedActions": ["check_business_hours", "get_business_information", "check_availability", "book_appointment", "transfer_to_human"],
-  "restrictedActions": ["Do not give unauthorized discounts", "Do not promise out-of-scope work"],
-  "escalationRules": ["When customer requests a human", "When customer reports a complaint"],
+  "restrictedActions": ["Do not state prices/hours/services not configured by the business", "Do not promise out-of-scope work"],
+  "escalationRules": ["When customer requests a human", "When customer reports a complaint", "When a required fact is missing"],
   "suggestedFaqs": [
-    {"question": "Sample FAQ 1", "answer": "Suggested answer 1"},
-    {"question": "Sample FAQ 2", "answer": "Suggested answer 2"}
+    {"question": "Sample FAQ 1", "answer": "Suggested answer 1"}
   ],
   "suggestedServices": [
-    {"name": "Sample Service 1", "price": 300000, "durationMinutes": 30, "description": "Sample description"}
-  ]
+    {"name": "Service from input or NEEDS_INPUT", "price": "NEEDS_INPUT or number", "durationMinutes": "NEEDS_INPUT or number", "description": "Service description or NEEDS_INPUT"}
+  ],
+  "needsInput": ["List every business fact that could not be derived from the input, e.g. 'operating hours', 'service prices', 'service durations'"]
 }`;
 
     const res = await ai.models.generateContent({
@@ -361,27 +478,69 @@ Return a JSON object conforming strictly to this format:
     });
 
     if (res.text) {
-      return JSON.parse(res.text);
+      const parsed = JSON.parse(res.text);
+      return sanitizeGeneratedConfig(parsed, businessInput);
     }
   } catch (err: any) {
     console.error('Auto Agent Gen Error:', err);
   }
 
-  // Sensible fallback if Gemini key is not present or API call fails
+  // Fact-safe fallback when Gemini is unavailable. Nothing is invented:
+  // every missing business fact is explicitly NEEDS_INPUT.
+  return factSafeFallback(businessInput);
+}
+
+/**
+ * Defense-in-depth: even if the model invents values, strip any service that
+ * carries a fabricated price/duration when the input didn't supply services.
+ * Anything that looks placeholder is converted to NEEDS_INPUT.
+ */
+function sanitizeGeneratedConfig(parsed: any, input: { name: string; type: string; description: string; hours?: string; services?: string }): any {
+  const servicesProvided = !!(input.services && input.services.trim());
+  if (Array.isArray(parsed.suggestedServices)) {
+    parsed.suggestedServices = parsed.suggestedServices.map((s: any) => {
+      const name = s && typeof s.name === 'string' ? s.name : 'NEEDS_INPUT';
+      const price = (servicesProvided && typeof s.price === 'number') ? s.price : 'NEEDS_INPUT';
+      const duration = (servicesProvided && typeof s.durationMinutes === 'number') ? s.durationMinutes : 'NEEDS_INPUT';
+      return { name, price, durationMinutes: duration, description: s?.description ?? 'NEEDS_INPUT' };
+    });
+  }
+  if (!input.hours) {
+    // Ensure the system prompt does not assert hours the business hasn't given.
+    if (typeof parsed.systemPrompt === 'string' && !/NEEDS_INPUT|not.*configured|do not.*hour/i.test(parsed.systemPrompt)) {
+      parsed.systemPrompt += ' Never state operating hours unless they have been configured by the business owner.';
+    }
+  }
+  parsed.needsInput = Array.isArray(parsed.needsInput) ? parsed.needsInput : [];
+  if (!input.hours && !parsed.needsInput.includes('operating hours')) parsed.needsInput.push('operating hours');
+  if (!servicesProvided && !parsed.needsInput.includes('service list and prices')) parsed.needsInput.push('service list and prices');
+  return parsed;
+}
+
+function factSafeFallback(input: { name: string; type: string; description: string; hours?: string; services?: string }): any {
+  const needs: string[] = [];
+  if (!input.hours) needs.push('operating hours');
+  if (!input.services) needs.push('service list, prices, and durations');
+  if (!input.description) needs.push('business description / what you do');
+
   return {
-    agentName: `${businessInput.name} AI Assistant`,
-    systemPrompt: `You are the official AI receptionist for ${businessInput.name}. Assist customers politely, answer FAQs, and book appointments.`,
+    agentName: `${input.name} AI Assistant`,
+    systemPrompt:
+      `You are the official AI receptionist for ${input.name}. ` +
+      `Assist customers politely, answer questions using only configured knowledge, and book appointments when permitted. ` +
+      `NEVER state prices, operating hours, or service details that the business has not explicitly configured. ` +
+      `If a customer asks for something you don't have configured, say you'll check and escalate to a human rather than guessing.`,
     personality: { tone: 'friendly', behavior: 'service', language: 'en' },
-    goals: ['Answer customer inquiries', 'Book appointments', 'Explain services'],
+    goals: ['Answer customer inquiries from configured knowledge', 'Book appointments', 'Escalate to a human when facts are missing'],
     allowedActions: ['check_business_hours', 'get_business_information', 'check_availability', 'book_appointment', 'transfer_to_human'],
-    restrictedActions: ['Do not make up fake prices or hours'],
-    escalationRules: ['When customer requests a real human agent'],
+    restrictedActions: ['Do not invent prices, hours, or services', 'Do not promise out-of-scope work'],
+    escalationRules: ['When customer requests a real human', 'When a required business fact is missing'],
     suggestedFaqs: [
-      { question: 'What are your hours?', answer: 'We are open during regular business hours.' },
       { question: 'How can I book an appointment?', answer: 'I can assist you directly with booking an appointment right here!' }
     ],
     suggestedServices: [
-      { name: 'Standard Service', price: 300000, durationMinutes: 30, description: 'General service' }
-    ]
+      { name: 'NEEDS_INPUT', price: 'NEEDS_INPUT', durationMinutes: 'NEEDS_INPUT', description: 'NEEDS_INPUT' }
+    ],
+    needsInput: needs
   };
 }

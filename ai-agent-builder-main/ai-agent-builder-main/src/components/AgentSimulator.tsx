@@ -55,11 +55,16 @@ export const AgentSimulator: React.FC<AgentSimulatorProps> = ({
     setLoading(true);
 
     try {
-      const res = await fetch('/api/runtime/chat', {
+      // The simulator is a developer tool and runs authenticated, so it uses
+      // the /api/runtime/simulate endpoint which returns the developer-only
+      // debug block (system prompt, retrieved knowledge, tool calls). The
+      // public /api/runtime/chat endpoint (used by the embeddable widget)
+      // intentionally strips that block.
+      const res = await fetch('/api/runtime/simulate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          tenantId: business.id,
+          businessId: business.id,
           userMessage: userText,
           channel: 'web_chat'
         })

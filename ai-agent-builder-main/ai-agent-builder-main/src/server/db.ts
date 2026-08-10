@@ -4,6 +4,7 @@ import BetterSqlite3 from 'better-sqlite3';
 import {
   Business,
   Agent,
+  AgentVersion,
   KnowledgeChunk,
   Customer,
   Conversation,
@@ -21,6 +22,7 @@ import {
   Session
 } from '../types';
 import { hashPassword } from './passwords';
+import { initEmbeddingsTable } from './embeddings';
 
 /**
  * SQLite-backed repository for the AI Agent Factory MVP.
@@ -58,6 +60,11 @@ const TABLES: Record<string, TableConfig> = {
   },
   agents: {
     table: 'agents',
+    jsonColumns: ['structuredConfig'],
+    booleanColumns: []
+  },
+  agentVersions: {
+    table: 'agent_versions',
     jsonColumns: ['structuredConfig'],
     booleanColumns: []
   },
@@ -332,6 +339,7 @@ export class AppDatabase {
 
   public businesses: Collection<Business>;
   public agents: Collection<Agent>;
+  public agentVersions: Collection<AgentVersion>;
   public knowledgeChunks: Collection<KnowledgeChunk>;
   public customers: Collection<Customer>;
   public conversations: Collection<Conversation>;
@@ -358,9 +366,11 @@ export class AppDatabase {
     this.sqlite.pragma('foreign_keys = ON');
 
     runMigrations(this.sqlite, this.migrationsDir);
+    initEmbeddingsTable(this.sqlite);
 
     this.businesses = new Collection<Business>(this.sqlite, TABLES.businesses);
     this.agents = new Collection<Agent>(this.sqlite, TABLES.agents);
+    this.agentVersions = new Collection<AgentVersion>(this.sqlite, TABLES.agentVersions);
     this.knowledgeChunks = new Collection<KnowledgeChunk>(this.sqlite, TABLES.knowledgeChunks);
     this.customers = new Collection<Customer>(this.sqlite, TABLES.customers);
     this.conversations = new Collection<Conversation>(this.sqlite, TABLES.conversations);
@@ -380,6 +390,17 @@ export class AppDatabase {
     if (opts.seed !== false) {
       this.seed();
       this.seedUsers();
+    }
+
+    // Best-effort background indexing of seeded knowledge when an embedding
+    // key is configured. Fire-and-forget: failures are non-fatal (keyword
+    // fallback remains) and we must not block startup for optional providers.
+    if (process.env.GEMINI_API_KEY) {
+      import('./embeddings').then(({ indexChunk }) => {
+        for (const c of this.knowledgeChunks.toJSON()) {
+          indexChunk(c).catch(() => {});
+        }
+      }).catch(() => {});
     }
   }
 
@@ -522,6 +543,22 @@ Never invent prices, hours, services, or availability that do not exist in the d
     };
     this.agents.push(tonysAgent);
 
+    // Seed a PUBLISHED version snapshot so the versioning system is consistent
+    // for the demo tenant (runtime reads the agent row, but the dashboard +
+    // simulator rely on version records existing).
+    this.agentVersions.push({
+      id: 'ver-tonys-1',
+      agentId: 'agent-tonys-1',
+      businessId: 'biz-tonys-barber',
+      versionNumber: 1,
+      status: 'PUBLISHED',
+      systemPrompt: tonysAgent.systemPrompt,
+      structuredConfig: tonysAgent.structuredConfig,
+      model: tonysAgent.model,
+      changeNote: 'Initial published version',
+      createdAt: new Date().toISOString(),
+      publishedAt: new Date().toISOString()
+    });
     // 4. Knowledge Chunks
     this.knowledgeChunks.push(
       {

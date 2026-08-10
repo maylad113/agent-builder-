@@ -122,6 +122,28 @@ export interface Agent {
   updatedAt: string;
 }
 
+/**
+ * An immutable snapshot of an agent's configuration at a point in time.
+ * Production conversations use the PUBLISHED version; DRAFT/TESTING versions
+ * are only usable from the authenticated simulator. Editing a draft never
+ * changes the live (PUBLISHED) agent until an explicit publish operation.
+ */
+export type AgentVersionStatus = 'DRAFT' | 'TESTING' | 'PUBLISHED' | 'ARCHIVED';
+
+export interface AgentVersion {
+  id: string;
+  agentId: string;
+  businessId: string;
+  versionNumber: number;
+  status: AgentVersionStatus;
+  systemPrompt: string;
+  structuredConfig: StructuredAgentConfig;
+  model: string;
+  changeNote?: string;
+  createdAt: string;
+  publishedAt?: string;
+}
+
 export interface KnowledgeChunk {
   id: string;
   businessId: string;
@@ -174,6 +196,14 @@ export interface Conversation {
   summary?: string;
   lastMessageAt: string;
   createdAt: string;
+  /** Reason captured when the AI escalated to a human. */
+  handoffReason?: string;
+  /** When the AI requested a human (set on WAITING_FOR_HUMAN). */
+  handoffRequestedAt?: string;
+  /** When a human took over (set on HUMAN_HANDLING). */
+  handoffStartedAt?: string;
+  /** When the conversation was resolved (set on RESOLVED). */
+  resolvedAt?: string;
 }
 
 export interface StaffMember {
@@ -273,6 +303,13 @@ export interface UsageRecord {
   requestsCount: number;
   voiceMinutes: number;
   smsCount: number;
+  /** Real input tokens from the provider's usageMetadata (Phase 19). */
+  inputTokens?: number;
+  /** Real output tokens from the provider's usageMetadata. */
+  outputTokens?: number;
+  agentId?: string;
+  model?: string;
+  provider?: string;
 }
 
 export interface AuditLog {

@@ -3,6 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import { router as apiRouter } from './src/server/routes';
+import { requestId, rateLimit, secureHeaders, RATE_LIMITS } from './src/server/security';
 
 // Resolve the project root in both run modes:
 //  - dev (`tsx server.ts`): executed as ESM, so import.meta.url points at this file.
@@ -16,8 +17,14 @@ async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
-  app.use(express.json());
-  app.use(express.urlencoded({ extended: true }));
+  app.use(express.json({ limit: '1mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+
+  // Security hardening (Phase 22): request IDs, secure headers, rate limiting.
+  app.use(requestId);
+  app.use(secureHeaders);
+  // Auth endpoints get a tighter budget to slow credential stuffing.
+  app.use('/api/auth', rateLimit({ ...RATE_LIMITS.auth, prefix: 'auth' }));
 
   // Static public directory (for embeddable widget.js script)
   app.use(express.static(path.join(projectRoot, 'public')));
@@ -39,6 +46,20 @@ async function startServer() {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
+
+  // Centralized JSON error handler. Catches thrown errors (e.g. a missing
+  // SESSION_SECRET in production) and returns a clean JSON 500 instead of the
+  // default HTML "Internal Server Error" page. Never leaks stack traces.
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const status = err?.status || 500;
+    const message = status >= 500 && process.env.NODE_ENV === 'production'
+      ? 'Internal server error.'
+      : (err?.message || 'Internal server error.');
+    if (status >= 500) {
+      console.error('[server] unhandled error:', err?.stack || err);
+    }
+    res.status(status).json({ error: message });
+  });
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 AI Agent Factory SaaS Server listening on http://0.0.0.0:${PORT}`);

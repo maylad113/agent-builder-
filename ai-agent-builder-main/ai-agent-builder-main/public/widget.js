@@ -8,6 +8,17 @@
   const businessId = currentScript ? currentScript.getAttribute('data-business-id') : 'biz-tonys-barber';
   const themeColor = (currentScript && currentScript.getAttribute('data-color')) || '#2563eb';
 
+  // Derive the API origin from the script src so the widget works when embedded
+  // on an EXTERNAL business website (different origin than the platform server).
+  // Falls back to same-origin when no src is available (e.g. local dev).
+  let apiOrigin = '';
+  try {
+    if (currentScript && currentScript.src) {
+      const u = new URL(currentScript.src);
+      apiOrigin = u.origin;
+    }
+  } catch (e) { /* same-origin fallback */ }
+
   if (!businessId) {
     console.error('AI Agent Factory Widget: Missing data-business-id attribute on script tag.');
     return;
@@ -225,7 +236,7 @@
     messagesDiv.scrollTop = messagesDiv.scrollHeight;
 
     try {
-      const res = await fetch('/api/runtime/chat', {
+      const res = await fetch(apiOrigin + '/api/runtime/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

@@ -1,7 +1,16 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { db } from './db';
 import { processAgentMessage, generateSuggestedAgentConfig } from './agentRuntime';
-import { Business, Agent, KnowledgeChunk, Product, Appointment, Order, User, Conversation } from '../types';
+import { executeAgentTool } from './tools';
+import {
+  createInitialDraft, createDraftFrom, editDraft, publishVersion,
+  rollbackToVersion, archiveVersion, moveToTesting, listVersions,
+  getPublishedVersion, getVersionForSim
+} from './agentVersions';
+import { indexChunk, removeEmbedding } from './embeddings';
+import { assertActivatable, readinessSnapshot } from './readiness';
+import { rateLimit, RATE_LIMITS } from './security';
+import { Business, Agent, KnowledgeChunk, Product, Appointment, Order, User, Conversation, AgentVersion } from '../types';
 import { verifyPassword } from './passwords';
 import {
   requireAuth,
@@ -39,7 +48,9 @@ router.get('/auth/me', (req: Request, res: Response) => {
 });
 
 // Login — public. Validates credentials, creates a SQLite-backed session,
-// sets the signed HttpOnly cookie.
+// sets the signed HttpOnly cookie. A missing SESSION_SECRET in production is
+// reported as a clear JSON 500 (not an HTML crash page) so operators can
+// diagnose it without the app becoming unresponsive.
 router.post('/auth/login', (req: Request, res: Response) => {
   const { email, password } = req.body ?? {};
   if (!email || !password) {
@@ -52,7 +63,15 @@ router.post('/auth/login', (req: Request, res: Response) => {
   if (!verifyPassword(String(password), user.passwordHash)) {
     return res.status(401).json({ error: 'Invalid email or password.' });
   }
-  const session = createSession(user.id);
+  let session;
+  try {
+    session = createSession(user.id);
+  } catch (err: any) {
+    const msg = err?.message || 'Failed to create session.';
+    return res.status(500).json({
+      error: process.env.NODE_ENV === 'production' ? 'Internal server error.' : msg
+    });
+  }
   setSessionCookie(res, session.id);
   res.json({ user: toPublicUser(user) });
 });
@@ -250,6 +269,24 @@ router.post('/businesses/:id/duplicate', requireAuth, requireRole('PLATFORM_OWNE
     clonedAgent.createdAt = new Date().toISOString();
     clonedAgent.updatedAt = new Date().toISOString();
     db.agents.push(clonedAgent);
+    // Clone the agent's published version so the new agent starts with a
+    // complete version history (factory workflow: duplicate template).
+    const srcPub = db.agentVersions.find(v => v.agentId === a.id && v.status === 'PUBLISHED');
+    if (srcPub) {
+      db.agentVersions.push({
+        id: `ver-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        agentId: clonedAgent.id,
+        businessId: newBizId,
+        versionNumber: 1,
+        status: 'PUBLISHED',
+        systemPrompt: srcPub.systemPrompt,
+        structuredConfig: srcPub.structuredConfig,
+        model: srcPub.model,
+        changeNote: 'Cloned from template',
+        createdAt: new Date().toISOString(),
+        publishedAt: new Date().toISOString()
+      });
+    }
   });
 
   // Clone Knowledge Chunks
@@ -295,6 +332,16 @@ router.get('/agents', requireAuth, requireTenantScope, (req: Request, res: Respo
   const agents = businessId ? db.agents.filter(a => a.businessId === businessId) : db.agents.toJSON();
   res.json(agents);
 });
+
+// Get a single agent — tenant-scoped via requireResourceAccess.
+router.get(
+  '/agents/:id',
+  requireAuth,
+  requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
+  (req: Request, res: Response) => {
+    res.json(res.locals.resource as Agent);
+  }
+);
 
 // Generate Suggested Agent Configuration (AI Assistant Wizard)
 router.post('/agents/generate-config', requireAuth, async (req: Request, res: Response) => {
@@ -350,6 +397,10 @@ router.post('/agents', requireAuth, requireTenantScope, (req: Request, res: Resp
 
   db.agents.push(newAgent);
 
+  // Create the first DRAFT version snapshot. The agent row is the live config;
+  // the version history is immutable. Editing happens on drafts, not the row.
+  createInitialDraft(newAgent);
+
   db.auditLogs.push({
     id: `log-${Date.now()}`,
     businessId,
@@ -362,20 +413,19 @@ router.post('/agents', requireAuth, requireTenantScope, (req: Request, res: Resp
   res.status(201).json(newAgent);
 });
 
-// Update Agent — resource belongs to the authorized tenant
+// Update Agent — resource belongs to the authorized tenant.
+// This edits metadata only (name/description). Config edits go through the
+// version endpoints so a draft never silently changes the live agent.
 router.put(
   '/agents/:id',
   requireAuth,
   requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
   (req: Request, res: Response) => {
     const agent = res.locals.resource as Agent;
-
-    // Increment version on update
-    const newVersion = agent.version + 1;
-    Object.assign(agent, req.body, {
-      version: newVersion,
-      updatedAt: new Date().toISOString()
-    });
+    const { name, description } = req.body;
+    if (name !== undefined) agent.name = name;
+    if (description !== undefined) agent.description = description;
+    agent.updatedAt = new Date().toISOString();
     db.agents.update(agent);
 
     db.auditLogs.push({
@@ -383,7 +433,7 @@ router.put(
       businessId: agent.businessId,
       agentId: agent.id,
       action: 'AGENT_UPDATED',
-      details: `Updated agent "${agent.name}" to version v${newVersion}.`,
+      details: `Updated agent "${agent.name}" metadata.`,
       timestamp: new Date().toISOString()
     });
 
@@ -404,10 +454,17 @@ router.post(
       return res.status(400).json({ error: 'Invalid status state.' });
     }
 
-    // Validate readiness before setting ACTIVE
+    // Validate readiness before setting ACTIVE (Phase 20): the server-side
+    // composite checklist must pass. The frontend cannot bypass this.
     if (status === 'ACTIVE') {
-      const biz = db.businesses.find(b => b.id === agent.businessId);
-      if (!biz) return res.status(400).json({ error: 'Cannot activate agent: Business not found.' });
+      try {
+        assertActivatable(agent);
+      } catch (err: any) {
+        return res.status(400).json({
+          error: err.message,
+          readiness: err.readiness
+        });
+      }
     }
 
     agent.status = status;
@@ -427,15 +484,188 @@ router.post(
   }
 );
 
+// Agent readiness checklist (Phase 20) — read-only snapshot for the UI.
+router.get(
+  '/agents/:id/readiness',
+  requireAuth,
+  requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
+  (req: Request, res: Response) => {
+    const agent = res.locals.resource as Agent;
+    res.json(readinessSnapshot(agent));
+  }
+);
+
 // =========================================
-// 3. RUNTIME CHAT & SIMULATOR (PUBLIC — customer-facing widget, no login)
+// 2b. AGENT VERSIONS
+// =========================================
+// Version history + lifecycle. All tenant-scoped via requireResourceAccess on
+// the parent agent. Editing a draft never changes the live agent; publishing
+// is an explicit operation that snapshots the draft onto the agent row.
+
+router.get(
+  '/agents/:id/versions',
+  requireAuth,
+  requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
+  (req: Request, res: Response) => {
+    res.json(listVersions(req.params.id));
+  }
+);
+
+router.get(
+  '/agents/:id/versions/published',
+  requireAuth,
+  requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
+  (req: Request, res: Response) => {
+    const pub = getPublishedVersion(req.params.id);
+    if (!pub) return res.status(404).json({ error: 'No published version.' });
+    res.json(pub);
+  }
+);
+
+router.post(
+  '/agents/:id/versions',
+  requireAuth,
+  requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
+  (req: Request, res: Response) => {
+    // Create a new draft from an existing version (defaults to published).
+    const { fromVersionId, changeNote } = req.body;
+    const sourceId = fromVersionId || getPublishedVersion(req.params.id)?.id;
+    if (!sourceId) return res.status(400).json({ error: 'No source version to draft from.' });
+    try {
+      const draft = createDraftFrom(sourceId, changeNote);
+      res.status(201).json(draft);
+    } catch (e: any) {
+      res.status(400).json({ error: e.message });
+    }
+  }
+);
+
+router.put(
+  '/agents/:id/versions/:versionId',
+  requireAuth,
+  requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
+  (req: Request, res: Response) => {
+    try {
+      const updated = editDraft(req.params.versionId, req.body);
+      res.json(updated);
+    } catch (e: any) {
+      res.status(400).json({ error: e.message });
+    }
+  }
+);
+
+router.post(
+  '/agents/:id/versions/:versionId/publish',
+  requireAuth,
+  requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
+  (req: Request, res: Response) => {
+    try {
+      const pub = publishVersion(req.params.versionId);
+      db.auditLogs.push({
+        id: `log-${Date.now()}`,
+        businessId: (res.locals.resource as Agent).businessId,
+        agentId: req.params.id,
+        action: 'AGENT_PUBLISHED',
+        details: `Published agent version v${pub.versionNumber}.`,
+        timestamp: new Date().toISOString()
+      });
+      res.json(pub);
+    } catch (e: any) {
+      res.status(400).json({ error: e.message });
+    }
+  }
+);
+
+router.post(
+  '/agents/:id/versions/:versionId/test',
+  requireAuth,
+  requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
+  (req: Request, res: Response) => {
+    try {
+      res.json(moveToTesting(req.params.versionId));
+    } catch (e: any) {
+      res.status(400).json({ error: e.message });
+    }
+  }
+);
+
+router.post(
+  '/agents/:id/versions/:versionId/rollback',
+  requireAuth,
+  requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
+  (req: Request, res: Response) => {
+    try {
+      const pub = rollbackToVersion(req.params.versionId);
+      res.json(pub);
+    } catch (e: any) {
+      res.status(400).json({ error: e.message });
+    }
+  }
+);
+
+router.post(
+  '/agents/:id/versions/:versionId/archive',
+  requireAuth,
+  requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
+  (req: Request, res: Response) => {
+    try {
+      res.json(archiveVersion(req.params.versionId));
+    } catch (e: any) {
+      res.status(400).json({ error: e.message });
+    }
+  }
+);
+
+// =========================================
+// 3. RUNTIME CHAT & SIMULATOR
 // =========================================
 
-router.post('/runtime/chat', async (req: Request, res: Response) => {
+// Public, customer-facing widget endpoint. NO authentication (a website
+// visitor is not logged in). Returns ONLY the safe reply + conversationId +
+// status — never the internal debug block (system prompt, retrieved knowledge,
+// tool calls, latency) which is developer-only and must not leak to customers.
+// The runtime itself is tenant-scoped and never trusts a frontend-supplied
+// conversation id across tenants.
+// OPTIONS preflight for the cross-origin widget (Phase 17).
+router.options('/runtime/chat', (req: Request, res: Response) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  }
+  return res.status(204).end();
+});
+
+router.post('/runtime/chat', rateLimit({ ...RATE_LIMITS.public, prefix: 'chat' }), (req: Request, res: Response, next: NextFunction) => {
+  // CORS for the embeddable widget (Phase 17): the widget loads on external
+  // business websites (different origin) and POSTs to this endpoint. We allow
+  // any origin because tenancy is enforced by tenantId, not by origin, and
+  // rate limiting + payload limits provide abuse protection. Only the public
+  // chat endpoint is exposed cross-origin; authenticated dashboard routes are
+  // not.
+  const origin = req.headers.origin;
+  if (origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  }
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+  next();
+}, async (req: Request, res: Response) => {
   const { tenantId, userMessage, conversationId, channel, customerName, customerPhone } = req.body;
 
   if (!tenantId || !userMessage) {
     return res.status(400).json({ error: 'tenantId and userMessage are required.' });
+  }
+
+  // Payload-size guard: keep customer messages reasonable to limit abuse.
+  if (typeof userMessage !== 'string' || userMessage.length > 8000) {
+    return res.status(413).json({ error: 'Message too long.' });
   }
 
   try {
@@ -448,14 +678,57 @@ router.post('/runtime/chat', async (req: Request, res: Response) => {
       customerPhone
     });
 
-    res.json(result);
+    // Customer-facing: strip all internal diagnostics.
+    res.json({
+      reply: result.reply,
+      conversationId: result.conversationId,
+      status: result.status
+    });
   } catch (err: any) {
     res.status(500).json({
-      error: err.message || 'Agent runtime processing failed',
+      error: 'Agent runtime processing failed',
       fallbackMessage: "I am having trouble processing your request right now. I will connect you with a team member."
     });
   }
 });
+
+// Authenticated simulator endpoint for business owners/staff testing an agent.
+// Returns the full result INCLUDING the developer-only debug block (system
+// prompt, retrieved knowledge, tool calls, execution id) so the agent can be
+// debugged. Tenant-scoped: the requested tenant must be the caller's own
+// (platform owner may target any tenant).
+router.post(
+  '/runtime/simulate',
+  requireAuth,
+  requireTenantScope,
+  async (req: Request, res: Response) => {
+    const businessId = res.locals.businessId as string | null;
+    if (!businessId) {
+      return res.status(400).json({ error: 'businessId is required.' });
+    }
+    const { userMessage, conversationId, channel, customerName, customerPhone, versionId } = req.body;
+    if (!userMessage) {
+      return res.status(400).json({ error: 'userMessage is required.' });
+    }
+    try {
+      const result = await processAgentMessage({
+        tenantId: businessId,
+        userMessage,
+        conversationId,
+        channel: channel || 'web_chat',
+        customerName,
+        customerPhone,
+        versionId
+      });
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({
+        error: err.message || 'Agent runtime processing failed',
+        fallbackMessage: "I am having trouble processing your request right now. I will connect you with a team member."
+      });
+    }
+  }
+);
 
 // =========================================
 // 4. KNOWLEDGE BASE
@@ -469,7 +742,7 @@ router.get('/knowledge', requireAuth, requireTenantScope, (req: Request, res: Re
   res.json(items);
 });
 
-router.post('/knowledge', requireAuth, requireTenantScope, (req: Request, res: Response) => {
+router.post('/knowledge', requireAuth, requireTenantScope, async (req: Request, res: Response) => {
   const { title, type = 'faq', content, tags = [] } = req.body;
   const businessId = res.locals.businessId as string | null;
   if (!businessId || !title || !content) {
@@ -487,8 +760,27 @@ router.post('/knowledge', requireAuth, requireTenantScope, (req: Request, res: R
   };
 
   db.knowledgeChunks.push(chunk);
+  // Index for semantic retrieval (re-indexes on change; no-op if no API key).
+  indexChunk(chunk).catch(() => {/* embedding failures are non-fatal */});
   res.status(201).json(chunk);
 });
+
+router.put(
+  '/knowledge/:id',
+  requireAuth,
+  requireResourceAccess(req => db.knowledgeChunks.find(k => k.id === req.params.id)),
+  async (req: Request, res: Response) => {
+    const chunk = res.locals.resource as KnowledgeChunk;
+    const { title, content, tags, type } = req.body;
+    if (title !== undefined) chunk.title = title;
+    if (content !== undefined) chunk.content = content;
+    if (type !== undefined) chunk.type = type;
+    if (Array.isArray(tags)) chunk.tags = tags;
+    db.knowledgeChunks.update(chunk);
+    indexChunk(chunk).catch(() => {/* non-fatal */});
+    res.json(chunk);
+  }
+);
 
 router.delete(
   '/knowledge/:id',
@@ -500,6 +792,7 @@ router.delete(
     if (idx === -1) return res.status(404).json({ error: 'Item not found.' });
 
     db.knowledgeChunks.splice(idx, 1);
+    removeEmbedding(chunk.id).catch(() => {});
     res.json({ success: true });
   }
 );
@@ -519,33 +812,29 @@ router.get('/appointments', requireAuth, requireTenantScope, (req: Request, res:
   res.json(apps);
 });
 
-router.post('/appointments', requireAuth, requireTenantScope, (req: Request, res: Response) => {
+router.post('/appointments', requireAuth, requireTenantScope, async (req: Request, res: Response) => {
   const { serviceId, customerName, customerPhone, date, startTime, notes } = req.body;
   const businessId = res.locals.businessId as string | null;
+  if (!businessId) return res.status(400).json({ error: 'Invalid businessId.' });
 
-  const biz = businessId ? db.businesses.find(b => b.id === businessId) : undefined;
-  if (!biz) return res.status(400).json({ error: 'Invalid businessId.' });
-
-  const service = biz.services.find(s => s.id === serviceId) || biz.services[0];
-
-  const app: Appointment = {
-    id: `app-${Date.now()}`,
-    businessId,
-    serviceId: service ? service.id : 'srv-1',
-    serviceName: service ? service.name : 'Service',
-    customerId: `cust-${Date.now()}`,
+  // Delegate to the same transactional booking engine the agent runtime uses,
+  // so the REST API and the AI tool share ONE source of truth for overlap
+  // prevention, service-duration end times, and business-hours validation.
+  const result = await executeAgentTool('book_appointment', {
+    serviceIdOrName: serviceId,
     customerName,
     customerPhone,
     date,
     startTime,
-    endTime: `${parseInt(startTime.split(':')[0]) + 1}:00`,
-    status: 'CONFIRMED',
-    notes,
-    createdAt: new Date().toISOString()
-  };
+    notes
+  }, { tenantId: businessId, channel: 'web_chat' });
 
-  db.appointments.push(app);
-  res.status(201).json(app);
+  if (!result.success) {
+    return res.status(409).json({ error: result.error });
+  }
+  // The tool records the appointment; return the full record for the dashboard.
+  const created = db.appointments.find(a => a.id === result.data?.appointmentId);
+  res.status(201).json(created ?? result.data);
 });
 
 router.put(
@@ -624,6 +913,7 @@ router.post(
     const conv = res.locals.resource as Conversation;
 
     conv.status = 'HUMAN_HANDLING';
+    conv.handoffStartedAt = new Date().toISOString();
     db.conversations.update(conv);
 
     db.messages.push({
@@ -632,6 +922,14 @@ router.post(
       sender: 'system',
       content: 'A human team member has joined the chat and taken over.',
       channel: conv.channel,
+      timestamp: new Date().toISOString()
+    });
+
+    db.auditLogs.push({
+      id: `log-${Date.now()}`,
+      businessId: conv.businessId,
+      action: 'HUMAN_HANDOFF_ACCEPTED',
+      details: `Human took over conversation ${conv.id}.`,
       timestamp: new Date().toISOString()
     });
 
@@ -673,11 +971,39 @@ router.post(
   requireAuth,
   requireResourceAccess(req => db.conversations.find(c => c.id === req.params.id)),
   (req: Request, res: Response) => {
-    const conv = res.locals.resource as any;
+    const conv = res.locals.resource as Conversation;
 
     conv.status = 'RESOLVED';
+    conv.resolvedAt = new Date().toISOString();
     db.conversations.update(conv);
     res.json(conv);
+  }
+);
+
+// Resume AI: re-enable the agent on a resolved/handed-off conversation.
+router.post(
+  '/conversations/:id/resume',
+  requireAuth,
+  requireResourceAccess(req => db.conversations.find(c => c.id === req.params.id)),
+  (req: Request, res: Response) => {
+    const conv = res.locals.resource as Conversation;
+    // Only allow resuming from RESOLVED or HUMAN_HANDLING.
+    if (conv.status !== 'RESOLVED' && conv.status !== 'HUMAN_HANDLING' && conv.status !== 'WAITING_FOR_HUMAN') {
+      return res.status(400).json({ error: `Cannot resume a conversation in ${conv.status}.` });
+    }
+    conv.status = 'AI_HANDLING';
+    db.conversations.update(conv);
+
+    db.messages.push({
+      id: `msg-${Date.now()}-system`,
+      conversationId: conv.id,
+      sender: 'system',
+      content: 'AI assistant has resumed handling this conversation.',
+      channel: conv.channel,
+      timestamp: new Date().toISOString()
+    });
+
+    res.json({ success: true, conversation: conv });
   }
 );
 
