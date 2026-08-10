@@ -33,6 +33,29 @@ import {
 
 export const router = Router();
 
+/**
+ * Cap a list response to bound memory and protect against unbounded result
+ * sets as a business grows. Honours ?limit (capped at MAX) and ?cursor
+ * (zero-based offset). Returns a plain array slice so existing API clients that
+ * expect an array keep working; total count + next cursor are exposed via
+ * response headers for clients that want pagination.
+ */
+const PAGINATION_MAX = 100;
+const PAGINATION_DEFAULT = 50;
+function paginate<T>(items: T[], req: Request, res: Response): T[] {
+  const limit = Math.min(
+    Math.max(1, parseInt(String(req.query.limit ?? ''), 10) || PAGINATION_DEFAULT),
+    PAGINATION_MAX
+  );
+  const cursor = Math.max(0, parseInt(String(req.query.cursor ?? ''), 10) || 0);
+  const page = items.slice(cursor, cursor + limit);
+  const nextCursor = cursor + limit;
+  const hasMore = nextCursor < items.length;
+  res.setHeader('X-Total-Count', String(items.length));
+  if (hasMore) res.setHeader('X-Next-Cursor', String(nextCursor));
+  return page;
+}
+
 // Health Check (public)
 router.get('/health', (req: Request, res: Response) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -773,7 +796,7 @@ router.get('/knowledge', requireAuth, requireTenantScope, (req: Request, res: Re
   if (!businessId) return res.status(400).json({ error: 'businessId required.' });
 
   const items = db.knowledgeChunks.filter(k => k.businessId === businessId);
-  res.json(items);
+  res.json(paginate(items, req, res));
 });
 
 router.post('/knowledge', requireAuth, requireTenantScope, async (req: Request, res: Response) => {
@@ -843,7 +866,7 @@ router.get('/appointments', requireAuth, requireTenantScope, (req: Request, res:
   if (date) apps = apps.filter(a => a.date === date);
   if (status) apps = apps.filter(a => a.status === status);
 
-  res.json(apps);
+  res.json(paginate(apps, req, res));
 });
 
 router.post('/appointments', requireAuth, requireTenantScope, async (req: Request, res: Response) => {
@@ -891,7 +914,7 @@ router.put(
 router.get('/products', requireAuth, requireTenantScope, (req: Request, res: Response) => {
   const businessId = res.locals.businessId as string | null;
   const items = businessId ? db.products.filter(p => p.businessId === businessId) : db.products.toJSON();
-  res.json(items);
+  res.json(paginate(items, req, res));
 });
 
 router.post('/products', requireAuth, requireTenantScope, (req: Request, res: Response) => {
@@ -914,7 +937,7 @@ router.post('/products', requireAuth, requireTenantScope, (req: Request, res: Re
 router.get('/orders', requireAuth, requireTenantScope, (req: Request, res: Response) => {
   const businessId = res.locals.businessId as string | null;
   const orders = businessId ? db.orders.filter(o => o.businessId === businessId) : db.orders.toJSON();
-  res.json(orders);
+  res.json(paginate(orders, req, res));
 });
 
 // =========================================
@@ -924,7 +947,7 @@ router.get('/orders', requireAuth, requireTenantScope, (req: Request, res: Respo
 router.get('/conversations', requireAuth, requireTenantScope, (req: Request, res: Response) => {
   const businessId = res.locals.businessId as string | null;
   const convs = businessId ? db.conversations.filter(c => c.businessId === businessId) : db.conversations.toJSON();
-  res.json(convs);
+  res.json(paginate(convs, req, res));
 });
 
 router.get(
@@ -934,7 +957,7 @@ router.get(
   (req: Request, res: Response) => {
     const conv = res.locals.resource as { id: string };
     const msgs = db.messages.filter(m => m.conversationId === conv.id);
-    res.json(msgs);
+    res.json(paginate(msgs, req, res));
   }
 );
 
@@ -1241,10 +1264,12 @@ router.get('/audit-logs', requireAuth, (req: Request, res: Response) => {
     if (user.role !== 'PLATFORM_OWNER' && String(businessId) !== user.businessId) {
       return res.status(404).json({ error: 'Not found.' });
     }
-    return res.json(db.auditLogs.filter(l => l.businessId === businessId).reverse());
+    const logs = db.auditLogs.filter(l => l.businessId === businessId).reverse();
+    return res.json(paginate(logs, req, res));
   }
-  const logs = user.role === 'PLATFORM_OWNER'
+  const logs = (user.role === 'PLATFORM_OWNER'
     ? db.auditLogs.toJSON()
-    : db.auditLogs.filter(l => l.businessId === user.businessId);
-  res.json(logs.slice(-50).reverse());
+    : db.auditLogs.filter(l => l.businessId === user.businessId)
+  ).reverse();
+  res.json(paginate(logs, req, res));
 });
