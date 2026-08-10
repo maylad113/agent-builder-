@@ -911,8 +911,10 @@ router.put(
     // let a caller overwrite id/businessId/serviceId (tenant-isolation bypass /
     // mass-assignment) or forge completion status.
     const { status, notes } = req.body || {};
-    const ALLOWED_STATUS = ['CONFIRMED', 'CANCELLED', 'COMPLETED', 'NO_SHOW'];
-    if (typeof status === 'string' && ALLOWED_STATUS.includes(status)) app.status = status;
+    const ALLOWED_STATUS = ['CONFIRMED', 'CANCELLED', 'RESCHEDULED'];
+    if (typeof status === 'string' && ALLOWED_STATUS.includes(status)) {
+      app.status = status as Appointment['status'];
+    }
     if (typeof notes === 'string') app.notes = notes.slice(0, 1000);
     db.appointments.update(app);
 

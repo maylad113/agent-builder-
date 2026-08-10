@@ -2,18 +2,18 @@
 
 Persistent memory for this repository. Read first when working on this project.
 
-## Current state (2026-08-10, hardening pass)
-- **75 tests across 14 files, all passing.** `npx tsc --noEmit` clean, `npm run build` clean.
-- Migration count is now **6** (added `006_integration_states_widget_origins.sql`).
-- Production server verified: `node dist/server.cjs` applies 6 migrations, health/SPA/widget.js all 200, widget chat from disallowed origin returns 403, integration validate with bogus creds returns ERROR (live Google API probe).
-- Hardening pass completed:
-  - **P1.1 Integration lifecycle**: `src/server/integrations.ts` defines `IntegrationProvider` (Google/Meta/Twilio/Voice) with real API-probe `validate()`. `IntegrationConfig.state` replaces the old `connected` boolean (NOT_CONFIGURED/CONFIGURING/CONNECTED/ERROR/DISCONNECTED). The PUT route no longer accepts `state`/`connected` from the client; the ONLY path to CONNECTED is POST `/:id/credentials` + POST `/:id/validate`. Credentials are server-side only (never in the DB row or API response).
-  - **P1.2 Widget origin enforcement**: `src/server/widgetSecurity.ts`. `/runtime/chat` OPTIONS+POST enforce `business.allowedWidgetOrigins`. Widget sends `?business=` query + `x-business-id` header so the preflight can resolve the tenant.
-  - **P1.3 Published-version enforcement**: `agentRuntime.processAgentMessage` adds a `simulator` flag; production path uses `getPublishedVersion()` ONLY and escalates to a human (never serves a draft) when no version is published. The old `ACTIVE||READY||TESTING` fallback-to-any-agent is removed.
-  - **P1.4 Order transaction rollback**: `tools.ts` order creation now THROWS inside `db.sqlite.transaction()` (only a throw rolls back in better-sqlite3); caught outside and returned as a failure. Failed multi-item orders leave inventory unchanged (no partial deduction).
-  - **P2 Session cookie**: `secure` flag is now `process.env.NODE_ENV === 'production'`.
-  - **Mass-assignment**: PUT `/businesses/:id` uses an allowlist (never `Object.assign`); supports new `holidays` + `allowedWidgetOrigins`.
-- Phases BLOCKED on external credentials: 13 (Google Calendar), 14 (Meta/Instagram), 15 (Twilio), 16 (Voice). The provider interfaces + real official-API validation code now EXIST (Phase 11/P1.1); a missing optional credential leaves the integration NOT_CONFIGURED and does NOT break startup (verified by tests/noOptionalEnv.test.ts). To fully connect, supply the matching env vars / OAuth tokens via the credentials endpoint.
+## Current state (2026-08-10, hardening pass — appointment engine + webhooks + security)
+- **112 tests across 17 files, all passing.** `npx tsc --noEmit` clean, `npm run build` clean, production smoke verified.
+- Migration count: **6**. Production server verified end-to-end: migrations auto-apply, health/SPA/widget.js 200, login requires SESSION_SECRET, widget chat from allowed origin 200 + conversation stored + graceful WAITING_FOR_HUMAN fallback, from disallowed origin 403, Meta/Twilio webhooks 403 NOT_CONFIGURED without crashing.
+- This hardening pass added:
+  - **Appointment engine v2** (`src/server/appointmentEngine.ts`): timezone-aware day-of-week, holiday/closed-day/hours/duration-overflow/minimum-notice/maximum-advance validation, staff-coverage slot generation with bidirectional service-buffer overlap, parseBookingNotice policy parsing. `tools.ts` book/reschedule share ONE transactional overlap+buffer guard (race-condition safe, tested in concurrency.test.ts).
+  - **Webhooks** (`src/server/webhooks.ts`, mounted at `/api/webhooks` before global body parsers): Meta Instagram (GET verify-token + POST X-Hub-Signature-256 HMAC) and Twilio (POST X-Twilio-Signature HMAC-SHA1 + missed-call AI receptionist + STOP opt-out). Server-side business resolution from page-id/phone-number (never trusts inbound tenant id). Idempotent via processed-id dedup (re-delivery safe). 11 tests over real loopback HTTP.
+  - **Capped list pagination**: high-volume list endpoints (conversations, appointments, messages, knowledge, products, orders, audit-logs) return a capped array (default 50, max 100) with `X-Total-Count`/`X-Next-Cursor` headers — non-breaking for existing array-expecting clients.
+  - **Mass-assignment fix**: `PUT /appointments/:id` switched from `Object.assign` to an explicit `{status, notes}` allow-list (prevents businessId/id/serviceId overwrite = tenant-isolation bypass). Regression-tested.
+  - **Widget Origin-header bypass fix**: production mode rejects `/runtime/chat` requests with NO Origin header (prevents non-browser clients targeting arbitrary tenantId to consume LLM quota). Regression-tested.
+- Prior hardening (commit db6ce44): P1.1 Integration lifecycle, P1.2 widget origin enforcement, P1.3 published-version gating, P1.4 order transaction rollback, P2 secure cookie flag, business update allow-list.
+- Phases BLOCKED on external credentials: 13 (Google Calendar), 14 (Meta/Instagram), 15 (Twilio), 16 (Voice). The provider interfaces + real official-API validation code + webhook signature verification now EXIST and are tested; a missing optional credential leaves the integration NOT_CONFIGURED and does NOT break startup (verified by tests/noOptionalEnv.test.ts + webhooks.test.ts). To fully connect, supply the matching env vars / OAuth tokens via the credentials endpoint.
+- **Push to GitHub BLOCKED**: the configured `GITHUB_TOKEN` lacks `Contents: write` scope for `maylad113/agent-builder-`. Commits are local only until a PAT with write access is provided.
 
 ## Stack
 - TypeScript + Vite (frontend React 19) + Express (backend) in one process.
@@ -38,6 +38,8 @@ Persistent memory for this repository. Read first when working on this project.
 - `src/server/agentVersions.ts` — DRAFT/TESTING/PUBLISHED/ARCHIVED lifecycle.
 - `src/server/embeddings.ts` — RAG embeddings (Gemini) + keyword fallback.
 - `src/server/integrations.ts` — `IntegrationProvider` abstraction (Google/Meta/Twilio/Voice) + credential store (server-side only) + `runValidation` (only path to CONNECTED).
+- `src/server/appointmentEngine.ts` — centralized scheduling: hours/holiday/notice/buffer/staff validation + slot generation (shared by REST API + agent tool).
+- `src/server/webhooks.ts` — Meta/Instagram + Twilio webhook router (signature verification, idempotent, missed-call AI receptionist). Mounted at `/api/webhooks` before global body parsers.
 - `src/server/widgetSecurity.ts` — per-business widget origin allow-list + CORS header builder.
 - `public/widget.js` — embeddable chat widget; derives `apiOrigin` from script src for cross-origin embedding.
 
