@@ -700,6 +700,13 @@ router.post('/runtime/chat', rateLimit({ ...RATE_LIMITS.public, prefix: 'chat' }
   // tenantId inside the runtime; origin is an additional layer.
   const { tenantId } = req.body || {};
   const origin = req.headers.origin;
+  // In production, require an Origin header AND a business allow-list match.
+  // A missing Origin header must NOT bypass enforcement (otherwise any
+  // non-browser client could target an arbitrary tenantId to consume its LLM
+  // quota). In development we still allow localhost/curl for the dev loop.
+  if (process.env.NODE_ENV === 'production' && !origin) {
+    return res.status(403).json({ error: 'Origin not allowed.' });
+  }
   const headers = tenantId ? widgetCorsHeaders(tenantId, origin) : null;
   if (origin && !headers) {
     // Unknown origin: reject. Don't reflect the origin.
@@ -900,9 +907,24 @@ router.put(
   requireResourceAccess(req => db.appointments.find(a => a.id === req.params.id)),
   (req: Request, res: Response) => {
     const app = res.locals.resource as Appointment;
-
-    Object.assign(app, req.body);
+    // Whitelist mutable fields only. NEVER Object.assign(req.body) — that would
+    // let a caller overwrite id/businessId/serviceId (tenant-isolation bypass /
+    // mass-assignment) or forge completion status.
+    const { status, notes } = req.body || {};
+    const ALLOWED_STATUS = ['CONFIRMED', 'CANCELLED', 'COMPLETED', 'NO_SHOW'];
+    if (typeof status === 'string' && ALLOWED_STATUS.includes(status)) app.status = status;
+    if (typeof notes === 'string') app.notes = notes.slice(0, 1000);
     db.appointments.update(app);
+
+    if (status === 'CANCELLED') {
+      db.auditLogs.push({
+        id: `log-${Date.now()}`,
+        businessId: app.businessId,
+        action: 'APPOINTMENT_CANCELLED',
+        details: `Appointment ${app.id} cancelled.`,
+        timestamp: new Date().toISOString()
+      });
+    }
     res.json(app);
   }
 );
