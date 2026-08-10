@@ -4,18 +4,23 @@ import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import { router as apiRouter } from './src/server/routes';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Resolve the project root in both run modes:
+//  - dev (`tsx server.ts`): executed as ESM, so import.meta.url points at this file.
+//  - production (`node dist/server.cjs`): esbuild bundles to CJS where import.meta.url
+//    is empty, but the native __dirname points at dist/. The project root is one level up.
+const IS_CJS = typeof __dirname !== 'undefined';
+const serverDir = IS_CJS ? __dirname : path.dirname(fileURLToPath(import.meta.url));
+const projectRoot = IS_CJS ? path.join(__dirname, '..') : serverDir;
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
 
   // Static public directory (for embeddable widget.js script)
-  app.use(express.static(path.join(__dirname, 'public')));
+  app.use(express.static(path.join(projectRoot, 'public')));
 
   // Mount API Routes FIRST
   app.use('/api', apiRouter);
@@ -28,7 +33,7 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(__dirname, 'dist');
+    const distPath = path.join(projectRoot, 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));

@@ -394,6 +394,7 @@ export async function executeAgentTool(
         }
 
         app.status = 'CANCELLED';
+        db.appointments.update(app);
 
         db.auditLogs.push({
           id: `log-${Date.now()}`,
@@ -424,6 +425,7 @@ export async function executeAgentTool(
         app.date = newDate;
         app.startTime = newTime;
         app.status = 'RESCHEDULED';
+        db.appointments.update(app);
 
         return {
           success: true,
@@ -480,6 +482,7 @@ export async function executeAgentTool(
           }
 
           product.inventory -= item.quantity; // Deduct inventory safely
+          db.products.update(product);
           const itemTotal = product.price * item.quantity;
           totalAmount += itemTotal;
           orderItems.push({
@@ -577,6 +580,7 @@ export async function executeAgentTool(
           const conv = db.conversations.find(c => c.id === conversationId);
           if (conv) {
             conv.status = 'WAITING_FOR_HUMAN';
+            db.conversations.update(conv);
           }
         }
 

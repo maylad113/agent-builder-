@@ -1,0 +1,17 @@
+# Dependencies are installed to /opt/agentforge via --prefix (see /home/team/shared/skills
+# if you need to reinstall). Never commit node_modules or the symlink.
+node_modules
+
+# Build output
+dist/
+
+# Local SQLite database (lives at ./data/agentforge.db; small, persists on disk)
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Logs & misc
+*.log
+.DS_Store

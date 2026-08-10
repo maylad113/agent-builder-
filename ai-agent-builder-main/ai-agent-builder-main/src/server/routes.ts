@@ -29,7 +29,7 @@ router.get('/auth/me', (req: Request, res: Response) => {
 // Get all businesses (with optional search/type filters)
 router.get('/businesses', (req: Request, res: Response) => {
   const { search, type, status } = req.query;
-  let result = db.businesses;
+  let result = db.businesses.toJSON();
 
   if (search) {
     const q = String(search).toLowerCase();
@@ -160,6 +160,7 @@ router.put('/businesses/:id', (req: Request, res: Response) => {
   if (!biz) return res.status(404).json({ error: 'Business not found.' });
 
   Object.assign(biz, req.body, { updatedAt: new Date().toISOString() });
+  db.businesses.update(biz);
   res.json(biz);
 });
 
@@ -316,6 +317,7 @@ router.put('/agents/:id', (req: Request, res: Response) => {
     version: newVersion,
     updatedAt: new Date().toISOString()
   });
+  db.agents.update(agent);
 
   db.auditLogs.push({
     id: `log-${Date.now()}`,
@@ -347,6 +349,7 @@ router.post('/agents/:id/status', (req: Request, res: Response) => {
 
   agent.status = status;
   agent.updatedAt = new Date().toISOString();
+  db.agents.update(agent);
 
   db.auditLogs.push({
     id: `log-${Date.now()}`,
@@ -436,7 +439,7 @@ router.delete('/knowledge/:id', (req: Request, res: Response) => {
 
 router.get('/appointments', (req: Request, res: Response) => {
   const { businessId, date, status } = req.query;
-  let apps = db.appointments;
+  let apps = db.appointments.toJSON();
 
   if (businessId) apps = apps.filter(a => a.businessId === businessId);
   if (date) apps = apps.filter(a => a.date === date);
@@ -478,6 +481,7 @@ router.put('/appointments/:id', (req: Request, res: Response) => {
   if (!app) return res.status(404).json({ error: 'Appointment not found.' });
 
   Object.assign(app, req.body);
+  db.appointments.update(app);
   res.json(app);
 });
 
@@ -487,7 +491,7 @@ router.put('/appointments/:id', (req: Request, res: Response) => {
 
 router.get('/products', (req: Request, res: Response) => {
   const { businessId } = req.query;
-  let items = db.products;
+  let items = db.products.toJSON();
   if (businessId) items = items.filter(p => p.businessId === businessId);
   res.json(items);
 });
@@ -510,7 +514,7 @@ router.post('/products', (req: Request, res: Response) => {
 
 router.get('/orders', (req: Request, res: Response) => {
   const { businessId } = req.query;
-  let orders = db.orders;
+  let orders = db.orders.toJSON();
   if (businessId) orders = orders.filter(o => o.businessId === businessId);
   res.json(orders);
 });
@@ -521,7 +525,7 @@ router.get('/orders', (req: Request, res: Response) => {
 
 router.get('/conversations', (req: Request, res: Response) => {
   const { businessId } = req.query;
-  let convs = db.conversations;
+  let convs = db.conversations.toJSON();
   if (businessId) convs = convs.filter(c => c.businessId === businessId);
   res.json(convs);
 });
@@ -537,7 +541,8 @@ router.post('/conversations/:id/takeover', (req: Request, res: Response) => {
   if (!conv) return res.status(404).json({ error: 'Conversation not found.' });
 
   conv.status = 'HUMAN_HANDLING';
-  
+  db.conversations.update(conv);
+
   db.messages.push({
     id: `msg-${Date.now()}-system`,
     conversationId: conv.id,
@@ -569,6 +574,7 @@ router.post('/conversations/:id/message', (req: Request, res: Response) => {
 
   db.messages.push(msg);
   conv.lastMessageAt = new Date().toISOString();
+  db.conversations.update(conv);
 
   res.json(msg);
 });
@@ -579,6 +585,7 @@ router.post('/conversations/:id/resolve', (req: Request, res: Response) => {
   if (!conv) return res.status(404).json({ error: 'Conversation not found.' });
 
   conv.status = 'RESOLVED';
+  db.conversations.update(conv);
   res.json(conv);
 });
 
@@ -601,7 +608,7 @@ function getSecureJwtSecret(): string {
 
 router.get('/channels', (req: Request, res: Response) => {
   const { businessId } = req.query;
-  let chans = db.channels;
+  let chans = db.channels.toJSON();
   if (businessId) chans = chans.filter(c => c.businessId === businessId);
   res.json(chans);
 });
@@ -615,6 +622,7 @@ router.put('/channels/:id', (req: Request, res: Response) => {
   if (details) chan.details = details;
   if (configData) chan.configData = configData;
   chan.updatedAt = new Date().toISOString();
+  db.channels.update(chan);
 
   db.auditLogs.push({
     id: `log-${Date.now()}`,
@@ -629,7 +637,7 @@ router.put('/channels/:id', (req: Request, res: Response) => {
 
 router.get('/integrations', (req: Request, res: Response) => {
   const { businessId } = req.query;
-  let items = db.integrations;
+  let items = db.integrations.toJSON();
   if (businessId) items = items.filter(i => i.businessId === businessId);
   res.json(items);
 });
@@ -644,6 +652,7 @@ router.put('/integrations/:id', (req: Request, res: Response) => {
   if (typeof credentialsSet === 'boolean') integ.credentialsSet = credentialsSet;
   if (configData) integ.configData = configData;
   integ.lastSync = new Date().toISOString();
+  db.integrations.update(integ);
 
   db.auditLogs.push({
     id: `log-${Date.now()}`,

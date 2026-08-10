@@ -1,3 +1,6 @@
+import fs from 'fs';
+import path from 'path';
+import BetterSqlite3 from 'better-sqlite3';
 import {
   Business,
   Agent,
@@ -16,28 +19,363 @@ import {
   StaffMember
 } from '../types';
 
-class InMemoryDatabase {
-  public businesses: Business[] = [];
-  public agents: Agent[] = [];
-  public knowledgeChunks: KnowledgeChunk[] = [];
-  public customers: Customer[] = [];
-  public conversations: Conversation[] = [];
-  public messages: Message[] = [];
-  public appointments: Appointment[] = [];
-  public staffMembers: StaffMember[] = [];
-  public products: Product[] = [];
-  public orders: Order[] = [];
-  public channels: ChannelConfig[] = [];
-  public integrations: IntegrationConfig[] = [];
-  public templates: AgentTemplate[] = [];
-  public usageRecords: UsageRecord[] = [];
-  public auditLogs: AuditLog[] = [];
+/**
+ * SQLite-backed repository for the AI Agent Factory MVP.
+ *
+ * Design goals:
+ *  - Keep the exact call-site shape the rest of the server code uses
+ *    (`db.businesses.find(...)`, `db.agents.filter(...)`, `db.customers.push(...)`,
+ *    `db.knowledgeChunks.splice(...)`, `db.usageRecords.reduce(...)`, ...).
+ *  - Every read goes to SQLite; every write goes to SQLite. No business data
+ *    lives in JS arrays.
+ *  - Objects returned by `find`/`filter` are fresh parses of DB rows, so a
+ *    caller that mutates the object (e.g. `conversation.status = ...`) must
+ *    call `<collection>.update(record)` to persist — the call sites do that.
+ *  - Nested/structured fields (arrays/objects) are stored as JSON TEXT and
+ *    parsed back into the exact shapes defined in src/types/index.ts.
+ */
 
-  constructor() {
-    this.seed();
+// ---------------------------------------------------------------------------
+// Table configuration
+// ---------------------------------------------------------------------------
+
+interface TableConfig {
+  table: string;
+  /** Field names whose value is an object/array and is stored as JSON TEXT. */
+  jsonColumns: string[];
+  /** Field names stored as SQLite INTEGER 0/1 but exposed as booleans. */
+  booleanColumns: string[];
+}
+
+const TABLES: Record<string, TableConfig> = {
+  businesses: {
+    table: 'businesses',
+    jsonColumns: ['hours', 'services', 'faqs', 'policies'],
+    booleanColumns: []
+  },
+  agents: {
+    table: 'agents',
+    jsonColumns: ['structuredConfig'],
+    booleanColumns: []
+  },
+  knowledgeChunks: {
+    table: 'knowledge_chunks',
+    jsonColumns: ['tags'],
+    booleanColumns: []
+  },
+  customers: {
+    table: 'customers',
+    jsonColumns: [],
+    booleanColumns: []
+  },
+  conversations: {
+    table: 'conversations',
+    jsonColumns: [],
+    booleanColumns: []
+  },
+  messages: {
+    table: 'messages',
+    jsonColumns: ['toolCalls'],
+    booleanColumns: []
+  },
+  appointments: {
+    table: 'appointments',
+    jsonColumns: [],
+    booleanColumns: []
+  },
+  staffMembers: {
+    table: 'staff_members',
+    jsonColumns: ['servicesHandled'],
+    booleanColumns: []
+  },
+  products: {
+    table: 'products',
+    jsonColumns: [],
+    booleanColumns: []
+  },
+  orders: {
+    table: 'orders',
+    jsonColumns: ['items'],
+    booleanColumns: []
+  },
+  channels: {
+    table: 'channels',
+    jsonColumns: ['configData'],
+    booleanColumns: []
+  },
+  integrations: {
+    table: 'integrations',
+    jsonColumns: ['configData'],
+    booleanColumns: ['connected', 'credentialsSet']
+  },
+  templates: {
+    table: 'templates',
+    jsonColumns: ['defaultServices', 'defaultFaqs', 'defaultAgentConfig'],
+    booleanColumns: []
+  },
+  usageRecords: {
+    table: 'usage_records',
+    jsonColumns: [],
+    booleanColumns: []
+  },
+  auditLogs: {
+    table: 'audit_logs',
+    jsonColumns: [],
+    booleanColumns: []
+  }
+};
+
+function camelToSnake(s: string): string {
+  return s.replace(/[A-Z]/g, c => `_${c.toLowerCase()}`);
+}
+
+function snakeToCamel(s: string): string {
+  return s.replace(/_([a-z])/g, (_m, c: string) => c.toUpperCase());
+}
+
+// ---------------------------------------------------------------------------
+// Migrations
+// ---------------------------------------------------------------------------
+
+function runMigrations(sqlite: BetterSqlite3.Database, migrationsDir: string): void {
+  sqlite.exec(
+    `CREATE TABLE IF NOT EXISTS schema_migrations (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       name TEXT NOT NULL UNIQUE,
+       applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+     )`
+  );
+
+  if (!fs.existsSync(migrationsDir)) {
+    throw new Error(`Migrations directory not found: ${migrationsDir}`);
   }
 
-  private seed() {
+  const files = fs
+    .readdirSync(migrationsDir)
+    .filter(f => f.endsWith('.sql'))
+    .sort();
+
+  const appliedRows = sqlite.prepare('SELECT name FROM schema_migrations').all() as Array<{ name: string }>;
+  const applied = new Set(appliedRows.map(r => r.name));
+
+  for (const file of files) {
+    if (applied.has(file)) continue;
+    const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
+    sqlite.exec(sql);
+    sqlite.prepare('INSERT INTO schema_migrations (name) VALUES (?)').run(file);
+    console.log(`[db] applied migration: ${file}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Collection: array-like facade over a SQLite table
+// ---------------------------------------------------------------------------
+
+type Row = Record<string, any>;
+
+class Collection<T extends { id: string }> {
+  constructor(
+    private sqlite: BetterSqlite3.Database,
+    private config: TableConfig
+  ) {}
+
+  private columnNames(): string[] {
+    const rows = this.sqlite.prepare(`PRAGMA table_info(${this.config.table})`).all() as Array<{ name: string }>;
+    return rows.map(r => r.name);
+  }
+
+  private rowToObject(row: Row): T {
+    const jsonSet = new Set(this.config.jsonColumns);
+    const boolSet = new Set(this.config.booleanColumns);
+    const obj: Record<string, any> = {};
+    for (const [col, value] of Object.entries(row)) {
+      const field = snakeToCamel(col);
+      if (jsonSet.has(field)) {
+        obj[field] = value == null ? undefined : JSON.parse(value);
+      } else if (boolSet.has(field)) {
+        obj[field] = value === 1 || value === true;
+      } else {
+        obj[field] = value;
+      }
+    }
+    return obj as T;
+  }
+
+  private objectToRow(obj: T): Row {
+    const jsonSet = new Set(this.config.jsonColumns);
+    const boolSet = new Set(this.config.booleanColumns);
+    const row: Row = {};
+    for (const [field, value] of Object.entries(obj as Record<string, any>)) {
+      if (field === 'id') {
+        row.id = value;
+        continue;
+      }
+      const col = camelToSnake(field);
+      if (jsonSet.has(field)) {
+        row[col] = value == null ? null : JSON.stringify(value);
+      } else if (boolSet.has(field)) {
+        row[col] = value ? 1 : 0;
+      } else {
+        row[col] = value == null ? null : value;
+      }
+    }
+    return row;
+  }
+
+  /** Load every row (insertion order), parsed to domain objects. */
+  private allRows(): T[] {
+    const rows = this.sqlite.prepare(`SELECT * FROM ${this.config.table} ORDER BY rowid`).all() as Row[];
+    return rows.map(r => this.rowToObject(r));
+  }
+
+  find(predicate: (item: T) => boolean): T | undefined {
+    return this.allRows().find(predicate);
+  }
+
+  filter(predicate: (item: T) => boolean): T[] {
+    return this.allRows().filter(predicate);
+  }
+
+  findIndex(predicate: (item: T) => boolean): number {
+    return this.allRows().findIndex(predicate);
+  }
+
+  push(...items: T[]): number {
+    const columns = this.columnNames();
+    const allowed = new Set(columns);
+    const insert = this.sqlite.prepare(
+      `INSERT INTO ${this.config.table} (id, ${columns.filter(c => c !== 'id').join(', ')}) VALUES (${columns
+        .map(() => '?')
+        .join(', ')})`
+    );
+    for (const item of items) {
+      const row = this.objectToRow(item);
+      const values = columns.map(c => (c === 'id' ? row.id : allowed.has(c) ? row[c] ?? null : null));
+      insert.run(values);
+    }
+    return this.length;
+  }
+
+  /** Persist the current state of a record that a caller mutated in place. */
+  update(item: T): void {
+    const columns = this.columnNames().filter(c => c !== 'id');
+    const row = this.objectToRow(item);
+    const setClause = columns.map(c => `${c} = ?`).join(', ');
+    const stmt = this.sqlite.prepare(`UPDATE ${this.config.table} SET ${setClause} WHERE id = ?`);
+    const result = stmt.run([...columns.map(c => row[c] ?? null), item.id]);
+    if (result.changes === 0) {
+      throw new Error(`Cannot update: no row with id '${item.id}' in ${this.config.table}`);
+    }
+  }
+
+  /** Array semantics: delete rows between start and start+deleteCount. */
+  splice(start: number, deleteCount?: number): T[] {
+    const rows = this.allRows();
+    const removed = rows.splice(start, deleteCount === undefined ? rows.length - start : deleteCount);
+    const del = this.sqlite.prepare(`DELETE FROM ${this.config.table} WHERE id = ?`);
+    for (const r of removed) {
+      del.run(r.id);
+    }
+    return removed;
+  }
+
+  slice(start?: number, end?: number): T[] {
+    return this.allRows().slice(start, end);
+  }
+
+  reduce<U>(callback: (acc: U, item: T) => U, initial: U): U {
+    return this.allRows().reduce(callback, initial);
+  }
+
+  get length(): number {
+    const row = this.sqlite.prepare(`SELECT COUNT(*) AS c FROM ${this.config.table}`).get() as { c: number };
+    return row.c;
+  }
+
+  /** Lets `res.json(db.<collection>)` serialize as the plain array it always was. */
+  toJSON(): T[] {
+    return this.allRows();
+  }
+
+  [Symbol.iterator](): Iterator<T> {
+    return this.allRows()[Symbol.iterator]();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// AppDatabase
+// ---------------------------------------------------------------------------
+
+export interface AppDatabaseOptions {
+  dbPath?: string;
+  migrationsDir?: string;
+  seed?: boolean;
+}
+
+export class AppDatabase {
+  public sqlite: BetterSqlite3.Database;
+  public readonly dbPath: string;
+  public readonly migrationsDir: string;
+
+  public businesses: Collection<Business>;
+  public agents: Collection<Agent>;
+  public knowledgeChunks: Collection<KnowledgeChunk>;
+  public customers: Collection<Customer>;
+  public conversations: Collection<Conversation>;
+  public messages: Collection<Message>;
+  public appointments: Collection<Appointment>;
+  public staffMembers: Collection<StaffMember>;
+  public products: Collection<Product>;
+  public orders: Collection<Order>;
+  public channels: Collection<ChannelConfig>;
+  public integrations: Collection<IntegrationConfig>;
+  public templates: Collection<AgentTemplate>;
+  public usageRecords: Collection<UsageRecord>;
+  public auditLogs: Collection<AuditLog>;
+
+  constructor(opts: AppDatabaseOptions = {}) {
+    this.dbPath = opts.dbPath || process.env.DB_PATH || path.join(process.cwd(), 'data', 'agentforge.db');
+    this.migrationsDir = opts.migrationsDir || process.env.MIGRATIONS_DIR || path.join(process.cwd(), 'migrations');
+
+    fs.mkdirSync(path.dirname(this.dbPath), { recursive: true });
+    this.sqlite = new BetterSqlite3(this.dbPath);
+    this.sqlite.pragma('journal_mode = WAL');
+    this.sqlite.pragma('foreign_keys = ON');
+
+    runMigrations(this.sqlite, this.migrationsDir);
+
+    this.businesses = new Collection<Business>(this.sqlite, TABLES.businesses);
+    this.agents = new Collection<Agent>(this.sqlite, TABLES.agents);
+    this.knowledgeChunks = new Collection<KnowledgeChunk>(this.sqlite, TABLES.knowledgeChunks);
+    this.customers = new Collection<Customer>(this.sqlite, TABLES.customers);
+    this.conversations = new Collection<Conversation>(this.sqlite, TABLES.conversations);
+    this.messages = new Collection<Message>(this.sqlite, TABLES.messages);
+    this.appointments = new Collection<Appointment>(this.sqlite, TABLES.appointments);
+    this.staffMembers = new Collection<StaffMember>(this.sqlite, TABLES.staffMembers);
+    this.products = new Collection<Product>(this.sqlite, TABLES.products);
+    this.orders = new Collection<Order>(this.sqlite, TABLES.orders);
+    this.channels = new Collection<ChannelConfig>(this.sqlite, TABLES.channels);
+    this.integrations = new Collection<IntegrationConfig>(this.sqlite, TABLES.integrations);
+    this.templates = new Collection<AgentTemplate>(this.sqlite, TABLES.templates);
+    this.usageRecords = new Collection<UsageRecord>(this.sqlite, TABLES.usageRecords);
+    this.auditLogs = new Collection<AuditLog>(this.sqlite, TABLES.auditLogs);
+
+    if (opts.seed !== false) {
+      this.seed();
+    }
+  }
+
+  close(): void {
+    this.sqlite.close();
+  }
+
+  /** Seed the Tony's Barber Shop demo tenant. Idempotent: only runs when the DB is empty. */
+  private seed(): void {
+    const businessCount = (this.sqlite.prepare('SELECT COUNT(*) AS c FROM businesses').get() as { c: number }).c;
+    if (businessCount > 0) {
+      return;
+    }
+
     const defaultHours = [
       { day: 'monday', isOpen: true, openTime: '09:00', closeTime: '20:00' },
       { day: 'tuesday', isOpen: true, openTime: '09:00', closeTime: '20:00' },
@@ -80,7 +418,6 @@ class InMemoryDatabase {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
-
     this.businesses.push(tonysBarber);
 
     // 2. Staff Members for Tony's
@@ -524,4 +861,5 @@ Never invent prices, hours, services, or availability that do not exist in the d
   }
 }
 
-export const db = new InMemoryDatabase();
+// Singleton used by routes.ts / agentRuntime.ts / tools.ts (same shape as before).
+export const db = new AppDatabase();

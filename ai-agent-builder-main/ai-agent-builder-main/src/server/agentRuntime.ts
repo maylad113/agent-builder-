@@ -262,6 +262,7 @@ CRITICAL MANDATES:
   // Update conversation record
   conversation.lastMessageAt = new Date().toISOString();
   conversation.summary = `Last exchange: "${userMessage.substring(0, 30)}..." -> "${finalReply.substring(0, 30)}..."`;
+  db.conversations.update(conversation);
 
   // Store Agent Reply Message
   db.messages.push({
@@ -293,6 +294,7 @@ CRITICAL MANDATES:
   usage.tokensUsed += tokensEstimate;
   usage.estimatedCostUsd += (tokensEstimate / 1000) * 0.0001; // $0.0001 per 1k tokens estimate
   usage.requestsCount += 1;
+  db.usageRecords.update(usage);
 
   return {
     reply: finalReply,
