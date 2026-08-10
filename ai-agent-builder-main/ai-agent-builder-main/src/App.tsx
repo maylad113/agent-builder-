@@ -1,11 +1,15 @@
 import React, { useState, useEffect } from 'react';
-import { Business, Agent, AgentTemplate, AuditLog, Appointment, Product, Order, ChannelConfig, IntegrationConfig } from './types';
+import { Business, Agent, AgentTemplate, AuditLog, Appointment, Product, Order, ChannelConfig, IntegrationConfig, PublicUser } from './types';
 import { Navbar } from './components/Navbar';
 import { PlatformOwnerDashboard } from './components/PlatformOwnerDashboard';
 import { BusinessOwnerPortal } from './components/BusinessOwnerPortal';
 import { BusinessWizard } from './components/BusinessWizard';
+import { LoginForm } from './components/LoginForm';
 
 export default function App() {
+  // Real server-side session: null while not logged in / unknown.
+  const [user, setUser] = useState<PublicUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const [viewMode, setViewMode] = useState<'platform_owner' | 'business_owner'>('platform_owner');
   const [businesses, setBusinesses] = useState<Business[]>([]);
   const [selectedBusinessId, setSelectedBusinessId] = useState<string>('biz-tonys-barber');
@@ -20,6 +24,25 @@ export default function App() {
   const [orders, setOrders] = useState<Order[]>([]);
   const [channels, setChannels] = useState<ChannelConfig[]>([]);
   const [integrations, setIntegrations] = useState<IntegrationConfig[]>([]);
+
+  // Session bootstrap: /api/auth/me returns the real user or 401.
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch('/api/auth/me');
+        if (res.ok) {
+          const data = await res.json();
+          if (data.user) {
+            setUser(data.user);
+            if (data.user.businessId) setSelectedBusinessId(data.user.businessId);
+          }
+        }
+      } catch (err) {
+        console.error('Session load error:', err);
+      }
+      setAuthLoading(false);
+    })();
+  }, []);
 
   const fetchGlobalData = async () => {
     try {
@@ -42,8 +65,9 @@ export default function App() {
       setTemplates(tplData);
       setAuditLogs(logsData);
 
-      if (bizData.length > 0 && !selectedBusinessId) {
-        setSelectedBusinessId(bizData[0].id);
+      if (bizData.length > 0) {
+        // Business-scoped users are served only their own business by the server.
+        setSelectedBusinessId(user?.businessId || bizData[0].id);
       }
     } catch (err) {
       console.error('Data loading error:', err);
@@ -79,9 +103,11 @@ export default function App() {
     }
   };
 
+  // Fetch data once a session exists (and after login/logout).
   useEffect(() => {
+    if (!user) return;
     fetchGlobalData();
-  }, []);
+  }, [user?.id]);
 
   useEffect(() => {
     if (selectedBusinessId) {
@@ -89,9 +115,34 @@ export default function App() {
     }
   }, [selectedBusinessId]);
 
+  // Business roles are hard-scoped to their own tenant by the server: they
+  // always see the business portal, never the platform dashboard.
+  const effectiveViewMode: 'platform_owner' | 'business_owner' =
+    user?.role === 'PLATFORM_OWNER' ? viewMode : 'business_owner';
+
   const handleOpenTenantPortal = (bizId: string) => {
     setSelectedBusinessId(bizId);
     setViewMode('business_owner');
+  };
+
+  const handleLogout = async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch (err) {
+      console.error('Logout error:', err);
+    }
+    setUser(null);
+    setBusinesses([]);
+    setAgents([]);
+    setTemplates([]);
+    setAuditLogs([]);
+    setAppointments([]);
+    setProducts([]);
+    setOrders([]);
+    setChannels([]);
+    setIntegrations([]);
+    setViewMode('platform_owner');
+    setSelectedBusinessId('biz-tonys-barber');
   };
 
   const handleDuplicateBusiness = async (bizId: string, newName: string) => {
@@ -175,6 +226,20 @@ export default function App() {
     }
   };
 
+  // While the session is being resolved, render a minimal loading state.
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-slate-100/70 text-slate-900 font-sans antialiased flex items-center justify-center">
+        <p className="text-sm text-slate-500">Loading…</p>
+      </div>
+    );
+  }
+
+  // Not authenticated: show the login form.
+  if (!user) {
+    return <LoginForm onLogin={setUser} />;
+  }
+
   const selectedBiz = businesses.find(b => b.id === selectedBusinessId) || businesses[0];
   const selectedAgent = agents.find(a => a.businessId === selectedBusinessId) || agents[0];
 
@@ -183,7 +248,9 @@ export default function App() {
       
       {/* Top Navbar */}
       <Navbar
-        viewMode={viewMode}
+        user={user}
+        onLogout={handleLogout}
+        viewMode={effectiveViewMode}
         setViewMode={setViewMode}
         businesses={businesses}
         selectedBusinessId={selectedBusinessId}
@@ -193,7 +260,7 @@ export default function App() {
 
       {/* Main Content Area */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {viewMode === 'platform_owner' ? (
+        {effectiveViewMode === 'platform_owner' ? (
           <PlatformOwnerDashboard
             businesses={businesses}
             agents={agents}
@@ -222,12 +289,14 @@ export default function App() {
         )}
       </main>
 
-      {/* Business Wizard Modal */}
-      <BusinessWizard
-        isOpen={isWizardOpen}
-        onClose={() => setIsWizardOpen(false)}
-        onComplete={handleWizardComplete}
-      />
+      {/* Business Wizard Modal — platform owner only (server also enforces it) */}
+      {user.role === 'PLATFORM_OWNER' && (
+        <BusinessWizard
+          isOpen={isWizardOpen}
+          onClose={() => setIsWizardOpen(false)}
+          onComplete={handleWizardComplete}
+        />
+      )}
 
     </div>
   );

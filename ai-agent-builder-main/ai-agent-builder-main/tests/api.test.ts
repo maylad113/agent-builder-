@@ -1,4 +1,4 @@
-import { describe, it, expect, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import os from 'os';
 import path from 'path';
 import fs from 'fs';
@@ -9,6 +9,9 @@ import request from 'supertest';
  * API-level smoke test: the Express routes must serve the exact JSON shapes
  * they always did, now backed by SQLite. Writes made through the API are
  * verified to land on disk (read back via a separate database connection).
+ *
+ * Business routes are now protected by real server-side auth, so the suite
+ * first logs in as the seeded platform owner and reuses the session cookie.
  */
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentforge-api-'));
 process.env.DB_PATH = path.join(tmpDir, 'api.db');
@@ -23,13 +26,24 @@ function makeApp() {
   return app;
 }
 
+const app = makeApp();
+const agent = request.agent(app);
+
+beforeAll(async () => {
+  const res = await agent.post('/api/auth/login').send({
+    email: 'owner@agentfactory.io',
+    password: 'Password123!'
+  });
+  expect(res.status).toBe(200);
+});
+
 afterAll(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
 describe('API over SQLite', () => {
   it('GET /api/businesses returns the seeded tenant with the exact shape', async () => {
-    const res = await request(makeApp()).get('/api/businesses');
+    const res = await agent.get('/api/businesses');
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(true);
 
@@ -45,25 +59,22 @@ describe('API over SQLite', () => {
   });
 
   it('GET /api/agents, /api/appointments and /api/health keep their shapes', async () => {
-    const app = makeApp();
-
-    const agents = await request(app).get('/api/agents?businessId=biz-tonys-barber');
+    const agents = await agent.get('/api/agents?businessId=biz-tonys-barber');
     expect(agents.status).toBe(200);
     expect(agents.body).toHaveLength(1);
     expect(agents.body[0].structuredConfig.toolsEnabled).toContain('book_appointment');
 
-    const apps = await request(app).get('/api/appointments?businessId=biz-tonys-barber');
+    const apps = await agent.get('/api/appointments?businessId=biz-tonys-barber');
     expect(apps.status).toBe(200);
     expect(apps.body).toHaveLength(2);
     expect(apps.body[0].customerName).toBe('Reza Ahmadi');
 
-    const health = await request(app).get('/api/health');
+    const health = await request(makeApp()).get('/api/health');
     expect(health.body.status).toBe('ok');
   });
 
   it('POST /api/businesses writes through to disk (readable by a new connection)', async () => {
-    const app = makeApp();
-    const postRes = await request(app).post('/api/businesses').send({
+    const postRes = await agent.post('/api/businesses').send({
       name: 'API Created Shop',
       type: 'restaurant',
       description: 'Created via API',
@@ -76,9 +87,9 @@ describe('API over SQLite', () => {
     const newId = postRes.body.id;
 
     // Auto-created channels & integrations for the new tenant.
-    const chans = await request(app).get(`/api/channels?businessId=${newId}`);
+    const chans = await agent.get(`/api/channels?businessId=${newId}`);
     expect(chans.body).toHaveLength(4);
-    const ints = await request(app).get(`/api/integrations?businessId=${newId}`);
+    const ints = await agent.get(`/api/integrations?businessId=${newId}`);
     expect(ints.body).toHaveLength(4);
 
     // Prove the write landed on disk: open a fresh connection to the same file.
@@ -90,7 +101,7 @@ describe('API over SQLite', () => {
     fresh.close();
 
     // PUT persists too.
-    const putRes = await request(app).put(`/api/businesses/${newId}`).send({ name: 'API Created Shop v2' });
+    const putRes = await agent.put(`/api/businesses/${newId}`).send({ name: 'API Created Shop v2' });
     expect(putRes.status).toBe(200);
     const fresh2 = new AppDatabase({ dbPath: process.env.DB_PATH, seed: false });
     expect(fresh2.businesses.find(b => b.id === newId)?.name).toBe('API Created Shop v2');
@@ -98,10 +109,9 @@ describe('API over SQLite', () => {
   });
 
   it('tenant filtering is applied server-side (businessId scoping)', async () => {
-    const app = makeApp();
-    const all = await request(app).get('/api/agents');
+    const all = await agent.get('/api/agents');
     expect(all.body.length).toBeGreaterThanOrEqual(1);
-    const scoped = await request(app).get('/api/agents?businessId=biz-tonys-barber');
+    const scoped = await agent.get('/api/agents?businessId=biz-tonys-barber');
     expect(scoped.body.every((a: any) => a.businessId === 'biz-tonys-barber')).toBe(true);
   });
 });

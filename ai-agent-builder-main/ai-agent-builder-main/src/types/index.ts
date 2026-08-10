@@ -1,3 +1,31 @@
+// ---------------------------------------------------------------------------
+// Auth: users & sessions
+// ---------------------------------------------------------------------------
+
+export type UserRole = 'PLATFORM_OWNER' | 'BUSINESS_OWNER' | 'BUSINESS_STAFF';
+
+export interface User {
+  id: string;
+  email: string;
+  passwordHash: string; // scrypt$N$r$p$salt$hash — never plaintext
+  name: string;
+  role: UserRole;
+  /** Tenant the user is hard-scoped to; null only for PLATFORM_OWNER. */
+  businessId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** User shape safe to send to the frontend (never includes passwordHash). */
+export type PublicUser = Omit<User, 'passwordHash'>;
+
+export interface Session {
+  id: string;
+  userId: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
 export type BusinessType = 
   | 'barbershop'
   | 'salon'

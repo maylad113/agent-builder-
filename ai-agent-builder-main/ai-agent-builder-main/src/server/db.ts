@@ -16,8 +16,11 @@ import {
   AgentTemplate,
   UsageRecord,
   AuditLog,
-  StaffMember
+  StaffMember,
+  User,
+  Session
 } from '../types';
+import { hashPassword } from './passwords';
 
 /**
  * SQLite-backed repository for the AI Agent Factory MVP.
@@ -120,6 +123,16 @@ const TABLES: Record<string, TableConfig> = {
   },
   auditLogs: {
     table: 'audit_logs',
+    jsonColumns: [],
+    booleanColumns: []
+  },
+  users: {
+    table: 'users',
+    jsonColumns: [],
+    booleanColumns: []
+  },
+  sessions: {
+    table: 'sessions',
     jsonColumns: [],
     booleanColumns: []
   }
@@ -332,6 +345,8 @@ export class AppDatabase {
   public templates: Collection<AgentTemplate>;
   public usageRecords: Collection<UsageRecord>;
   public auditLogs: Collection<AuditLog>;
+  public users: Collection<User>;
+  public sessions: Collection<Session>;
 
   constructor(opts: AppDatabaseOptions = {}) {
     this.dbPath = opts.dbPath || process.env.DB_PATH || path.join(process.cwd(), 'data', 'agentforge.db');
@@ -359,9 +374,12 @@ export class AppDatabase {
     this.templates = new Collection<AgentTemplate>(this.sqlite, TABLES.templates);
     this.usageRecords = new Collection<UsageRecord>(this.sqlite, TABLES.usageRecords);
     this.auditLogs = new Collection<AuditLog>(this.sqlite, TABLES.auditLogs);
+    this.users = new Collection<User>(this.sqlite, TABLES.users);
+    this.sessions = new Collection<Session>(this.sqlite, TABLES.sessions);
 
     if (opts.seed !== false) {
       this.seed();
+      this.seedUsers();
     }
   }
 
@@ -858,6 +876,49 @@ Never invent prices, hours, services, or availability that do not exist in the d
         smsCount: 0
       }
     );
+  }
+
+  /**
+   * Seed the demo user accounts. Idempotent: INSERT OR IGNORE by email, so a
+   * partially-seeded DB self-heals and a reseeded DB never duplicates. Passwords
+   * are scrypt-hashed and only computed for emails that are actually missing.
+   */
+  private seedUsers(): void {
+    const now = new Date().toISOString();
+    const demoUsers: Array<Omit<User, 'createdAt' | 'updatedAt' | 'passwordHash'>> = [
+      {
+        id: 'usr-platform-1',
+        email: 'owner@agentfactory.io',
+        name: 'Platform Owner',
+        role: 'PLATFORM_OWNER',
+        businessId: null
+      },
+      {
+        id: 'usr-tony-1',
+        email: 'tony@tonysbarber.com',
+        name: 'Tony (Owner)',
+        role: 'BUSINESS_OWNER',
+        businessId: 'biz-tonys-barber'
+      },
+      {
+        id: 'usr-tony-staff-1',
+        email: 'staff@tonysbarber.com',
+        name: 'Marco (Staff)',
+        role: 'BUSINESS_STAFF',
+        businessId: 'biz-tonys-barber'
+      }
+    ];
+    // Demo password for all seeded accounts (documented in the report).
+    const demoPassword = 'Password123!';
+    const existsStmt = this.sqlite.prepare('SELECT 1 FROM users WHERE email = ?');
+    const insertStmt = this.sqlite.prepare(
+      `INSERT OR IGNORE INTO users (id, email, password_hash, name, role, business_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    for (const u of demoUsers) {
+      if (existsStmt.get(u.email)) continue;
+      insertStmt.run(u.id, u.email, hashPassword(demoPassword), u.name, u.role, u.businessId, now, now);
+    }
   }
 }
 
