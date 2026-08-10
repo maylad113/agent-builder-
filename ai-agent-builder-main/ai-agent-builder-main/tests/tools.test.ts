@@ -26,6 +26,34 @@ const { executeAgentTool, agentToolDeclarations } = await import('../src/server/
 const TENANT = 'biz-tonys-barber';
 const SVC_HAIRCUT = 'srv-1'; // 30 min, 09:00-20:00 weekdays in seed
 
+/**
+ * Pick a valid near-term open weekday for booking. The seed business is open
+ * Mon–Sat (closed Sunday) and caps bookings 14 days in advance, so we find the
+ * next Mon–Sat that is within 14 days of today. Tests must not hard-code
+ * far-future dates — the booking-notice engine (see appointmentEngine.ts)
+ * honours the business's configured "up to N days in advance" policy.
+ */
+function nextOpenDay(afterDays = 1): string {
+  const d = new Date();
+  d.setDate(d.getDate() + afterDays);
+  // 0=Sun (closed) .. 6=Sat (open). Step forward until we land on an open day.
+  while (d.getDay() === 0) d.setDate(d.getDate() + 1);
+  return d.toISOString().split('T')[0];
+}
+const BOOK_DATE = nextOpenDay();   // a near-term open weekday
+const BOOK_DATE_2 = nextOpenDay(2); // another open weekday
+const BOOK_DATE_3 = nextOpenDay(4); // a third open weekday (fresh, no prior bookings)
+
+/** Pick the next Sunday (a closed day for the seed business). */
+function nextSunday(): string {
+  const d = new Date();
+  const day = d.getDay();
+  const add = (7 - day) % 7 || 7;
+  d.setDate(d.getDate() + add);
+  return d.toISOString().split('T')[0];
+}
+const SUNDAY_DATE = nextSunday();
+
 afterAll(() => {
   db.close();
   fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -37,7 +65,7 @@ describe('book_appointment: honest failure + duration + business hours', () => {
       customerName: 'Test',
       customerPhone: '+10000000001',
       serviceIdOrName: 'Nonexistent Service',
-      date: '2030-03-05', // Tuesday
+      date: BOOK_DATE,
       startTime: '14:00'
     }, { tenantId: TENANT });
     expect(r.success).toBe(false);
@@ -53,7 +81,7 @@ describe('book_appointment: honest failure + duration + business hours', () => {
       customerName: 'Early',
       customerPhone: '+10000000002',
       serviceIdOrName: 'Haircut',
-      date: '2030-03-04', // Monday
+      date: BOOK_DATE,
       startTime: '07:00' // opens at 09:00
     }, { tenantId: TENANT });
     expect(r.success).toBe(false);
@@ -65,7 +93,7 @@ describe('book_appointment: honest failure + duration + business hours', () => {
       customerName: 'Sunday',
       customerPhone: '+10000000003',
       serviceIdOrName: 'Haircut',
-      date: '2030-03-10', // Sunday (closed in seed)
+      date: SUNDAY_DATE, // Sunday (closed in seed)
       startTime: '12:00'
     }, { tenantId: TENANT });
     expect(r.success).toBe(false);
@@ -77,7 +105,7 @@ describe('book_appointment: honest failure + duration + business hours', () => {
       customerName: 'Duration',
       customerPhone: '+10000000004',
       serviceIdOrName: 'Haircut', // 30 min
-      date: '2030-03-05', // Tuesday
+      date: BOOK_DATE,
       startTime: '14:00'
     }, { tenantId: TENANT });
     expect(r.success).toBe(true);
@@ -89,7 +117,7 @@ describe('book_appointment: honest failure + duration + business hours', () => {
 
 describe('book_appointment: concurrent overlap prevention (#5)', () => {
   it('two overlapping bookings for the same slot -> exactly ONE succeeds', async () => {
-    const date = '2030-03-06'; // Thursday
+    const date = BOOK_DATE_2;
     const startTime = '15:00';
     const svc = 'Haircut'; // 30 min => 15:00-15:30
 
@@ -121,7 +149,7 @@ describe('book_appointment: concurrent overlap prevention (#5)', () => {
   });
 
   it('a partially overlapping (15:00-15:30 vs 15:15-15:45) booking is rejected', async () => {
-    const date = '2030-03-07'; // Friday
+    const date = BOOK_DATE_3;
     // First booking 15:00-15:30 (Haircut 30m)
     const r1 = await executeAgentTool('book_appointment', {
       customerName: 'Overlap1', customerPhone: '+10000000020',
@@ -139,7 +167,7 @@ describe('book_appointment: concurrent overlap prevention (#5)', () => {
   });
 
   it('back-to-back (adjacent) bookings are allowed', async () => {
-    const date = '2030-03-07';
+    const date = BOOK_DATE_2;
     const r1 = await executeAgentTool('book_appointment', {
       customerName: 'Back1', customerPhone: '+10000000030',
       serviceIdOrName: 'Haircut', date, startTime: '16:00' // 16:00-16:30

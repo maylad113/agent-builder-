@@ -39,6 +39,15 @@ const platformAgent = request.agent(app);
 const tonyAgent = request.agent(app);
 const staffAgent = request.agent(app);
 
+// A near-term open weekday (skip Sunday; new businesses are open Mon–Sat by
+// default with a 14-day max-advance policy, so booking must be within 14 days).
+function nearOpenDate(addDays = 1): string {
+  const d = new Date();
+  d.setDate(d.getDate() + addDays);
+  while (d.getDay() === 0) d.setDate(d.getDate() + 1);
+  return d.toISOString().split('T')[0];
+}
+
 // Business B ("Bella's Bakery") + its resources, created as the platform owner.
 let bizBId = '';
 let agentBId = '';
@@ -88,13 +97,14 @@ beforeAll(async () => {
   expect(kcRes.status).toBe(201);
   knowledgeBId = kcRes.body.id;
 
-  // Appointment for B (valid service + slot within default hours).
+  // Appointment for B (valid service + slot within default hours, within the
+  // 14-day max-advance policy).
   const apptRes = await platformAgent.post('/api/appointments').send({
     businessId: bizBId,
     serviceId: bellaServiceId,
     customerName: 'Gina',
     customerPhone: '+98 900 111 2222',
-    date: '2030-01-15',
+    date: nearOpenDate(),
     startTime: '10:00',
     notes: 'Bella appointment'
   });

@@ -3,6 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import { router as apiRouter } from './src/server/routes';
+import { webhookRouter } from './src/server/webhooks';
 import { requestId, rateLimit, secureHeaders, RATE_LIMITS } from './src/server/security';
 
 // Resolve the project root in both run modes:
@@ -16,6 +17,13 @@ const projectRoot = IS_CJS ? path.join(__dirname, '..') : serverDir;
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
+
+  // The Meta webhook POST route needs the RAW request body (it hashes the exact
+  // bytes for X-Hub-Signature-256), so it must run BEFORE any JSON/urlencoded
+  // body parser consumes the stream. Mount the webhook router first; it installs
+  // its own parsers (raw for Meta, urlencoded for Twilio). The auth-protected
+  // /api router is mounted afterwards with the global body parsers below.
+  app.use('/api/webhooks', webhookRouter);
 
   app.use(express.json({ limit: '1mb' }));
   app.use(express.urlencoded({ extended: true, limit: '1mb' }));
@@ -31,6 +39,12 @@ async function startServer() {
 
   // Mount API Routes FIRST
   app.use('/api', apiRouter);
+
+  // External channel webhooks (Meta/Instagram + Twilio/SMS). Mounted outside the
+  // auth-protected /api router because they receive provider-signed traffic, and
+  // apply their own signature/verify-token validation. They never trust inbound
+  // tenant ids; businesses are resolved server-side from the channel config.
+  app.use('/api/webhooks', webhookRouter);
 
   // Vite middleware for development vs static production build
   if (process.env.NODE_ENV !== 'production') {

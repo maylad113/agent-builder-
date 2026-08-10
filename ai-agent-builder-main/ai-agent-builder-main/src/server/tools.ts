@@ -1,5 +1,9 @@
 import { Type, FunctionDeclaration } from '@google/genai';
 import { db } from './db';
+import {
+  timeToMinutes, addMinutes, intervalsOverlap, isFail,
+  dayOfWeekForDate, isHoliday, validateSlot, generateAvailableSlots, findEligibleStaff
+} from './appointmentEngine';
 
 export interface ToolContext {
   tenantId: string;
@@ -7,41 +11,11 @@ export interface ToolContext {
   channel?: string;
 }
 
-// ---------------------------------------------------------------------------
-// Time helpers (HH:MM strings). Pure functions, no I/O.
-// ---------------------------------------------------------------------------
+// Time helpers (timeToMinutes, addMinutes, intervalsOverlap, isFail, dayOfWeek,
+// validateSlot, generateAvailableSlots) are imported from ./appointmentEngine
+// — the single source of truth for the scheduling engine. See that module for
+// the pure, unit-tested availability/overlap/notice logic.
 
-/** "14:30" -> minutes since midnight (870). Tolerant of missing minutes. */
-function timeToMinutes(t: string): number {
-  const [h, m] = String(t || '').split(':').map(n => parseInt(n, 10) || 0);
-  return h * 60 + m;
-}
-
-/** minutes since midnight -> "HH:MM" (zero-padded). */
-function minutesToTime(min: number): string {
-  const h = Math.floor(min / 60);
-  const m = min % 60;
-  return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
-}
-
-/** Add a duration in minutes to a HH:MM start time -> HH:MM end time. */
-function addMinutes(start: string, durationMinutes: number): string {
-  return minutesToTime(timeToMinutes(start) + Math.max(1, durationMinutes));
-}
-
-/**
- * Do two [start, end) intervals overlap? Used for appointment overlap
- * detection. Adjacent appointments (one ends exactly when the other starts) do
- * NOT overlap, so back-to-back bookings are allowed.
- */
-function intervalsOverlap(aStart: string, aEnd: string, bStart: string, bEnd: string): boolean {
-  return timeToMinutes(aStart) < timeToMinutes(bEnd) && timeToMinutes(bStart) < timeToMinutes(aEnd);
-}
-
-/** Type guard: narrow a transaction result to its failure branch. */
-function isFail<T>(r: { ok: true } | { ok: false; error: string } | T): r is { ok: false; error: string } {
-  return typeof r === 'object' && r !== null && (r as any).ok === false;
-}
 
 // Gemini Function Declarations Schema for tool calling
 export const agentToolDeclarations: FunctionDeclaration[] = [
@@ -271,41 +245,34 @@ export async function executeAgentTool(
       case 'check_availability': {
         const { date, serviceId } = args;
         const requestedDate = date || new Date().toISOString().split('T')[0];
-        
-        // Find day of week for requested date
-        const dateObj = new Date(requestedDate);
-        const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-        const dayName = dayNames[dateObj.getUTCDay()];
-        
+        const dayName = dayOfWeekForDate(requestedDate, business.timezone);
+
+        // Holiday / closed-day short-circuit (engine handles both).
+        if (isHoliday(business, requestedDate)) {
+          return {
+            success: true,
+            data: { date: requestedDate, dayOfWeek: dayName, isOpen: false,
+              message: `The business is closed on ${requestedDate} (holiday).`, availableSlots: [] }
+          };
+        }
         const dayHours = business.hours.find(h => h.day === dayName);
         if (!dayHours || !dayHours.isOpen) {
           return {
             success: true,
-            data: {
-              date: requestedDate,
-              dayOfWeek: dayName,
-              isOpen: false,
-              message: `The business is closed on ${dayName}s.`,
-              availableSlots: []
-            }
+            data: { date: requestedDate, dayOfWeek: dayName, isOpen: false,
+              message: `The business is closed on ${dayName}s.`, availableSlots: [] }
           };
         }
 
-        // Get existing appointments for this tenant on this date
+        // Resolve the service (default to the first one if none given) so
+        // slot generation accounts for its duration + buffer.
+        const service = (serviceId ? business.services.find(s => s.id === serviceId) : undefined)
+          || business.services[0];
         const existingApps = db.appointments.filter(a => a.businessId === tenantId && a.date === requestedDate && a.status !== 'CANCELLED');
-        const bookedTimes = new Set(existingApps.map(a => a.startTime));
-
-        // Generate standard hourly slots between openTime and closeTime
-        const openHour = parseInt(dayHours.openTime.split(':')[0], 10) || 9;
-        const closeHour = parseInt(dayHours.closeTime.split(':')[0], 10) || 20;
-
-        const availableSlots: string[] = [];
-        for (let h = openHour; h < closeHour; h++) {
-          const slot = `${h.toString().padStart(2, '0')}:00`;
-          const slotHalf = `${h.toString().padStart(2, '0')}:30`;
-          if (!bookedTimes.has(slot)) availableSlots.push(slot);
-          if (h < closeHour - 1 && !bookedTimes.has(slotHalf)) availableSlots.push(slotHalf);
-        }
+        const staff = db.staffMembers.filter(s => s.businessId === tenantId);
+        const availableSlots = service
+          ? generateAvailableSlots(business, staff, service, existingApps, requestedDate)
+          : [];
 
         return {
           success: true,
@@ -337,39 +304,39 @@ export async function executeAgentTool(
           return { success: false, error: `Service "${serviceIdOrName}" was not found. Available services: ${business.services.map(s => s.name).join(', ') || 'none'}.` };
         }
 
-        const duration = Math.max(1, service.durationMinutes || 30);
-        const endTime = addMinutes(startTime, duration);
-
-        // Validate the slot falls within business hours for that day.
-        const dateObj = new Date(`${date}T00:00:00Z`);
-        const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-        const dayName = dayNames[dateObj.getUTCDay()];
-        const dayHours = business.hours.find(h => h.day === dayName);
-        if (!dayHours || !dayHours.isOpen) {
-          return { success: false, error: `The business is closed on ${dayName}. Cannot book for ${date}.` };
+        // Slot validation via the engine: hours, holiday, min notice, max advance.
+        const slotCheck = validateSlot(business, service, date, startTime);
+        if (!slotCheck.ok) {
+          return { success: false, error: slotCheck.error! };
         }
-        if (timeToMinutes(startTime) < timeToMinutes(dayHours.openTime) || timeToMinutes(endTime) > timeToMinutes(dayHours.closeTime)) {
-          return { success: false, error: `Requested time ${startTime}-${endTime} is outside opening hours (${dayHours.openTime}-${dayHours.closeTime}) on ${dayName}.` };
-        }
+        const endTime = slotCheck.endTime!;
+        const bufferAfter = Math.max(0, service.bufferMinutesAfter || 0);
+        // For overlap detection we block the slot PLUS its trailing buffer so
+        // the staff member has the configured turnaround time.
+        const blockEnd = bufferAfter > 0 ? addMinutes(endTime, bufferAfter) : endTime;
 
-        // TRANSACTIONAL booking with overlap prevention. The overlap check and
-        // the INSERT run inside one SQLite transaction. better-sqlite3 is
-        // synchronous and serializes writes, so the transaction makes the
-        // check-then-insert atomic: two concurrent bookings for an overlapping
-        // slot cannot both succeed — the second sees the first's row.
+        // TRANSACTIONAL booking with overlap prevention (incl. buffer). The
+        // overlap check and the INSERT run inside one SQLite transaction.
+        // better-sqlite3 is synchronous and serializes writes, so the
+        // transaction makes the check-then-insert atomic: two concurrent
+        // bookings for an overlapping slot cannot both succeed.
         const appointmentId = `app-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
         const customerId = `cust-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
         const nowIso = new Date().toISOString();
 
         const bookTxn = db.sqlite.transaction((): { ok: true; appointment: any } | { ok: false; error: string } => {
           // Re-check for an overlapping (not just identical) non-cancelled
-          // appointment for this tenant on this date. Back-to-back (adjacent)
-          // appointments are allowed; true overlaps are rejected.
+          // appointment for this tenant on this date. Both the new booking AND
+          // each existing appointment extend by their own service buffer, so a
+          // turnaround period is respected in both directions.
           const overlapping = db.appointments.filter(
             a => a.businessId === tenantId && a.date === date && a.status !== 'CANCELLED'
           );
           for (const a of overlapping) {
-            if (intervalsOverlap(startTime, endTime, a.startTime, a.endTime)) {
+            const existingService = business.services.find(s => s.id === a.serviceId);
+            const existingBuffer = Math.max(0, existingService?.bufferMinutesAfter || 0);
+            const aBlockEnd = existingBuffer > 0 ? addMinutes(a.endTime, existingBuffer) : a.endTime;
+            if (intervalsOverlap(startTime, blockEnd, a.startTime, aBlockEnd)) {
               return { ok: false, error: `The time ${startTime}-${endTime} on ${date} overlaps an existing appointment (${a.startTime}-${a.endTime}). Please choose another slot using check_availability.` };
             }
           }
@@ -381,7 +348,10 @@ export async function executeAgentTool(
             db.customers.push(customer);
           }
 
-          const staff = db.staffMembers.find(s => s.businessId === tenantId);
+          // Assign an eligible staff member (engine honors staff hours, services,
+          // timeOff). Falls back to the first staff member when none configured.
+          const staffList = db.staffMembers.filter(s => s.businessId === tenantId);
+          const staff = findEligibleStaff(business, staffList, service, date, startTime, endTime);
 
           const newAppointment = {
             id: appointmentId,
@@ -489,20 +459,16 @@ export async function executeAgentTool(
         // Recompute end time from the service duration so the moved slot stays correct.
         const service = business.services.find(s => s.id === app.serviceId) ||
           business.services.find(s => s.name === app.serviceName);
-        const duration = Math.max(1, service?.durationMinutes || 30);
-        const newEndTime = addMinutes(newTime, duration);
+        const svc = service || { id: '', name: app.serviceName, price: 0, durationMinutes: 30, description: '' };
 
-        // Validate the new slot is within business hours.
-        const dateObj = new Date(`${newDate}T00:00:00Z`);
-        const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-        const dayName = dayNames[dateObj.getUTCDay()];
-        const dayHours = business.hours.find(h => h.day === dayName);
-        if (!dayHours || !dayHours.isOpen) {
-          return { success: false, error: `The business is closed on ${dayName}.` };
+        // Validate the new slot via the engine (hours, holiday, notice, advance).
+        const slotCheck = validateSlot(business, svc, newDate, newTime);
+        if (!slotCheck.ok) {
+          return { success: false, error: slotCheck.error! };
         }
-        if (timeToMinutes(newTime) < timeToMinutes(dayHours.openTime) || timeToMinutes(newEndTime) > timeToMinutes(dayHours.closeTime)) {
-          return { success: false, error: `Requested time ${newTime}-${newEndTime} is outside opening hours on ${dayName}.` };
-        }
+        const newEndTime = slotCheck.endTime!;
+        const bufferAfter = Math.max(0, (svc as any).bufferMinutesAfter || 0);
+        const blockEnd = bufferAfter > 0 ? addMinutes(newEndTime, bufferAfter) : newEndTime;
 
         // Transactional overlap check (excluding the appointment being moved).
         const rescheduleTxn = db.sqlite.transaction(() => {
@@ -510,7 +476,7 @@ export async function executeAgentTool(
             a => a.businessId === tenantId && a.date === newDate && a.status !== 'CANCELLED' && a.id !== app.id
           );
           for (const a of others) {
-            if (intervalsOverlap(newTime, newEndTime, a.startTime, a.endTime)) {
+            if (intervalsOverlap(newTime, blockEnd, a.startTime, a.endTime)) {
               return { ok: false as const, error: `The time ${newTime}-${newEndTime} on ${newDate} overlaps an existing appointment (${a.startTime}-${a.endTime}).` };
             }
           }
@@ -519,6 +485,13 @@ export async function executeAgentTool(
           app.endTime = newEndTime;
           app.status = 'RESCHEDULED';
           db.appointments.update(app);
+          db.auditLogs.push({
+            id: `log-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+            businessId: tenantId,
+            action: 'APPOINTMENT_RESCHEDULED',
+            details: `Appointment #${app.id} rescheduled to ${newDate} at ${newTime}.`,
+            timestamp: new Date().toISOString()
+          });
           return { ok: true as const };
         });
         const r = rescheduleTxn();
