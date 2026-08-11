@@ -91,12 +91,15 @@ beforeAll(async () => {
   expect(tLogin.status).toBe(200);
 
   // Bella's Bakery + READY agent + a knowledge chunk with a unique marker.
+  // The business is fully configured (service, default hours, connected
+  // web_chat channel, default policies) and the agent gets a PUBLISHED version
+  // so it can pass the readiness gate when e2 activates it.
   const bizRes = await platform.post('/api/businesses').send({
     name: "Bella's Bakery",
     type: 'restaurant',
     description: 'Second tenant used to prove isolation.',
     location: 'Baker Street 9',
-    services: [],
+    services: [{ name: 'Cake Tasting', price: 150000, durationMinutes: 45, description: 'Sample our cakes.' }],
     faqs: []
   });
   expect(bizRes.status).toBe(201);
@@ -109,6 +112,7 @@ beforeAll(async () => {
   });
   expect(agentRes.status).toBe(201);
   agentBId = agentRes.body.id;
+  await publishInitialDraft(agentBId, platform);
 
   const kcRes = await platform.post('/api/knowledge').send({
     businessId: bizBId,
@@ -119,6 +123,17 @@ beforeAll(async () => {
   });
   expect(kcRes.status).toBe(201);
 });
+
+/** Publish the agent's initial DRAFT version (readiness requires a PUBLISHED
+ * version before ACTIVE; publishing snapshots the current config). */
+async function publishInitialDraft(agentId: string, requester: any) {
+  const versions = await requester.get(`/api/agents/${agentId}/versions`);
+  expect(versions.status).toBe(200);
+  const draft = versions.body.find((v: any) => v.status === 'DRAFT');
+  expect(draft).toBeTruthy();
+  const pub = await requester.post(`/api/agents/${agentId}/versions/${draft.id}/publish`);
+  expect(pub.status).toBe(200);
+}
 
 afterAll(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -263,6 +278,9 @@ describe('agent lifecycle enforcement', () => {
 
     expect((await tony.post(`/api/agents/${id}/status`).send({ status: 'TESTING' })).status).toBe(200);
     expect((await tony.post(`/api/agents/${id}/status`).send({ status: 'READY' })).status).toBe(200);
+    // Readiness gate: a PUBLISHED version must exist before the agent can go
+    // ACTIVE (production serves the frozen published config).
+    await publishInitialDraft(id, tony);
     const act = await tony.post(`/api/agents/${id}/status`).send({ status: 'ACTIVE' });
     expect(act.status).toBe(200);
     expect(act.body.status).toBe('ACTIVE');
@@ -285,6 +303,7 @@ describe('agent lifecycle enforcement', () => {
     });
     expect(created.status).toBe(201);
     expect(created.body.status).toBe('READY');
+    await publishInitialDraft(created.body.id, tony);
 
     const act = await tony.post(`/api/agents/${created.body.id}/status`).send({ status: 'ACTIVE' });
     expect(act.status).toBe(200);
@@ -333,6 +352,10 @@ describe('tool enablement enforcement', () => {
     });
     expect(created.status).toBe(201);
     limitedAgentId = created.body.id as string;
+
+    // Publish the initial draft so the agent satisfies the readiness gate
+    // (ACTIVE requires a PUBLISHED version).
+    await publishInitialDraft(limitedAgentId, tony);
 
     const act = await tony.post(`/api/agents/${limitedAgentId}/status`).send({ status: 'ACTIVE' });
     expect(act.status).toBe(200);
@@ -399,8 +422,8 @@ describe('public chat privacy (debug gating)', () => {
     expect(res.status).toBe(200);
     expect(res.body.reply).toBe('Sure! Here is the info.');
 
-    // Debug is entirely absent for public callers.
-    expect(res.body.debug).toBeNull();
+    // Debug is entirely absent for public callers (no debug key at all).
+    expect(res.body.debug).toBeUndefined();
     const raw = JSON.stringify(res.body);
     expect(raw).not.toContain('systemPrompt');
     expect(raw).not.toContain('retrievedKnowledge');
@@ -477,7 +500,7 @@ describe('public chat uses only ACTIVE agents', () => {
     expect(res.status).toBe(200);
     expect(res.body.agentAvailable).toBe(false);
     expect(res.body.reply).toContain('not available');
-    expect(res.body.debug).toBeNull();
+    expect(res.body.debug).toBeUndefined();
     // It still records a conversation (honest audit trail).
     expect(res.body.conversationId).toBeTruthy();
   });
@@ -496,7 +519,7 @@ describe('public chat uses only ACTIVE agents', () => {
     expect(res.status).toBe(200);
     expect(res.body.agentAvailable).toBe(true);
     expect(res.body.reply).toBe('Hello! How can I help you today?');
-    expect(res.body.debug).toBeNull(); // still public
+    expect(res.body.debug).toBeUndefined(); // still public
   });
 });
 

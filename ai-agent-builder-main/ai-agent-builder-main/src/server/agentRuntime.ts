@@ -548,10 +548,10 @@ export async function generateSuggestedAgentConfig(businessInput: {
   // Anything not provided by the owner is a NEEDS_INPUT entry, not a guess.
   const needsInput: Array<{ field: string; label: string }> = [];
   if (!businessInput.hours || !businessInput.hours.trim()) {
-    needsInput.push({ field: 'hours', label: 'Operating hours (open/close times per day)' });
+    needsInput.push({ field: 'hours', label: 'Operating hours' });
   }
   if (!businessInput.services || !businessInput.services.trim()) {
-    needsInput.push({ field: 'services', label: 'Service list with exact prices and durations' });
+    needsInput.push({ field: 'services', label: 'Service list and prices' });
   }
   if (!businessInput.description || !businessInput.description.trim()) {
     needsInput.push({ field: 'description', label: 'Business description' });
@@ -702,8 +702,14 @@ function sanitizeGeneratedConfig(parsed: any, input: { name: string; type: strin
     }
   }
   parsed.needsInput = Array.isArray(parsed.needsInput) ? parsed.needsInput : [];
-  if (!input.hours && !parsed.needsInput.includes('operating hours')) parsed.needsInput.push('operating hours');
-  if (!servicesProvided && !parsed.needsInput.includes('service list and prices')) parsed.needsInput.push('service list and prices');
+  // Missing-fact markers use the same { field, label } shape everywhere so the
+  // wizard can render them uniformly, from the model path or the fallback.
+  if (!input.hours && !parsed.needsInput.some((n: any) => n && n.field === 'hours')) {
+    parsed.needsInput.push({ field: 'hours', label: 'Operating hours' });
+  }
+  if (!servicesProvided && !parsed.needsInput.some((n: any) => n && n.field === 'services')) {
+    parsed.needsInput.push({ field: 'services', label: 'Service list and prices' });
+  }
   return parsed;
 }
 

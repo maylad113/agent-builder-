@@ -403,11 +403,12 @@ router.post('/businesses/:id/duplicate', requireAuth, requireRole('PLATFORM_OWNE
  * Agent lifecycle — the ONLY legal status transitions (enforced server-side on
  * POST /agents/:id/status and PUT /agents/:id):
  *
- *   DRAFT    → TESTING, ARCHIVED
- *   TESTING  → READY, DRAFT, ARCHIVED          (back to DRAFT: edit & re-test)
- *   READY    → ACTIVE, TESTING, ARCHIVED       (back to TESTING: iterate)
+ *   DRAFT    → TESTING, PAUSED, ARCHIVED
+ *   TESTING  → READY, DRAFT, PAUSED, ARCHIVED   (back to DRAFT: edit & re-test)
+ *   READY    → ACTIVE, TESTING, PAUSED, ARCHIVED (back to TESTING: iterate)
  *   ACTIVE   → PAUSED, ARCHIVED
- *   PAUSED   → ACTIVE, ARCHIVED                (un-pause = re-deploy)
+ *   PAUSED   → ACTIVE, ARCHIVED, or the state it was paused from (un-pause =
+ *              resume; ACTIVE re-deploy still runs the readiness gate)
  *   ARCHIVED → (terminal — no transitions out)
  *
  * Invariant: at most ONE agent per business is ACTIVE. When an agent becomes
@@ -417,8 +418,8 @@ router.post('/businesses/:id/duplicate', requireAuth, requireRole('PLATFORM_OWNE
  * Same-status transitions are idempotent no-ops.
  */
 const AGENT_STATUS_TRANSITIONS: Record<AgentStatus, AgentStatus[]> = {
-  DRAFT: ['TESTING', 'ARCHIVED'],
-  TESTING: ['READY', 'DRAFT', 'ARCHIVED'],
+  DRAFT: ['TESTING', 'PAUSED', 'ARCHIVED'],
+  TESTING: ['READY', 'DRAFT', 'PAUSED', 'ARCHIVED'],
   READY: ['ACTIVE', 'TESTING', 'PAUSED', 'ARCHIVED'],
   ACTIVE: ['PAUSED', 'ARCHIVED'],
   PAUSED: ['ACTIVE', 'ARCHIVED'],
@@ -432,6 +433,7 @@ function pauseOtherActiveAgents(businessId: string, keepAgentId: string): void {
   const others = db.agents.filter(a => a.businessId === businessId && a.id !== keepAgentId && a.status === 'ACTIVE');
   for (const other of others) {
     other.status = 'PAUSED';
+    other.pausedFrom = 'ACTIVE'; // unpausing this agent may resume it as ACTIVE
     other.updatedAt = new Date().toISOString();
     db.agents.update(other);
     db.auditLogs.push({
@@ -570,13 +572,13 @@ router.put(
 
     // Metadata edits only (name/description) — never trust arbitrary keys
     // (prevents mass-assignment). Config edits go through the version
-    // endpoints so a draft never silently changes the live agent.
+    // endpoints so a draft never silently changes the live agent. Metadata
+    // edits deliberately do NOT bump the version number — the version counter
+    // tracks published config snapshots, not cosmetic field changes.
     const { name, description } = req.body;
     if (name !== undefined) agent.name = name;
     if (description !== undefined) agent.description = description;
 
-    // Increment version on update
-    agent.version = agent.version + 1;
     agent.updatedAt = new Date().toISOString();
     db.agents.update(agent);
 
@@ -608,7 +610,13 @@ router.post(
 
     // Same status = idempotent no-op.
     if (status !== agent.status) {
-      const allowed = AGENT_STATUS_TRANSITIONS[agent.status];
+      let allowed = AGENT_STATUS_TRANSITIONS[agent.status];
+      // A PAUSED agent may also resume the exact state it was paused from
+      // (e.g. READY -> PAUSED then PAUSED -> READY), in addition to the
+      // static ACTIVE/ARCHIVED exits.
+      if (agent.status === 'PAUSED' && agent.pausedFrom && !allowed.includes(agent.pausedFrom)) {
+        allowed = [...allowed, agent.pausedFrom];
+      }
       if (!allowed.includes(status)) {
         return res.status(400).json({
           error: `Invalid status transition: ${agent.status} -> ${status}. Allowed: ${[...allowed, agent.status].join(', ')}.`
@@ -631,6 +639,13 @@ router.post(
         const biz = db.businesses.find(b => b.id === agent.businessId);
         if (!biz) return res.status(400).json({ error: 'Cannot activate agent: Business not found.' });
         pauseOtherActiveAgents(agent.businessId, agent.id);
+      }
+
+      // Pausing records the state we paused FROM so unpausing can resume it.
+      if (status === 'PAUSED') {
+        agent.pausedFrom = agent.status;
+      } else if (agent.status === 'PAUSED') {
+        delete agent.pausedFrom;
       }
 
       agent.status = status;
@@ -899,11 +914,18 @@ router.post('/runtime/chat', rateLimit({ ...RATE_LIMITS.public, prefix: 'chat' }
       includeDebug
     });
 
-    // Customer-facing: strip all internal diagnostics.
+    // Customer-facing fields: the widget always receives the safe
+    // `agentAvailable` flag (false = no ACTIVE agent → render as an error,
+    // never a fake answer) plus reply/conversationId/status. The internal
+    // debug block (system prompt, retrieved knowledge, tool results) is
+    // developer-only: it is attached ONLY for authenticated sessions scoped
+    // to the tenant being chatted with (simulator use case).
     res.json({
       reply: result.reply,
       conversationId: result.conversationId,
-      status: result.status
+      status: result.status,
+      agentAvailable: result.agentAvailable,
+      ...(includeDebug && result.debug ? { debug: result.debug } : {})
     });
   } catch (err: any) {
     // Configuration errors (no agent, no published version) are expected
@@ -947,7 +969,11 @@ router.post(
         customerName,
         customerPhone,
         versionId,
-        simulator: true
+        simulator: true,
+        // The simulator is an authenticated, tenant-scoped owner tool: it
+        // receives the full developer debug block (execution id, system
+        // prompt, retrieved knowledge, tool calls) so agents can be debugged.
+        includeDebug: true
       });
       res.json(result);
     } catch (err: any) {

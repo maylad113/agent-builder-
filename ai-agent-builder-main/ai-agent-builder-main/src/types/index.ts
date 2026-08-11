@@ -131,6 +131,8 @@ export interface Agent {
   description: string;
   version: number;
   status: AgentStatus;
+  /** Lifecycle state the agent was paused FROM (set on pause, cleared on unpause). */
+  pausedFrom?: AgentStatus;
   systemPrompt: string;
   structuredConfig: StructuredAgentConfig;
   llmProvider: 'gemini' | 'openai' | 'anthropic';
