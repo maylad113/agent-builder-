@@ -4,6 +4,7 @@ import BetterSqlite3 from 'better-sqlite3';
 import {
   Business,
   Agent,
+  AgentVersion,
   KnowledgeChunk,
   Customer,
   Conversation,
@@ -21,6 +22,7 @@ import {
   Session
 } from '../types';
 import { hashPassword } from './passwords';
+import { initEmbeddingsTable } from './embeddings';
 
 /**
  * SQLite-backed repository for the AI Agent Factory MVP.
@@ -53,11 +55,16 @@ interface TableConfig {
 const TABLES: Record<string, TableConfig> = {
   businesses: {
     table: 'businesses',
-    jsonColumns: ['hours', 'services', 'faqs', 'policies'],
+    jsonColumns: ['hours', 'services', 'faqs', 'policies', 'holidays', 'allowedWidgetOrigins'],
     booleanColumns: []
   },
   agents: {
     table: 'agents',
+    jsonColumns: ['structuredConfig'],
+    booleanColumns: []
+  },
+  agentVersions: {
+    table: 'agent_versions',
     jsonColumns: ['structuredConfig'],
     booleanColumns: []
   },
@@ -109,7 +116,7 @@ const TABLES: Record<string, TableConfig> = {
   integrations: {
     table: 'integrations',
     jsonColumns: ['configData'],
-    booleanColumns: ['connected', 'credentialsSet']
+    booleanColumns: ['credentialsSet']
   },
   templates: {
     table: 'templates',
@@ -332,6 +339,7 @@ export class AppDatabase {
 
   public businesses: Collection<Business>;
   public agents: Collection<Agent>;
+  public agentVersions: Collection<AgentVersion>;
   public knowledgeChunks: Collection<KnowledgeChunk>;
   public customers: Collection<Customer>;
   public conversations: Collection<Conversation>;
@@ -349,7 +357,17 @@ export class AppDatabase {
   public sessions: Collection<Session>;
 
   constructor(opts: AppDatabaseOptions = {}) {
-    this.dbPath = opts.dbPath || process.env.DB_PATH || path.join(process.cwd(), 'data', 'agentforge.db');
+    let dbPath = opts.dbPath || process.env.DB_PATH || path.join(process.cwd(), 'data', 'agentforge.db');
+    // If DB_PATH points at an existing directory, append a default filename
+    // so the server doesn't crash with SQLITE_CANTOPEN (common deployment mistake).
+    try {
+      if (fs.statSync(dbPath).isDirectory()) {
+        dbPath = path.join(dbPath, 'agentfactory.db');
+      }
+    } catch {
+      // path doesn't exist yet — that's fine, better-sqlite3 will create it
+    }
+    this.dbPath = dbPath;
     this.migrationsDir = opts.migrationsDir || process.env.MIGRATIONS_DIR || path.join(process.cwd(), 'migrations');
 
     fs.mkdirSync(path.dirname(this.dbPath), { recursive: true });
@@ -358,9 +376,11 @@ export class AppDatabase {
     this.sqlite.pragma('foreign_keys = ON');
 
     runMigrations(this.sqlite, this.migrationsDir);
+    initEmbeddingsTable(this.sqlite);
 
     this.businesses = new Collection<Business>(this.sqlite, TABLES.businesses);
     this.agents = new Collection<Agent>(this.sqlite, TABLES.agents);
+    this.agentVersions = new Collection<AgentVersion>(this.sqlite, TABLES.agentVersions);
     this.knowledgeChunks = new Collection<KnowledgeChunk>(this.sqlite, TABLES.knowledgeChunks);
     this.customers = new Collection<Customer>(this.sqlite, TABLES.customers);
     this.conversations = new Collection<Conversation>(this.sqlite, TABLES.conversations);
@@ -380,6 +400,17 @@ export class AppDatabase {
     if (opts.seed !== false) {
       this.seed();
       this.seedUsers();
+    }
+
+    // Best-effort background indexing of seeded knowledge when an embedding
+    // key is configured. Fire-and-forget: failures are non-fatal (keyword
+    // fallback remains) and we must not block startup for optional providers.
+    if (process.env.GEMINI_API_KEY) {
+      import('./embeddings').then(({ indexChunk }) => {
+        for (const c of this.knowledgeChunks.toJSON()) {
+          indexChunk(c).catch(() => {});
+        }
+      }).catch(() => {});
     }
   }
 
@@ -433,6 +464,8 @@ export class AppDatabase {
       },
       communicationStyle: 'Friendly, welcoming, respectful, and direct.',
       status: 'ACTIVE',
+      holidays: [],
+      allowedWidgetOrigins: [], // empty => localhost allowed in dev (widget security)
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -524,6 +557,22 @@ Never invent prices, hours, services, or availability that do not exist in the d
     };
     this.agents.push(tonysAgent);
 
+    // Seed a PUBLISHED version snapshot so the versioning system is consistent
+    // for the demo tenant (runtime reads the agent row, but the dashboard +
+    // simulator rely on version records existing).
+    this.agentVersions.push({
+      id: 'ver-tonys-1',
+      agentId: 'agent-tonys-1',
+      businessId: 'biz-tonys-barber',
+      versionNumber: 1,
+      status: 'PUBLISHED',
+      systemPrompt: tonysAgent.systemPrompt,
+      structuredConfig: tonysAgent.structuredConfig,
+      model: tonysAgent.model,
+      changeNote: 'Initial published version',
+      createdAt: new Date().toISOString(),
+      publishedAt: new Date().toISOString()
+    });
     // 4. Knowledge Chunks
     this.knowledgeChunks.push(
       {
@@ -678,7 +727,7 @@ Never invent prices, hours, services, or availability that do not exist in the d
         id: 'integ-1',
         businessId: 'biz-tonys-barber',
         provider: 'google_calendar',
-        connected: false,
+        state: 'NOT_CONFIGURED',
         statusMessage: 'Not configured',
         credentialsSet: false
       },
@@ -686,7 +735,7 @@ Never invent prices, hours, services, or availability that do not exist in the d
         id: 'integ-2',
         businessId: 'biz-tonys-barber',
         provider: 'meta_instagram',
-        connected: false,
+        state: 'NOT_CONFIGURED',
         statusMessage: 'Not configured',
         credentialsSet: false
       },
@@ -694,7 +743,7 @@ Never invent prices, hours, services, or availability that do not exist in the d
         id: 'integ-3',
         businessId: 'biz-tonys-barber',
         provider: 'twilio_sms',
-        connected: false,
+        state: 'NOT_CONFIGURED',
         statusMessage: 'Not configured',
         credentialsSet: false
       },
@@ -702,7 +751,7 @@ Never invent prices, hours, services, or availability that do not exist in the d
         id: 'integ-4',
         businessId: 'biz-tonys-barber',
         provider: 'voice_ai',
-        connected: false,
+        state: 'NOT_CONFIGURED',
         statusMessage: 'Not configured',
         credentialsSet: false
       }

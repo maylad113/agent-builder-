@@ -126,9 +126,9 @@ describe('SQLite storage layer', () => {
     const dbPath = testDbPath('shapes.db');
     const db1 = new AppDatabase({ dbPath, seed: true });
 
-    // IntegrationConfig: booleans stored as 0/1, configData as JSON.
+    // IntegrationConfig: state stored as text, credentialsSet as boolean, configData as JSON.
     const integ = db1.integrations.find(i => i.id === 'integ-1');
-    integ!.connected = true;
+    integ!.state = 'CONNECTED';
     integ!.credentialsSet = true;
     integ!.configData = { calendarId: 'tonys@example.com' };
     db1.integrations.update(integ!);
@@ -149,7 +149,7 @@ describe('SQLite storage layer', () => {
 
     const db2 = new AppDatabase({ dbPath, seed: false });
     const integ2 = db2.integrations.find(i => i.id === 'integ-1');
-    expect(integ2?.connected).toBe(true);
+    expect(integ2?.state).toBe('CONNECTED');
     expect(integ2?.credentialsSet).toBe(true);
     expect(integ2?.configData).toEqual({ calendarId: 'tonys@example.com' });
 

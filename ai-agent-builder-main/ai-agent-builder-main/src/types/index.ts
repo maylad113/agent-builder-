@@ -50,6 +50,9 @@ export interface ServiceItem {
   price: number; // in currency units (e.g. Toman or USD)
   durationMinutes: number;
   description: string;
+  /** Optional buffer (minutes) the business needs after this service before the
+   * next appointment on the same staff member. Defaults to 0. */
+  bufferMinutesAfter?: number;
 }
 
 export interface BusinessHours {
@@ -57,6 +60,13 @@ export interface BusinessHours {
   isOpen: boolean;
   openTime: string; // "09:00"
   closeTime: string; // "20:00"
+}
+
+/** A single closed date (holiday / staff leave / maintenance). Stored on the
+ * business so no appointments can be booked that day. */
+export interface Holiday {
+  date: string; // YYYY-MM-DD
+  name: string;
 }
 
 export interface FAQItem {
@@ -86,6 +96,13 @@ export interface Business {
   };
   communicationStyle: string;
   status: 'ACTIVE' | 'INACTIVE' | 'PAUSED';
+  /** Dates the business is closed (holidays, maintenance). No appointments may
+   * be booked on these dates. */
+  holidays?: Holiday[];
+  /** Origins permitted to embed the chat widget for this business. Enforced by
+   * the runtime CORS check on /api/runtime/chat. An empty list in development
+   * allows localhost for convenience. */
+  allowedWidgetOrigins?: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -120,6 +137,28 @@ export interface Agent {
   model: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * An immutable snapshot of an agent's configuration at a point in time.
+ * Production conversations use the PUBLISHED version; DRAFT/TESTING versions
+ * are only usable from the authenticated simulator. Editing a draft never
+ * changes the live (PUBLISHED) agent until an explicit publish operation.
+ */
+export type AgentVersionStatus = 'DRAFT' | 'TESTING' | 'PUBLISHED' | 'ARCHIVED';
+
+export interface AgentVersion {
+  id: string;
+  agentId: string;
+  businessId: string;
+  versionNumber: number;
+  status: AgentVersionStatus;
+  systemPrompt: string;
+  structuredConfig: StructuredAgentConfig;
+  model: string;
+  changeNote?: string;
+  createdAt: string;
+  publishedAt?: string;
 }
 
 export interface KnowledgeChunk {
@@ -174,6 +213,14 @@ export interface Conversation {
   summary?: string;
   lastMessageAt: string;
   createdAt: string;
+  /** Reason captured when the AI escalated to a human. */
+  handoffReason?: string;
+  /** When the AI requested a human (set on WAITING_FOR_HUMAN). */
+  handoffRequestedAt?: string;
+  /** When a human took over (set on HUMAN_HANDLING). */
+  handoffStartedAt?: string;
+  /** When the conversation was resolved (set on RESOLVED). */
+  resolvedAt?: string;
 }
 
 export interface StaffMember {
@@ -182,6 +229,11 @@ export interface StaffMember {
   name: string;
   role: string;
   servicesHandled: string[]; // service IDs
+  /** Per-day working hours for this staff member. If absent for a day, the
+   * staff member is unavailable that day. Falls back to business hours. */
+  workingHours?: BusinessHours[];
+  /** Dates this staff member is unavailable (vacation, sick leave). */
+  timeOff?: Holiday[];
 }
 
 export interface Appointment {
@@ -232,6 +284,10 @@ export interface Order {
   createdAt: string;
 }
 
+export type IntegrationState = 'NOT_CONFIGURED' | 'CONFIGURING' | 'CONNECTED' | 'ERROR' | 'DISCONNECTED';
+
+export type IntegrationProviderType = 'google_calendar' | 'meta_instagram' | 'twilio_sms' | 'voice_ai';
+
 export interface ChannelConfig {
   id: string;
   businessId: string;
@@ -245,11 +301,20 @@ export interface ChannelConfig {
 export interface IntegrationConfig {
   id: string;
   businessId: string;
-  provider: 'google_calendar' | 'meta_instagram' | 'twilio_sms' | 'voice_ai';
-  connected: boolean;
+  provider: IntegrationProviderType;
+  /** Lifecycle state. CONNECTED is ONLY set after the provider validates the
+   * credentials via IntegrationProvider.validate(). Never trust a frontend
+   * `connected: true`. */
+  state: IntegrationState;
   statusMessage: string;
+  /** True if credentials have been stored server-side (never returned to the
+   * frontend). Does NOT imply the provider is connected — see `state`. */
   credentialsSet: boolean;
   lastSync?: string;
+  lastValidatedAt?: string;
+  lastError?: string;
+  /** Non-secret provider configuration (e.g. selected calendar id, phone
+   * number). Credentials are NEVER stored here. */
   configData?: Record<string, string>;
 }
 
@@ -273,6 +338,13 @@ export interface UsageRecord {
   requestsCount: number;
   voiceMinutes: number;
   smsCount: number;
+  /** Real input tokens from the provider's usageMetadata (Phase 19). */
+  inputTokens?: number;
+  /** Real output tokens from the provider's usageMetadata. */
+  outputTokens?: number;
+  agentId?: string;
+  model?: string;
+  provider?: string;
 }
 
 export interface AuditLog {

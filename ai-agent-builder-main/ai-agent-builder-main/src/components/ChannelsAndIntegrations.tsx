@@ -85,16 +85,26 @@ export const ChannelsAndIntegrations: React.FC<ChannelsAndIntegrationsProps> = (
         const item = integrations.find(i => i.id === configuringItem.id || i.provider === configuringItem.providerKey);
         const targetId = item ? item.id : `integ-${Date.now()}-${configuringItem.providerKey}`;
 
-        await fetch(`/api/integrations/${targetId}`, {
-          method: 'PUT',
+        // Two-step secure connect (P1.1): submit credentials server-side, then
+        // validate. The server ONLY marks the integration CONNECTED after the
+        // provider confirms the credentials actually work. The frontend never
+        // sets `state=CONNECTED` directly.
+        await fetch(`/api/integrations/${targetId}/credentials`, {
+          method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            connected: true,
-            credentialsSet: true,
-            statusMessage: 'Configured & Active',
-            configData: formValues
-          })
+          body: JSON.stringify({ credentials: formValues })
         });
+        const validateRes = await fetch(`/api/integrations/${targetId}/validate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        });
+        const outcome = await validateRes.json().catch(() => ({}));
+        if (outcome.state !== 'CONNECTED') {
+          setSaveSuccess(false);
+          alert(`Could not validate integration: ${outcome.statusMessage || outcome.lastError || 'unknown error'}`);
+        } else {
+          setSaveSuccess(true);
+        }
       } else {
         const item = channels.find(c => c.id === configuringItem.id || c.type === configuringItem.providerKey);
         const targetId = item ? item.id : `chan-${Date.now()}-${configuringItem.providerKey}`;
@@ -108,15 +118,17 @@ export const ChannelsAndIntegrations: React.FC<ChannelsAndIntegrationsProps> = (
             configData: formValues
           })
         });
+        setSaveSuccess(true);
       }
 
-      setSaveSuccess(true);
       if (onRefreshData) onRefreshData();
 
-      setTimeout(() => {
-        setConfiguringItem(null);
-        setSaveSuccess(false);
-      }, 1200);
+      if (saveSuccess || configuringItem.type === 'channel') {
+        setTimeout(() => {
+          setConfiguringItem(null);
+          setSaveSuccess(false);
+        }, 1200);
+      }
     } catch (err) {
       console.error('Save integration error:', err);
     } finally {
@@ -127,15 +139,9 @@ export const ChannelsAndIntegrations: React.FC<ChannelsAndIntegrationsProps> = (
   const handleDisconnect = async (type: 'integration' | 'channel', id: string, providerKey: string) => {
     try {
       if (type === 'integration') {
-        await fetch(`/api/integrations/${id}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            connected: false,
-            credentialsSet: false,
-            statusMessage: 'Not configured',
-            configData: {}
-          })
+        await fetch(`/api/integrations/${id}/disconnect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
         });
       } else {
         await fetch(`/api/channels/${id}`, {
@@ -204,7 +210,7 @@ export const ChannelsAndIntegrations: React.FC<ChannelsAndIntegrationsProps> = (
           {/* Google Calendar */}
           {(() => {
             const integ = getIntegrationConfig('google_calendar');
-            const isConnected = integ?.connected || false;
+            const isConnected = (integ?.state === 'CONNECTED') || false;
             return (
               <div className="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-sm space-y-4 flex flex-col justify-between">
                 <div>
@@ -276,7 +282,7 @@ export const ChannelsAndIntegrations: React.FC<ChannelsAndIntegrationsProps> = (
           {/* Meta Instagram */}
           {(() => {
             const integ = getIntegrationConfig('meta_instagram');
-            const isConnected = integ?.connected || false;
+            const isConnected = (integ?.state === 'CONNECTED') || false;
             return (
               <div className="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-sm space-y-4 flex flex-col justify-between">
                 <div>
@@ -348,7 +354,7 @@ export const ChannelsAndIntegrations: React.FC<ChannelsAndIntegrationsProps> = (
           {/* Twilio SMS */}
           {(() => {
             const integ = getIntegrationConfig('twilio_sms');
-            const isConnected = integ?.connected || false;
+            const isConnected = (integ?.state === 'CONNECTED') || false;
             return (
               <div className="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-sm space-y-4 flex flex-col justify-between">
                 <div>
@@ -420,7 +426,7 @@ export const ChannelsAndIntegrations: React.FC<ChannelsAndIntegrationsProps> = (
           {/* Voice AI */}
           {(() => {
             const integ = getIntegrationConfig('voice_ai');
-            const isConnected = integ?.connected || false;
+            const isConnected = (integ?.state === 'CONNECTED') || false;
             return (
               <div className="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-sm space-y-4 flex flex-col justify-between">
                 <div>

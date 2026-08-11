@@ -39,6 +39,15 @@ const platformAgent = request.agent(app);
 const tonyAgent = request.agent(app);
 const staffAgent = request.agent(app);
 
+// A near-term open weekday (skip Sunday; new businesses are open Mon–Sat by
+// default with a 14-day max-advance policy, so booking must be within 14 days).
+function nearOpenDate(addDays = 1): string {
+  const d = new Date();
+  d.setDate(d.getDate() + addDays);
+  while (d.getDay() === 0) d.setDate(d.getDate() + 1);
+  return d.toISOString().split('T')[0];
+}
+
 // Business B ("Bella's Bakery") + its resources, created as the platform owner.
 let bizBId = '';
 let agentBId = '';
@@ -55,17 +64,18 @@ beforeAll(async () => {
   });
   expect(login.status).toBe(200);
 
-  // Create a second tenant.
+  // Create a second tenant (with a real service so appointment booking is valid).
   const bizRes = await platformAgent.post('/api/businesses').send({
     name: "Bella's Bakery",
     type: 'restaurant',
     description: 'Second tenant used to prove isolation.',
     location: 'Baker Street 9',
-    services: [],
+    services: [{ name: 'Cake Tasting', price: 150000, durationMinutes: 45, description: 'Sample our cakes.' }],
     faqs: []
   });
   expect(bizRes.status).toBe(201);
   bizBId = bizRes.body.id;
+  const bellaServiceId = bizRes.body.services[0].id;
 
   // Agent for B.
   const agentRes = await platformAgent.post('/api/agents').send({
@@ -87,12 +97,14 @@ beforeAll(async () => {
   expect(kcRes.status).toBe(201);
   knowledgeBId = kcRes.body.id;
 
-  // Appointment for B.
+  // Appointment for B (valid service + slot within default hours, within the
+  // 14-day max-advance policy).
   const apptRes = await platformAgent.post('/api/appointments').send({
     businessId: bizBId,
+    serviceId: bellaServiceId,
     customerName: 'Gina',
     customerPhone: '+98 900 111 2222',
-    date: '2030-01-15',
+    date: nearOpenDate(),
     startTime: '10:00',
     notes: 'Bella appointment'
   });
@@ -293,9 +305,13 @@ describe('multi-tenant isolation: Business A cannot read or write Business B', (
     expect(agents.status).toBe(200);
     expect(agents.body).toHaveLength(1);
 
+    // Metadata edits update the agent without bumping the version number —
+    // config changes go through the explicit version endpoints so a draft
+    // never silently changes the live (published) agent.
     const update = await tonyAgent.put('/api/agents/agent-tonys-1').send({ description: 'Updated by owner' });
     expect(update.status).toBe(200);
-    expect(update.body.version).toBe(2);
+    expect(update.body.description).toBe('Updated by owner');
+    expect(update.body.version).toBe(1);
 
     const apps = await tonyAgent.get('/api/appointments?businessId=biz-tonys-barber');
     expect(apps.status).toBe(200);
@@ -328,9 +344,15 @@ describe('public widget + tenant isolation at runtime', () => {
     expect(raw).not.toContain(BELLA_SECRET);
     expect(raw).not.toContain('pistachio croissant');
 
-    // The retrieval is server-scoped to tenant A: no B chunks in context.
-    const retrieved = (res.body.debug?.retrievedKnowledge ?? []) as string[];
-    expect(retrieved.every((chunk: string) => !chunk.includes(BELLA_SECRET))).toBe(true);
+    // CRITICAL: the public customer-facing endpoint must NEVER return the
+    // internal debug block (system prompt, retrieved knowledge, tool calls).
+    // Those are developer-only and would leak the agent's instructions + RAG.
+    expect(res.body.debug).toBeUndefined();
+    expect(res.body.systemPrompt).toBeUndefined();
+    expect(res.body.retrievedKnowledge).toBeUndefined();
+    expect(res.body.toolCalls).toBeUndefined();
+    // Only the safe customer-facing fields are present.
+    expect(Object.keys(res.body).sort()).toEqual(['conversationId', 'reply', 'status']);
   });
 
   it('runtime chat with an unknown tenant still errors honestly (no cross-tenant write)', async () => {
@@ -339,7 +361,54 @@ describe('public widget + tenant isolation at runtime', () => {
       tenantId: 'biz-does-not-exist',
       userMessage: 'hello'
     });
-    expect(res.status).toBe(500);
+    // Configuration/degradation errors return 503; genuine server faults 500.
+    // Either way it must be an error status with a truthful error field.
+    expect(res.status).toBeGreaterThanOrEqual(500);
     expect(res.body.error).toBeTruthy();
+  });
+
+  it('runtime chat is tenant-scoped: a customer cannot load another tenant\'s conversation by id (IDOR fix)', async () => {
+    // convBId belongs to tenant B. A customer posting to tenant A with B's
+    // conversation id must NOT attach to B's conversation — the runtime must
+    // ignore the foreign id and create a fresh conversation under tenant A.
+    const fresh = request(makeApp());
+    const idorMarker = 'idor-probe-' + Date.now();
+    const res = await fresh.post('/api/runtime/chat').send({
+      tenantId: 'biz-tonys-barber',
+      conversationId: convBId,
+      userMessage: idorMarker
+    });
+    expect(res.status).toBe(200);
+    // A new conversation was created under tenant A, NOT B's conversation.
+    expect(res.body.conversationId).not.toBe(convBId);
+
+    // And the foreign (B) conversation must not have gained the marker message.
+    const bMessages = await platformAgent.get(`/api/conversations/${convBId}/messages`);
+    expect(bMessages.status).toBe(200);
+    expect(bMessages.body.some((m: any) => m.content === idorMarker)).toBe(false);
+  });
+
+  it('authenticated simulator returns debug diagnostics; cross-tenant simulate is blocked', async () => {
+    // Tony simulating his own tenant gets the full debug block.
+    const sim = await tonyAgent.post('/api/runtime/simulate').send({
+      businessId: 'biz-tonys-barber',
+      userMessage: 'what are your hours?'
+    });
+    expect(sim.status).toBe(200);
+    expect(sim.body.debug).toBeDefined();
+    expect(sim.body.debug.executionId).toBeDefined();
+    expect(sim.body.debug.systemPrompt).toBeDefined();
+
+    // Tony simulating tenant B is blocked — simulate is a write (it can create
+    // a conversation), so a cross-tenant attempt is correctly rejected (403).
+    const cross = await tonyAgent.post('/api/runtime/simulate').send({
+      businessId: bizBId,
+      userMessage: 'hello'
+    });
+    expect([403, 404]).toContain(cross.status);
+
+    // Unauthenticated simulate is blocked.
+    const fresh = request(makeApp());
+    expect((await fresh.post('/api/runtime/simulate').send({ businessId: 'biz-tonys-barber', userMessage: 'hi' })).status).toBe(401);
   });
 });

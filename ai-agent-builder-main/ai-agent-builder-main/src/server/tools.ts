@@ -1,5 +1,9 @@
 import { Type, FunctionDeclaration } from '@google/genai';
 import { db } from './db';
+import {
+  timeToMinutes, addMinutes, intervalsOverlap, isFail,
+  dayOfWeekForDate, isHoliday, validateSlot, generateAvailableSlots, findEligibleStaff
+} from './appointmentEngine';
 
 export interface ToolContext {
   tenantId: string;
@@ -12,7 +16,17 @@ export interface ToolContext {
    * was not offered in the function declarations.
    */
   toolsEnabled?: string[];
+  /** Tool names the agent is permitted to invoke. If provided, any tool not
+   * in this set is rejected before execution — defense-in-depth against the
+   * LLM hallucinating a tool call that was never declared to it. */
+  allowedToolNames?: string[];
 }
+
+// Time helpers (timeToMinutes, addMinutes, intervalsOverlap, isFail, dayOfWeek,
+// validateSlot, generateAvailableSlots) are imported from ./appointmentEngine
+// — the single source of truth for the scheduling engine. See that module for
+// the pure, unit-tested availability/overlap/notice logic.
+
 
 // Gemini Function Declarations Schema for tool calling
 export const agentToolDeclarations: FunctionDeclaration[] = [
@@ -198,11 +212,18 @@ export async function executeAgentTool(
     return { success: false, error: `Unauthorized tenant ID: ${tenantId}` };
   }
 
-  // HARD tool enablement gate: even if the LLM (or a caller) requests a tool
-  // that is not enabled for the agent in scope, we refuse to execute it. This
-  // is enforced for EVERY tool in the switch below — never trust the frontend.
-  if (context.toolsEnabled && !context.toolsEnabled.includes(toolName)) {
-    return { success: false, error: `Tool ${toolName} is not enabled for this agent` };
+  // HARD tool enablement gate (both layers enforced): even if the LLM (or a
+  // caller) requests a tool that is not enabled for the agent in scope, we
+  // refuse to execute it. `toolsEnabled` is the agent's own configured set;
+  // `allowedToolNames` is the defense-in-depth set the runtime derived from
+  // the declarations it actually offered the model (so a hallucinated tool
+  // that was never declared is also rejected). This is enforced for EVERY
+  // tool in the switch below — never trust the frontend.
+  if (
+    (context.toolsEnabled && !context.toolsEnabled.includes(toolName)) ||
+    (context.allowedToolNames && !context.allowedToolNames.includes(toolName))
+  ) {
+    return { success: false, error: `Tool ${toolName} is not enabled for this agent (not permitted).` };
   }
 
   try {
@@ -301,41 +322,34 @@ export async function executeAgentTool(
       case 'check_availability': {
         const { date, serviceId } = args;
         const requestedDate = date || new Date().toISOString().split('T')[0];
-        
-        // Find day of week for requested date
-        const dateObj = new Date(requestedDate);
-        const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-        const dayName = dayNames[dateObj.getUTCDay()];
-        
+        const dayName = dayOfWeekForDate(requestedDate, business.timezone);
+
+        // Holiday / closed-day short-circuit (engine handles both).
+        if (isHoliday(business, requestedDate)) {
+          return {
+            success: true,
+            data: { date: requestedDate, dayOfWeek: dayName, isOpen: false,
+              message: `The business is closed on ${requestedDate} (holiday).`, availableSlots: [] }
+          };
+        }
         const dayHours = business.hours.find(h => h.day === dayName);
         if (!dayHours || !dayHours.isOpen) {
           return {
             success: true,
-            data: {
-              date: requestedDate,
-              dayOfWeek: dayName,
-              isOpen: false,
-              message: `The business is closed on ${dayName}s.`,
-              availableSlots: []
-            }
+            data: { date: requestedDate, dayOfWeek: dayName, isOpen: false,
+              message: `The business is closed on ${dayName}s.`, availableSlots: [] }
           };
         }
 
-        // Get existing appointments for this tenant on this date
+        // Resolve the service (default to the first one if none given) so
+        // slot generation accounts for its duration + buffer.
+        const service = (serviceId ? business.services.find(s => s.id === serviceId) : undefined)
+          || business.services[0];
         const existingApps = db.appointments.filter(a => a.businessId === tenantId && a.date === requestedDate && a.status !== 'CANCELLED');
-        const bookedTimes = new Set(existingApps.map(a => a.startTime));
-
-        // Generate standard hourly slots between openTime and closeTime
-        const openHour = parseInt(dayHours.openTime.split(':')[0], 10) || 9;
-        const closeHour = parseInt(dayHours.closeTime.split(':')[0], 10) || 20;
-
-        const availableSlots: string[] = [];
-        for (let h = openHour; h < closeHour; h++) {
-          const slot = `${h.toString().padStart(2, '0')}:00`;
-          const slotHalf = `${h.toString().padStart(2, '0')}:30`;
-          if (!bookedTimes.has(slot)) availableSlots.push(slot);
-          if (h < closeHour - 1 && !bookedTimes.has(slotHalf)) availableSlots.push(slotHalf);
-        }
+        const staff = db.staffMembers.filter(s => s.businessId === tenantId);
+        const availableSlots = service
+          ? generateAvailableSlots(business, staff, service, existingApps, requestedDate)
+          : [];
 
         return {
           success: true,
@@ -353,79 +367,105 @@ export async function executeAgentTool(
       case 'book_appointment': {
         const { customerName, customerPhone, serviceIdOrName, date, startTime, notes } = args;
 
-        // Service resolution
-        const service = business.services.find(s => 
-          s.id === serviceIdOrName || 
+        if (!customerName || !customerPhone || !serviceIdOrName || !date || !startTime) {
+          return { success: false, error: 'customerName, customerPhone, serviceIdOrName, date and startTime are required to book.' };
+        }
+
+        // Service resolution (NO fabrication: if no service matches, fail honestly).
+        const service = business.services.find(s =>
+          s.id === serviceIdOrName ||
+          s.name.toLowerCase() === String(serviceIdOrName).toLowerCase() ||
           s.name.toLowerCase().includes(String(serviceIdOrName).toLowerCase())
-        ) || business.services[0]; // fallback to primary service if match ambiguous
-
-        // Check if slot is already occupied
-        const existing = db.appointments.find(a => 
-          a.businessId === tenantId && 
-          a.date === date && 
-          a.startTime === startTime && 
-          a.status !== 'CANCELLED'
         );
-
-        if (existing) {
-          return {
-            success: false,
-            error: `The slot at ${startTime} on ${date} is already booked. Please choose another time slot using check_availability.`
-          };
+        if (!service) {
+          return { success: false, error: `Service "${serviceIdOrName}" was not found. Available services: ${business.services.map(s => s.name).join(', ') || 'none'}.` };
         }
 
-        // Find or create customer
-        let customer = db.customers.find(c => c.businessId === tenantId && c.phone === customerPhone);
-        if (!customer) {
-          customer = {
-            id: `cust-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        // Slot validation via the engine: hours, holiday, min notice, max advance.
+        const slotCheck = validateSlot(business, service, date, startTime);
+        if (!slotCheck.ok) {
+          return { success: false, error: slotCheck.error! };
+        }
+        const endTime = slotCheck.endTime!;
+        const bufferAfter = Math.max(0, service.bufferMinutesAfter || 0);
+        // For overlap detection we block the slot PLUS its trailing buffer so
+        // the staff member has the configured turnaround time.
+        const blockEnd = bufferAfter > 0 ? addMinutes(endTime, bufferAfter) : endTime;
+
+        // TRANSACTIONAL booking with overlap prevention (incl. buffer). The
+        // overlap check and the INSERT run inside one SQLite transaction.
+        // better-sqlite3 is synchronous and serializes writes, so the
+        // transaction makes the check-then-insert atomic: two concurrent
+        // bookings for an overlapping slot cannot both succeed.
+        const appointmentId = `app-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+        const customerId = `cust-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+        const nowIso = new Date().toISOString();
+
+        const bookTxn = db.sqlite.transaction((): { ok: true; appointment: any } | { ok: false; error: string } => {
+          // Re-check for an overlapping (not just identical) non-cancelled
+          // appointment for this tenant on this date. Both the new booking AND
+          // each existing appointment extend by their own service buffer, so a
+          // turnaround period is respected in both directions.
+          const overlapping = db.appointments.filter(
+            a => a.businessId === tenantId && a.date === date && a.status !== 'CANCELLED'
+          );
+          for (const a of overlapping) {
+            const existingService = business.services.find(s => s.id === a.serviceId);
+            const existingBuffer = Math.max(0, existingService?.bufferMinutesAfter || 0);
+            const aBlockEnd = existingBuffer > 0 ? addMinutes(a.endTime, existingBuffer) : a.endTime;
+            if (intervalsOverlap(startTime, blockEnd, a.startTime, aBlockEnd)) {
+              return { ok: false, error: `The time ${startTime}-${endTime} on ${date} overlaps an existing appointment (${a.startTime}-${a.endTime}). Please choose another slot using check_availability.` };
+            }
+          }
+
+          // Find or create the customer inside the transaction.
+          let customer = db.customers.find(c => c.businessId === tenantId && c.phone === customerPhone);
+          if (!customer) {
+            customer = { id: customerId, businessId: tenantId, name: customerName, phone: customerPhone, createdAt: nowIso };
+            db.customers.push(customer);
+          }
+
+          // Assign an eligible staff member (engine honors staff hours, services,
+          // timeOff). Falls back to the first staff member when none configured.
+          const staffList = db.staffMembers.filter(s => s.businessId === tenantId);
+          const staff = findEligibleStaff(business, staffList, service, date, startTime, endTime);
+
+          const newAppointment = {
+            id: appointmentId,
             businessId: tenantId,
-            name: customerName,
-            phone: customerPhone,
-            createdAt: new Date().toISOString()
+            serviceId: service.id,
+            serviceName: service.name,
+            staffMemberId: staff?.id,
+            staffName: staff?.name,
+            customerId: customer.id,
+            customerName,
+            customerPhone,
+            date,
+            startTime,
+            endTime,
+            status: 'CONFIRMED' as const,
+            notes: notes || 'Booked via AI Assistant',
+            createdAt: nowIso
           };
-          db.customers.push(customer);
-        }
+          db.appointments.push(newAppointment);
 
-        // Calculate end time
-        const startHour = parseInt(startTime.split(':')[0], 10);
-        const startMin = parseInt(startTime.split(':')[1] || '0', 10);
-        const totalMinutes = startHour * 60 + startMin + (service?.durationMinutes || 30);
-        const endHour = Math.floor(totalMinutes / 60);
-        const endMin = totalMinutes % 60;
-        const endTime = `${endHour.toString().padStart(2, '0')}:${endMin.toString().padStart(2, '0')}`;
+          db.auditLogs.push({
+            id: `log-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+            businessId: tenantId,
+            action: 'APPOINTMENT_BOOKED',
+            details: `Appointment #${newAppointment.id} booked for ${customerName} (${service.name} at ${startTime}-${endTime} on ${date})`,
+            timestamp: nowIso
+          });
 
-        // Select staff member if available
-        const staff = db.staffMembers.find(s => s.businessId === tenantId);
-
-        const newAppointment = {
-          id: `app-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          businessId: tenantId,
-          serviceId: service ? service.id : 'srv-1',
-          serviceName: service ? service.name : 'Haircut',
-          staffMemberId: staff?.id,
-          staffName: staff?.name,
-          customerId: customer.id,
-          customerName,
-          customerPhone,
-          date,
-          startTime,
-          endTime,
-          status: 'CONFIRMED' as const,
-          notes: notes || 'Booked via AI Assistant',
-          createdAt: new Date().toISOString()
-        };
-
-        db.appointments.push(newAppointment);
-
-        // Audit Log
-        db.auditLogs.push({
-          id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          businessId: tenantId,
-          action: 'APPOINTMENT_BOOKED',
-          details: `Appointment #${newAppointment.id} booked for ${customerName} (${service.name} at ${startTime} on ${date})`,
-          timestamp: new Date().toISOString()
+          return { ok: true, appointment: newAppointment };
         });
+
+        const result = bookTxn();
+
+        if (isFail(result)) {
+          return { success: false, error: result.error };
+        }
+        const newAppointment = result.appointment;
 
         return {
           success: true,
@@ -482,16 +522,57 @@ export async function executeAgentTool(
 
       case 'reschedule_appointment': {
         const { appointmentId, newDate, newTime } = args;
+        if (!appointmentId || !newDate || !newTime) {
+          return { success: false, error: 'appointmentId, newDate and newTime are required.' };
+        }
         const app = db.appointments.find(a => a.businessId === tenantId && a.id === appointmentId);
-
         if (!app) {
           return { success: false, error: 'Appointment not found.' };
         }
+        if (app.status === 'CANCELLED') {
+          return { success: false, error: 'Cannot reschedule a cancelled appointment.' };
+        }
 
-        app.date = newDate;
-        app.startTime = newTime;
-        app.status = 'RESCHEDULED';
-        db.appointments.update(app);
+        // Recompute end time from the service duration so the moved slot stays correct.
+        const service = business.services.find(s => s.id === app.serviceId) ||
+          business.services.find(s => s.name === app.serviceName);
+        const svc = service || { id: '', name: app.serviceName, price: 0, durationMinutes: 30, description: '' };
+
+        // Validate the new slot via the engine (hours, holiday, notice, advance).
+        const slotCheck = validateSlot(business, svc, newDate, newTime);
+        if (!slotCheck.ok) {
+          return { success: false, error: slotCheck.error! };
+        }
+        const newEndTime = slotCheck.endTime!;
+        const bufferAfter = Math.max(0, (svc as any).bufferMinutesAfter || 0);
+        const blockEnd = bufferAfter > 0 ? addMinutes(newEndTime, bufferAfter) : newEndTime;
+
+        // Transactional overlap check (excluding the appointment being moved).
+        const rescheduleTxn = db.sqlite.transaction(() => {
+          const others = db.appointments.filter(
+            a => a.businessId === tenantId && a.date === newDate && a.status !== 'CANCELLED' && a.id !== app.id
+          );
+          for (const a of others) {
+            if (intervalsOverlap(newTime, blockEnd, a.startTime, a.endTime)) {
+              return { ok: false as const, error: `The time ${newTime}-${newEndTime} on ${newDate} overlaps an existing appointment (${a.startTime}-${a.endTime}).` };
+            }
+          }
+          app.date = newDate;
+          app.startTime = newTime;
+          app.endTime = newEndTime;
+          app.status = 'RESCHEDULED';
+          db.appointments.update(app);
+          db.auditLogs.push({
+            id: `log-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+            businessId: tenantId,
+            action: 'APPOINTMENT_RESCHEDULED',
+            details: `Appointment #${app.id} rescheduled to ${newDate} at ${newTime}.`,
+            timestamp: new Date().toISOString()
+          });
+          return { ok: true as const };
+        });
+        const r = rescheduleTxn();
+        if (isFail(r)) return { success: false, error: r.error };
 
         return {
           success: true,
@@ -500,6 +581,7 @@ export async function executeAgentTool(
             status: 'RESCHEDULED',
             newDate,
             newTime,
+            newEndTime,
             message: `Appointment #${app.id} successfully rescheduled to ${newDate} at ${newTime}.`
           }
         };
@@ -535,66 +617,104 @@ export async function executeAgentTool(
 
       case 'create_order': {
         const { customerName, customerPhone, items } = args;
-        const orderItems: Array<{ productId: string; productName: string; quantity: number; price: number }> = [];
-        let totalAmount = 0;
 
+        if (!customerName || !customerPhone || !Array.isArray(items) || items.length === 0) {
+          return { success: false, error: 'customerName, customerPhone and a non-empty items list are required.' };
+        }
+        // Validate item shape up front (before the transaction).
         for (const item of items) {
-          const product = db.products.find(p => p.businessId === tenantId && p.id === item.productId);
-          if (!product) {
-            return { success: false, error: `Product ID ${item.productId} not found.` };
+          if (!item?.productId || !Number.isInteger(item.quantity) || item.quantity <= 0) {
+            return { success: false, error: 'Each item needs a productId and a positive integer quantity.' };
           }
-          if (product.inventory < item.quantity) {
-            return { success: false, error: `Insufficient stock for ${product.name}. Available: ${product.inventory}, Requested: ${item.quantity}` };
-          }
-
-          product.inventory -= item.quantity; // Deduct inventory safely
-          db.products.update(product);
-          const itemTotal = product.price * item.quantity;
-          totalAmount += itemTotal;
-          orderItems.push({
-            productId: product.id,
-            productName: product.name,
-            quantity: item.quantity,
-            price: product.price
-          });
         }
 
-        // Customer lookup
-        let customer = db.customers.find(c => c.businessId === tenantId && c.phone === customerPhone);
-        if (!customer) {
-          customer = {
-            id: `cust-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        const orderId = `ord-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+        const nowIso = new Date().toISOString();
+
+        // The transaction THROWS on any failure so better-sqlite3 rolls back
+        // EVERY mutation made inside it (inventory decrements, customer create,
+        // order insert). Returning a failure value does NOT roll back — only a
+        // thrown exception triggers ROLLBACK. This guarantees a failed multi-
+        // item order leaves inventory completely unchanged (no partial deduction).
+        class OrderTxnError extends Error {
+          constructor(public error: string) { super(error); this.name = 'OrderTxnError'; }
+        }
+
+        const runOrderTxn = db.sqlite.transaction((): { order: any; totalAmount: number; orderItems: any[] } => {
+          const orderItems: Array<{ productId: string; productName: string; quantity: number; price: number }> = [];
+          let totalAmount = 0;
+
+          // Re-read each product inside the transaction and verify stock.
+          // better-sqlite3 is synchronous so the transaction serializes these
+          // writes — check + decrement are atomic, preventing two concurrent
+          // orders from overselling the same stock.
+          for (const item of items) {
+            const product = db.products.find(p => p.businessId === tenantId && p.id === item.productId);
+            if (!product) {
+              throw new OrderTxnError(`Product ID ${item.productId} not found.`);
+            }
+            if (product.inventory < item.quantity) {
+              throw new OrderTxnError(`Insufficient stock for ${product.name}. Available: ${product.inventory}, Requested: ${item.quantity}`);
+            }
+            product.inventory -= item.quantity;
+            // Guard against negative inventory even if the check above raced.
+            if (product.inventory < 0) {
+              throw new OrderTxnError(`Insufficient stock for ${product.name}.`);
+            }
+            db.products.update(product);
+
+            const itemTotal = product.price * item.quantity;
+            totalAmount += itemTotal;
+            orderItems.push({
+              productId: product.id,
+              productName: product.name,
+              quantity: item.quantity,
+              price: product.price
+            });
+          }
+
+          // Customer lookup/create inside the transaction.
+          let customer = db.customers.find(c => c.businessId === tenantId && c.phone === customerPhone);
+          if (!customer) {
+            customer = { id: `cust-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`, businessId: tenantId, name: customerName, phone: customerPhone, createdAt: nowIso };
+            db.customers.push(customer);
+          }
+
+          const newOrder = {
+            id: orderId,
             businessId: tenantId,
-            name: customerName,
-            phone: customerPhone,
-            createdAt: new Date().toISOString()
+            customerId: customer.id,
+            customerName,
+            items: orderItems,
+            totalAmount,
+            status: 'PENDING' as const,
+            createdAt: nowIso
           };
-          db.customers.push(customer);
+          db.orders.push(newOrder);
+
+          return { order: newOrder, totalAmount, orderItems };
+        });
+
+        let result: { order: any; totalAmount: number; orderItems: any[] };
+        try {
+          result = runOrderTxn();
+        } catch (e) {
+          if (e instanceof OrderTxnError) {
+            return { success: false, error: e.error };
+          }
+          throw e; // unexpected — let the runtime's error handling deal with it
         }
-
-        const newOrder = {
-          id: `ord-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          businessId: tenantId,
-          customerId: customer.id,
-          customerName,
-          items: orderItems,
-          totalAmount,
-          status: 'PENDING' as const,
-          createdAt: new Date().toISOString()
-        };
-
-        db.orders.push(newOrder);
 
         return {
           success: true,
           data: {
-            orderId: newOrder.id,
+            orderId: result.order.id,
             status: 'PENDING',
             customerName,
-            totalAmount,
+            totalAmount: result.totalAmount,
             currency: business.currency,
-            items: orderItems,
-            message: `Order #${newOrder.id} created successfully! Total: ${totalAmount} ${business.currency}.`
+            items: result.orderItems,
+            message: `Order #${result.order.id} created successfully! Total: ${result.totalAmount} ${business.currency}.`
           }
         };
       }
@@ -627,7 +747,7 @@ export async function executeAgentTool(
       case 'notify_business_owner': {
         const { reason, customerDetails } = args;
         db.auditLogs.push({
-          id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          id: `log-${Date.now()}`,
           businessId: tenantId,
           action: 'OWNER_NOTIFIED',
           details: `Urgent notification: ${reason} (Customer: ${customerDetails || 'N/A'})`,
@@ -646,12 +766,14 @@ export async function executeAgentTool(
           const conv = db.conversations.find(c => c.id === conversationId);
           if (conv) {
             conv.status = 'WAITING_FOR_HUMAN';
+            conv.handoffReason = reason || 'Customer requested human assistance.';
+            conv.handoffRequestedAt = new Date().toISOString();
             db.conversations.update(conv);
           }
         }
 
         db.auditLogs.push({
-          id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          id: `log-${Date.now()}`,
           businessId: tenantId,
           action: 'HUMAN_HANDOFF_TRIGGERED',
           details: `Conversation transferred to human agent. Reason: ${reason}`,

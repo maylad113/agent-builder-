@@ -155,7 +155,7 @@ CREATE TABLE IF NOT EXISTS integrations (
   id                TEXT PRIMARY KEY,
   business_id       TEXT NOT NULL REFERENCES businesses(id),
   provider          TEXT NOT NULL,
-  connected         INTEGER NOT NULL DEFAULT 0,          -- 0/1 boolean
+  connected         INTEGER NOT NULL DEFAULT 0,          -- 0/1 boolean (legacy; replaced by `state` in migration 006)
   status_message    TEXT NOT NULL DEFAULT '',
   credentials_set   INTEGER NOT NULL DEFAULT 0,          -- 0/1 boolean
   last_sync         TEXT,

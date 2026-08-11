@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.cjs.map
+
+# Environment / secrets — never commit real credentials
+.env
+.env.*
+!.env.example
+
+# Local databases / runtime data
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
+data/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+ai-agent-builder.zip

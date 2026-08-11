@@ -1,6 +1,7 @@
 import { GoogleGenAI, GenerateContentParameters, Part } from '@google/genai';
 import { db } from './db';
 import { agentToolDeclarations, executeAgentTool } from './tools';
+import { retrieveRelevant } from './embeddings';
 import { ChannelType, ToolCallRecord } from '../types';
 
 let aiClient: GoogleGenAI | null = null;
@@ -30,6 +31,8 @@ export interface RuntimeDebugInfo {
   latencyMs: number;
   tokensUsed: number;
   model: string;
+  /** Correlation id for this runtime execution (logged server-side for support). */
+  executionId: string;
   /** Present when the LLM call itself failed (internal callers only). */
   error?: string;
 }
@@ -55,52 +58,23 @@ export interface RuntimeExecutionResult {
 export const AGENT_UNAVAILABLE_REPLY =
   "This business's assistant is not available right now. Please try again later.";
 
-// Retrieve relevant business knowledge for context window grounding
-function retrieveKnowledgeChunks(businessId: string, query: string): string[] {
-  const chunks = db.knowledgeChunks.filter(k => k.businessId === businessId);
-  const qLower = query.toLowerCase();
-
-  const matched = chunks.filter(c => {
-    const titleMatch = c.title.toLowerCase().includes(qLower);
-    const tagMatch = c.tags.some(t => qLower.includes(t.toLowerCase()));
-    const contentMatch = c.content.toLowerCase().split(' ').some(word => word.length > 3 && qLower.includes(word));
-    return titleMatch || tagMatch || contentMatch;
-  });
-
-  // If no specific match, return top 3 chunks as general business context
-  const selected = matched.length > 0 ? matched : chunks.slice(0, 3);
-  return selected.map(s => `[${s.type.toUpperCase()}] ${s.title}: ${s.content}`);
+// Retrieve relevant business knowledge for context window grounding.
+// Semantic (cosine over Gemini embeddings) with a tenant-scoped keyword
+// fallback when embeddings are unavailable (no API key / nothing indexed).
+async function retrieveKnowledgeChunks(businessId: string, query: string): Promise<string[]> {
+  const results = await retrieveRelevant(businessId, query, 4);
+  return results.map(r => `[${r.chunk.type.toUpperCase()}] ${r.chunk.title}: ${r.chunk.content}`);
 }
 
-export async function processAgentMessage(params: {
-  tenantId: string;
-  userMessage: string;
-  conversationId?: string;
-  channel?: ChannelType;
-  customerName?: string;
-  customerPhone?: string;
-  /**
-   * Internal (simulator) use: run a SPECIFIC agent regardless of status.
-   * Routes must verify the caller is authenticated AND scoped to the agent's
-   * tenant before passing this — the runtime trusts no one.
-   */
-  agentId?: string;
-  /** Include internal debug (system prompt / knowledge / tool results) in the result. */
-  includeDebug?: boolean;
-}): Promise<RuntimeExecutionResult> {
-  const startTime = Date.now();
-  const { tenantId, userMessage, channel = 'web_chat' } = params;
-
-  // 1. Resolve Tenant & Business Information
-  const business = db.businesses.find(b => b.id === tenantId);
-  if (!business) {
-    throw new Error(`Business not found for ID: ${tenantId}`);
-  }
-
-  // 2. Resolve or Create Conversation (before agent selection so the
-  //    "assistant unavailable" path can still record the exchange honestly)
+/**
+ * Resolve or create a conversation for the incoming message. TENANT-SCOPED: a
+ * customer can never load another tenant's conversation by supplying its id —
+ * the lookup requires both id AND businessId == tenantId.
+ */
+function ensureConversation(params: { tenantId: string; conversationId?: string; customerName?: string; customerPhone?: string; }, business: { id: string; name: string; }, channel: ChannelType): import('../types').Conversation {
+  const tenantId = params.tenantId;
   let conversation = params.conversationId
-    ? db.conversations.find(c => c.id === params.conversationId)
+    ? db.conversations.find(c => c.id === params.conversationId && c.businessId === tenantId)
     : null;
 
   if (!conversation) {
@@ -132,6 +106,173 @@ export async function processAgentMessage(params: {
     };
     db.conversations.push(conversation);
   }
+  return conversation;
+}
+
+export async function processAgentMessage(params: {
+  tenantId: string;
+  userMessage: string;
+  conversationId?: string;
+  channel?: ChannelType;
+  customerName?: string;
+  customerPhone?: string;
+  /** When set (simulator only), run against a specific DRAFT/TESTING version
+   * instead of the live PUBLISHED config. Production calls never set this. */
+  versionId?: string;
+  /** When true (simulator), allow DRAFT/TESTING versions. When false
+   * (production default), the runtime MUST use the PUBLISHED version only and
+   * refuses to run against a non-published agent. */
+  simulator?: boolean;
+  /** Internal (simulator) use: run a SPECIFIC agent regardless of status.
+   * Routes must verify the caller is authenticated AND scoped to the agent's
+   * tenant before passing this — the runtime trusts no one. */
+  agentId?: string;
+  /** Include internal debug (system prompt / knowledge / tool results) in the result. */
+  includeDebug?: boolean;
+}): Promise<RuntimeExecutionResult> {
+  const startTime = Date.now();
+  const executionId = `exec-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
+  const { tenantId, userMessage, channel = 'web_chat' } = params;
+  // The simulator may target a specific agent (agentId) or a specific draft
+  // version (versionId); the public widget targets the business's ACTIVE agent.
+  const simulator = params.simulator || !!params.agentId;
+
+  // 1. Resolve Tenant & Business Information
+  const business = db.businesses.find(b => b.id === tenantId);
+  if (!business) {
+    throw new Error(`Business not found for ID: ${tenantId}`);
+  }
+
+  // 2. Resolve the agent.
+  //  - Simulator (agentId): run that SPECIFIC agent regardless of status.
+  //  - Public: ONLY the business's ACTIVE agent may serve customers. A
+  //    DRAFT/READY/TESTING/PAUSED/ARCHIVED agent must never answer the widget.
+  const agent = params.agentId
+    ? db.agents.find(a => a.id === params.agentId && a.businessId === tenantId)
+    : db.agents.find(a => a.businessId === tenantId && a.status === 'ACTIVE');
+
+  if (!agent) {
+    if (params.agentId) {
+      throw new Error(`Agent not found for business: ${tenantId}`);
+    }
+    // Honest unavailable result — never a fake answer. 200 + agentAvailable:false
+    // so the widget can render it as an error state.
+    const conv = ensureConversation(params, business, channel);
+    conv.lastMessageAt = new Date().toISOString();
+    conv.summary = `Last exchange: "${userMessage.substring(0, 30)}..." -> assistant unavailable`;
+    db.conversations.update(conv);
+
+    db.messages.push({
+      id: `msg-${Date.now()}-agent`,
+      conversationId: conv.id,
+      sender: 'agent',
+      content: AGENT_UNAVAILABLE_REPLY,
+      channel,
+      timestamp: new Date().toISOString()
+    });
+
+    return {
+      reply: AGENT_UNAVAILABLE_REPLY,
+      conversationId: conv.id,
+      status: 'WAITING_FOR_HUMAN',
+      agentAvailable: false,
+      debug: null
+    };
+  }
+
+  // Production conversations require an ACTIVE agent. A PAUSED or ARCHIVED
+  // agent must not serve real customers — escalate to a human instead. The
+  // simulator bypasses this so owners can test non-active agents.
+  if (!simulator && agent.status !== 'ACTIVE') {
+    const conv = ensureConversation(params, business, channel);
+    return {
+      reply: AGENT_UNAVAILABLE_REPLY,
+      conversationId: conv.id,
+      status: 'WAITING_FOR_HUMAN',
+      agentAvailable: false,
+      debug: null
+    };
+  }
+
+  // Resolve the effective config.
+  //  - Simulator (versionId set): use that DRAFT/TESTING version's snapshot.
+  //  - Simulator (no versionId): use the PUBLISHED version (or agent row as a
+  //    last resort — the simulator is a trusted owner tool).
+  //  - Production: use the PUBLISHED version only. If none is published yet, the
+  //    agent is not live; the runtime refuses and escalates to a human rather
+  //    than serving an un-published config to a real customer.
+  let effectiveSystemPrompt = agent.systemPrompt;
+  let effectiveConfig = agent.structuredConfig;
+  let effectiveModel = agent.model;
+  if (params.versionId) {
+    const { getVersionForSim } = await import('./agentVersions');
+    const resolved = getVersionForSim(agent.id, params.versionId);
+    effectiveSystemPrompt = resolved.systemPrompt;
+    effectiveConfig = resolved.structuredConfig;
+    effectiveModel = resolved.model;
+  } else if (!simulator) {
+    // PRODUCTION path: published version only.
+    const { getPublishedVersion } = await import('./agentVersions');
+    const pub = getPublishedVersion(agent.id);
+    if (!pub) {
+      // No published version — refuse to serve customers. Return a graceful
+      // human-escalation rather than the raw agent row (which may be a draft).
+      const conv = ensureConversation(params, business, channel);
+      return {
+        reply: "I'm having trouble connecting to the assistant service right now. I've notified the team and someone will follow up with you shortly.",
+        conversationId: conv.id,
+        status: 'WAITING_FOR_HUMAN',
+        agentAvailable: false,
+        debug: null
+      };
+    }
+    effectiveSystemPrompt = pub.systemPrompt;
+    effectiveConfig = pub.structuredConfig;
+    effectiveModel = pub.model;
+  }
+
+  // 3. Resolve or Create Conversation (TENANT-SCOPED: a customer can never
+  //    load another tenant's conversation by supplying its id — the lookup
+  //    requires both id AND businessId == tenantId.)
+  const conversation = ensureConversation(params, business, channel);
+
+  // HUMAN HANDOFF GUARD: when a human team member has taken over (HUMAN_HANDLING)
+  // or the conversation is resolved, the AI must NOT autonomously answer. The
+  // customer's message is still stored (so the human sees it), but the runtime
+  // returns a holding reply and never calls the model or any tool.
+  if (conversation.status === 'HUMAN_HANDLING') {
+    const holdingReply =
+      'A team member is currently handling our conversation and will reply to you shortly. Thank you for your patience.';
+    db.messages.push({
+      id: `msg-${Date.now()}-agent`,
+      conversationId: conversation.id,
+      sender: 'system',
+      content: holdingReply,
+      channel,
+      timestamp: new Date().toISOString()
+    });
+    conversation.lastMessageAt = new Date().toISOString();
+    db.conversations.update(conversation);
+    return {
+      reply: holdingReply,
+      conversationId: conversation.id,
+      status: conversation.status,
+      agentAvailable: true,
+      debug: null
+    };
+  }
+
+  if (conversation.status === 'RESOLVED') {
+    const holdingReply =
+      'This conversation has been marked as resolved. If you need further help, please start a new conversation or ask a team member to reopen this one.';
+    return {
+      reply: holdingReply,
+      conversationId: conversation.id,
+      status: conversation.status,
+      agentAvailable: true,
+      debug: null
+    };
+  }
 
   // Save incoming customer message
   db.messages.push({
@@ -143,48 +284,12 @@ export async function processAgentMessage(params: {
     timestamp: new Date().toISOString()
   });
 
-  // 3. Load Agent — PUBLIC path: ONLY an ACTIVE agent may serve customers.
-  //    No fallback to any agent: a DRAFT/READY/TESTING/PAUSED agent must
-  //    never answer the public widget. The simulator passes `agentId` to run
-  //    a specific (possibly not-yet-ACTIVE) agent after route-level checks.
-  const agent = params.agentId
-    ? db.agents.find(a => a.id === params.agentId && a.businessId === tenantId)
-    : db.agents.find(a => a.businessId === tenantId && a.status === 'ACTIVE');
-
-  if (!agent) {
-    if (params.agentId) {
-      throw new Error(`Agent not found for business: ${tenantId}`);
-    }
-    // Honest unavailable result — never a fake answer. 200 + agentAvailable:false
-    // so the widget can render it as an error state.
-    conversation.lastMessageAt = new Date().toISOString();
-    conversation.summary = `Last exchange: "${userMessage.substring(0, 30)}..." -> assistant unavailable`;
-    db.conversations.update(conversation);
-
-    db.messages.push({
-      id: `msg-${Date.now()}-agent`,
-      conversationId: conversation.id,
-      sender: 'agent',
-      content: AGENT_UNAVAILABLE_REPLY,
-      channel,
-      timestamp: new Date().toISOString()
-    });
-
-    return {
-      reply: AGENT_UNAVAILABLE_REPLY,
-      conversationId: conversation.id,
-      status: conversation.status,
-      agentAvailable: false,
-      debug: null
-    };
-  }
-
   // 4. Retrieve RAG Knowledge Chunks
-  const retrievedKnowledge = retrieveKnowledgeChunks(tenantId, userMessage);
+  const retrievedKnowledge = await retrieveKnowledgeChunks(tenantId, userMessage);
 
   // 5. Build Grounded System Prompt
-  const structured = agent.structuredConfig;
-  const fullSystemPrompt = `${agent.systemPrompt}
+  const structured = effectiveConfig;
+  const fullSystemPrompt = `${effectiveSystemPrompt}
 
 BUSINESS CONTEXT & FACTS:
 - Business Name: ${business.name}
@@ -231,12 +336,19 @@ CRITICAL MANDATES:
   let finalReply = '';
   let runtimeError: string | undefined;
 
+  // Real token usage from the provider's usageMetadata, accumulated across
+  // the tool loop (Phase 19). Hoisted outside try so the catch block and the
+  // usage recording block can read them.
+  let providerInputTokens = 0;
+  let providerOutputTokens = 0;
+  const providerModel = effectiveModel || 'gemini-3.6-flash';
+
   try {
     const ai = getGeminiClient();
 
     // Call Gemini Model
     const reqParameters: GenerateContentParameters = {
-      model: agent.model || 'gemini-3.6-flash',
+      model: providerModel,
       contents: contents as any,
       config: {
         systemInstruction: fullSystemPrompt,
@@ -246,6 +358,18 @@ CRITICAL MANDATES:
     };
 
     let response = await ai.models.generateContent(reqParameters);
+
+    const accumulateUsage = (r: typeof response) => {
+      const um = r?.usageMetadata;
+      if (um) {
+        // promptTokenCount accumulates full context on each turn; we take the
+        // final turn's prompt count plus the sum of generated candidate tokens
+        // across all turns to approximate total input/output usage.
+        providerInputTokens = um.promptTokenCount ?? providerInputTokens;
+        providerOutputTokens += um.candidatesTokenCount ?? 0;
+      }
+    };
+    accumulateUsage(response);
 
     // Handle Tool Execution Loop (up to 3 iterations for multi-step tool calls)
     let maxToolLoops = 3;
@@ -260,13 +384,17 @@ CRITICAL MANDATES:
         const args = (call.args as Record<string, any>) || {};
 
         // Execute Tool safely on backend with tenant isolation + hard
-        // enablement enforcement (toolsEnabled is passed so executeAgentTool
-        // refuses tools the agent does not have enabled).
+        // enablement enforcement. BOTH the agent's toolsEnabled set (the
+        // declarations offered to the model) and the derived allowedToolNames
+        // (defense-in-depth: even if the LLM hallucinates a tool name that was
+        // never declared, the backend refuses it) are passed so the tool layer
+        // independently verifies enablement.
         const result = await executeAgentTool(toolName, args, {
           tenantId,
           conversationId: conversation.id,
           channel,
-          toolsEnabled: structured.toolsEnabled
+          toolsEnabled: structured.toolsEnabled,
+          allowedToolNames: activeTools.map(t => t.name)
         });
 
         const rec: ToolCallRecord = {
@@ -298,18 +426,21 @@ CRITICAL MANDATES:
 
       // Call Gemini again with function results
       response = await ai.models.generateContent({
-        model: agent.model || 'gemini-3.6-flash',
+        model: providerModel,
         contents: contents as any,
         config: {
           systemInstruction: fullSystemPrompt,
           tools: activeTools.length > 0 ? [{ functionDeclarations: activeTools }] : undefined
         }
       });
+      accumulateUsage(response);
     }
 
     finalReply = response.text || "I'm sorry, I couldn't process that request properly. How else may I assist you?";
   } catch (err: any) {
-    console.error('Gemini Agent Runtime Error:', err);
+    // Log the real error internally with the execution id for support; never
+    // expose the provider's error message/stack to the customer.
+    console.error(`[runtime] ${executionId} Gemini error:`, err?.message || err);
     runtimeError = err?.message || 'AI Provider Error';
     // Honest fallback: report the outage, never claim any action succeeded.
     // Internal error details stay server-side (and in debug for internal callers).
@@ -318,7 +449,13 @@ CRITICAL MANDATES:
   }
 
   const latencyMs = Date.now() - startTime;
-  const tokensEstimate = Math.ceil((fullSystemPrompt.length + userMessage.length + finalReply.length) / 4);
+  // Prefer real provider usage metadata; fall back to a length-based estimate
+  // only when the provider omits usage (e.g. error path / no API key).
+  const realTokens = providerInputTokens + providerOutputTokens;
+  const usedInputTokens = providerInputTokens > 0 ? providerInputTokens : 0;
+  const usedOutputTokens = providerOutputTokens > 0 ? providerOutputTokens : 0;
+  const tokensUsed = realTokens > 0 ? realTokens : Math.ceil((fullSystemPrompt.length + userMessage.length + finalReply.length) / 4);
+  const usedModel = providerModel;
 
   // Update conversation record
   conversation.lastMessageAt = new Date().toISOString();
@@ -336,7 +473,9 @@ CRITICAL MANDATES:
     timestamp: new Date().toISOString()
   });
 
-  // Track Usage
+  // Track Usage (Phase 19): real provider token counts when available.
+  // Aggregate per business per day; agent/model/provider recorded for later
+  // per-conversation breakdown.
   const todayStr = new Date().toISOString().split('T')[0];
   let usage = db.usageRecords.find(u => u.businessId === tenantId && u.date === todayStr);
   if (!usage) {
@@ -348,13 +487,25 @@ CRITICAL MANDATES:
       estimatedCostUsd: 0,
       requestsCount: 0,
       voiceMinutes: 0,
-      smsCount: 0
+      smsCount: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      provider: 'google'
     };
     db.usageRecords.push(usage);
   }
-  usage.tokensUsed += tokensEstimate;
-  usage.estimatedCostUsd += (tokensEstimate / 1000) * 0.0001; // $0.0001 per 1k tokens estimate
+  usage.tokensUsed += tokensUsed;
+  usage.inputTokens = (usage.inputTokens ?? 0) + usedInputTokens;
+  usage.outputTokens = (usage.outputTokens ?? 0) + usedOutputTokens;
+  // Cost estimate from real input/output token counts when available;
+  // otherwise from the total estimate. Rates are illustrative placeholders
+  // for the future billing tier (no charges are ever executed).
+  const pricedInput = usedInputTokens;
+  const pricedOutput = usedOutputTokens;
+  usage.estimatedCostUsd += ((pricedInput * 0.0000001) + (pricedOutput * 0.0000004))
+    || (tokensUsed / 1000) * 0.0001;
   usage.requestsCount += 1;
+  if (!usage.model) usage.model = usedModel;
   db.usageRecords.update(usage);
 
   const debug: RuntimeDebugInfo | null = params.includeDebug
@@ -363,8 +514,9 @@ CRITICAL MANDATES:
         retrievedKnowledge,
         toolCalls: toolCallRecords,
         latencyMs,
-        tokensUsed: tokensEstimate,
+        tokensUsed,
         model: agent.model || 'gemini-3.6-flash',
+        executionId,
         ...(runtimeError ? { error: runtimeError } : {})
       }
     : null;
@@ -420,12 +572,27 @@ BUSINESS FACTS PROVIDED:
 - Services: ${businessInput.services || 'NOT PROVIDED'}
 - FAQs: ${businessInput.faqs || 'NOT PROVIDED'}
 
-CRITICAL RULES:
-1. NEVER invent prices, operating hours, addresses, policies, services, or any business fact. If a fact was not provided, do NOT fabricate it.
-2. For every business fact that is missing (e.g. exact prices, operating hours, policies, address), add an entry to the "needsInput" array with a short "field" name and a human-readable "label".
-3. Only fill suggestedServices / suggestedFaqs with information the owner actually provided. If not provided, leave them empty arrays.
-4. You MAY propose: agent name, personality (tone/behavior/language), goals, allowedActions (tool names), restrictedActions, escalationRules, and a systemPrompt written in generic, safe language.
-5. The systemPrompt must instruct the agent to never invent facts, to use tools for hours/prices/availability, and to tell the customer the truth when a tool reports failure (never claim a booking or action succeeded unless the backend confirmed it).
+CRITICAL RULES — violate these and the configuration is useless:
+1. NEVER invent business facts. If a price, duration, hour, policy, or service
+   name was NOT provided in the input above, you MUST output the literal string
+   "NEEDS_INPUT" for that field. Do NOT guess, round, or estimate.
+2. You MAY suggest STRUCTURE (e.g. "Would appointment booking help?") and ask
+   clarifying questions, but the values for services/prices/hours must come
+   ONLY from the input or be "NEEDS_INPUT".
+3. System prompt and personality may be generated, but must instruct the agent
+   to never state prices/hours/services that the business has not configured.
+4. For every business fact that is missing (e.g. exact prices, operating hours,
+   policies, address), add an entry to the "needsInput" array with a short
+   "field" name and a human-readable "label".
+5. Only fill suggestedServices / suggestedFaqs with information the owner
+   actually provided. If not provided, leave them empty arrays.
+6. You MAY propose: agent name, personality (tone/behavior/language), goals,
+   allowedActions (tool names), restrictedActions, escalationRules, and a
+   systemPrompt written in generic, safe language.
+7. The systemPrompt must instruct the agent to never invent facts, to use tools
+   for hours/prices/availability, and to tell the customer the truth when a
+   tool reports failure (never claim a booking or action succeeded unless the
+   backend confirmed it).
 
 Return ONLY a JSON object (no markdown, no prose, no code fences) with exactly this shape:
 {
@@ -434,7 +601,7 @@ Return ONLY a JSON object (no markdown, no prose, no code fences) with exactly t
   "personality": { "tone": "friendly", "behavior": "service", "language": "en" },
   "goals": ["Goal 1", "Goal 2", "Goal 3"],
   "allowedActions": ["check_business_hours", "get_business_information", "check_availability", "book_appointment", "search_knowledge", "transfer_to_human"],
-  "restrictedActions": ["Never invent prices, hours, addresses, or policies"],
+  "restrictedActions": ["Never invent prices, hours, addresses, or policies", "Never claim a booking or action succeeded unless a tool confirmed it"],
   "escalationRules": ["When customer requests a human", "When asked for facts not provided"],
   "suggestedFaqs": [],
   "suggestedServices": [],
@@ -450,17 +617,10 @@ Return ONLY a JSON object (no markdown, no prose, no code fences) with exactly t
     });
 
     if (res.text) {
+      // Robust parsing: tolerate markdown code fences and stray prose, then
+      // sanitize so the proposal can never carry fabricated business facts.
       const parsed = parseJsonFromModel(res.text);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        // Merge: computed NEEDS_INPUT (from what the route received) wins if
-        // the model did not report its own, otherwise keep the model's.
-        const modelNeedsInput = Array.isArray(parsed.needsInput) ? parsed.needsInput : [];
-        return {
-          ...parsed,
-          needsInput: modelNeedsInput.length > 0 ? modelNeedsInput : needsInput
-        };
-      }
-      throw new Error('Model did not return a JSON object');
+      return sanitizeGeneratedConfig(parsed, businessInput);
     }
   } catch (err: any) {
     console.error('Auto Agent Gen Error:', err);
@@ -518,6 +678,33 @@ CRITICAL MANDATES:
     suggestedServices: [],
     needsInput
   };
+}
+
+/**
+ * Defense-in-depth: even if the model invents values, strip any service that
+ * carries a fabricated price/duration when the input didn't supply services.
+ * Anything that looks placeholder is converted to NEEDS_INPUT.
+ */
+function sanitizeGeneratedConfig(parsed: any, input: { name: string; type: string; description: string; hours?: string; services?: string; faqs?: string }): any {
+  const servicesProvided = !!(input.services && input.services.trim());
+  if (Array.isArray(parsed.suggestedServices)) {
+    parsed.suggestedServices = parsed.suggestedServices.map((s: any) => {
+      const name = s && typeof s.name === 'string' ? s.name : 'NEEDS_INPUT';
+      const price = (servicesProvided && typeof s.price === 'number') ? s.price : 'NEEDS_INPUT';
+      const duration = (servicesProvided && typeof s.durationMinutes === 'number') ? s.durationMinutes : 'NEEDS_INPUT';
+      return { name, price, durationMinutes: duration, description: s?.description ?? 'NEEDS_INPUT' };
+    });
+  }
+  if (!input.hours) {
+    // Ensure the system prompt does not assert hours the business hasn't given.
+    if (typeof parsed.systemPrompt === 'string' && !/NEEDS_INPUT|not.*configured|do not.*hour/i.test(parsed.systemPrompt)) {
+      parsed.systemPrompt += ' Never state operating hours unless they have been configured by the business owner.';
+    }
+  }
+  parsed.needsInput = Array.isArray(parsed.needsInput) ? parsed.needsInput : [];
+  if (!input.hours && !parsed.needsInput.includes('operating hours')) parsed.needsInput.push('operating hours');
+  if (!servicesProvided && !parsed.needsInput.includes('service list and prices')) parsed.needsInput.push('service list and prices');
+  return parsed;
 }
 
 /**
