@@ -11,7 +11,8 @@ import { indexChunk, removeEmbedding } from './embeddings';
 import { assertActivatable, readinessSnapshot } from './readiness';
 import { rateLimit, RATE_LIMITS } from './security';
 import {
-  getProvider, runValidation, storeCredentials, getCredentials, clearCredentials
+  getProvider, runValidation, storeCredentials, getCredentials, clearCredentials,
+  sanitizeIntegrationForClient
 } from './integrations';
 import { widgetCorsHeaders } from './widgetSecurity';
 import { Business, Agent, KnowledgeChunk, Product, Appointment, Order, User, Conversation, AgentVersion } from '../types';
@@ -1191,7 +1192,7 @@ router.get('/integrations', requireAuth, requireTenantScope, (req: Request, res:
   const businessId = res.locals.businessId as string | null;
   const items = businessId ? db.integrations.filter(i => i.businessId === businessId) : db.integrations.toJSON();
   // Never leak credentials. configData holds only non-secret config.
-  res.json(items.map(({ ...i }) => i));
+  res.json(items.map(sanitizeIntegrationForClient));
 });
 
 /**
@@ -1214,7 +1215,7 @@ router.put(
     }
     integ.updatedAt = new Date().toISOString();
     db.integrations.update(integ);
-    res.json(integ);
+    res.json(sanitizeIntegrationForClient(integ));
   }
 );
 
