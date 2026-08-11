@@ -204,7 +204,8 @@ router.post('/businesses', requireAuth, requireRole('PLATFORM_OWNER'), (req: Req
       id: s.id || `srv-${Date.now()}-${idx}`,
       name: s.name,
       price: Number(s.price) || 0,
-      durationMinutes: Number(s.durationMinutes) || 30,
+      // Accept both durationMinutes (canonical) and duration (common shorthand)
+      durationMinutes: Number(s.durationMinutes ?? s.duration) || 30,
       description: s.description || ''
     })),
     faqs: faqs.map((f: any, idx: number) => ({
