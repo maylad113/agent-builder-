@@ -169,11 +169,15 @@ router.post('/businesses', requireAuth, requireRole('PLATFORM_OWNER'), (req: Req
     services = [],
     faqs = [],
     policies,
-    communicationStyle
+    communicationStyle,
+    allowedWidgetOrigins = []
   } = req.body;
 
   if (!name || !type) {
     return res.status(400).json({ error: 'Business name and type are required.' });
+  }
+  if (typeof name !== 'string' || name.length > 200) {
+    return res.status(400).json({ error: 'Business name must be 1-200 characters.' });
   }
 
   const defaultHours = [
@@ -215,6 +219,8 @@ router.post('/businesses', requireAuth, requireRole('PLATFORM_OWNER'), (req: Req
     },
     communicationStyle: communicationStyle || 'Friendly, courteous, and efficient.',
     status: 'ACTIVE',
+    allowedWidgetOrigins: Array.isArray(allowedWidgetOrigins) ? allowedWidgetOrigins : [],
+    holidays: [],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
   };
@@ -592,9 +598,14 @@ router.post(
   requireAuth,
   requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
   (req: Request, res: Response) => {
-    // Create a new draft from an existing version (defaults to published).
+    // Create a new draft from an existing version. Defaults to the published
+    // version; if none is published yet (e.g. a brand-new agent that only has
+    // its initial draft), fall back to the latest version of any status so the
+    // user can still iterate before the first publish.
     const { fromVersionId, changeNote } = req.body;
-    const sourceId = fromVersionId || getPublishedVersion(req.params.id)?.id;
+    const sourceId = fromVersionId
+      || getPublishedVersion(req.params.id)?.id
+      || listVersions(req.params.id)[0]?.id;
     if (!sourceId) return res.status(400).json({ error: 'No source version to draft from.' });
     try {
       const draft = createDraftFrom(sourceId, changeNote);
@@ -1008,6 +1019,16 @@ router.get('/conversations', requireAuth, requireTenantScope, (req: Request, res
   res.json(paginate(convs, req, res));
 });
 
+// Get a single conversation by id (tenant-scoped via requireResourceAccess).
+router.get(
+  '/conversations/:id',
+  requireAuth,
+  requireResourceAccess(req => db.conversations.find(c => c.id === req.params.id)),
+  (req: Request, res: Response) => {
+    res.json(res.locals.resource);
+  }
+);
+
 router.get(
   '/conversations/:id/messages',
   requireAuth,
@@ -1330,4 +1351,12 @@ router.get('/audit-logs', requireAuth, (req: Request, res: Response) => {
     : db.auditLogs.filter(l => l.businessId === user.businessId)
   ).reverse();
   res.json(paginate(logs, req, res));
+});
+
+// 404 catch-all for unmatched /api/* routes. Without this, unmatched API paths
+// fall through to the SPA catch-all in server.ts and return index.html, which
+// breaks API clients that expect JSON. This runs inside the /api router, so it
+// only matches /api/* paths.
+router.use((req: Request, res: Response) => {
+  res.status(404).json({ error: 'Endpoint not found.' });
 });

@@ -152,3 +152,52 @@ describe('health endpoint reports DB connectivity', () => {
     expect(r.body.status).toBe('ok');
   });
 });
+
+describe('debug-found regressions', () => {
+  it('rejects an oversized business name (>200 chars)', async () => {
+    const r = await owner.post('/api/businesses').send({ name: 'A'.repeat(500), type: 'general' });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/name/i);
+  });
+
+  it('returns JSON 404 for unknown /api/* routes (not SPA HTML)', async () => {
+    const r = await owner.get('/api/this-endpoint-does-not-exist');
+    expect(r.status).toBe(404);
+    expect(r.body).toHaveProperty('error');
+    expect(typeof r.body.error).toBe('string');
+  });
+
+  it('accepts allowedWidgetOrigins on business create', async () => {
+    const r = await owner.post('/api/businesses').send({
+      name: 'Origin Test Biz', type: 'general',
+      allowedWidgetOrigins: ['https://my-site.example']
+    });
+    expect(r.status).toBe(201);
+    expect(r.body.allowedWidgetOrigins).toEqual(['https://my-site.example']);
+  });
+
+  it('can create a draft from an agent with no published version', async () => {
+    // New agent only has its initial DRAFT. createDraftFrom must fall back to
+    // the latest version instead of erroring "No source version".
+    const biz = await owner.post('/api/businesses').send({ name: 'Draft Fallbk', type: 'general' });
+    const agent = await owner.post('/api/agents').send({ businessId: biz.body.id, name: 'DF Agent' });
+    const r = await owner.post(`/api/agents/${agent.body.id}/versions`).send({});
+    expect(r.status).toBe(201);
+    expect(r.body.status).toBe('DRAFT');
+  });
+
+  it('duplicates a business with its knowledge (correct tenant on clone)', async () => {
+    const biz = await owner.post('/api/businesses').send({ name: 'Dup Knowledge Src', type: 'general' });
+    await owner.post('/api/knowledge').send({
+      businessId: biz.body.id, title: 'K1', type: 'faq', content: 'hello', tags: []
+    });
+    const dup = await owner.post(`/api/businesses/${biz.body.id}/duplicate`).send({ newName: 'Dup Knowledge Copy' });
+    expect(dup.status).toBe(201);
+    const newId = dup.body.newBusiness.id;
+    const knowledge = await owner.get(`/api/knowledge?businessId=${newId}`);
+    expect(knowledge.status).toBe(200);
+    expect(knowledge.body.length).toBeGreaterThanOrEqual(1);
+    // cloned knowledge must belong to the NEW tenant, not the source
+    expect(knowledge.body[0].businessId).toBe(newId);
+  });
+});
