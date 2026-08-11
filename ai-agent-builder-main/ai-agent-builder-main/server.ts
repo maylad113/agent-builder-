@@ -20,6 +20,12 @@ async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
+  // Trust the first proxy hop so req.protocol / req.ip respect X-Forwarded-*
+  // headers when running behind a reverse proxy (nginx, a load balancer, or a
+  // PaaS like Render/Heroku). This is required for correct Secure-cookie
+  // behavior and rate-limit client IPs in production.
+  app.set('trust proxy', 1);
+
   // The Meta webhook POST route needs the RAW request body (it hashes the exact
   // bytes for X-Hub-Signature-256), so it must run BEFORE any JSON/urlencoded
   // body parser consumes the stream. Mount the webhook router first; it installs

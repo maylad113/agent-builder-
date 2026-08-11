@@ -357,7 +357,17 @@ export class AppDatabase {
   public sessions: Collection<Session>;
 
   constructor(opts: AppDatabaseOptions = {}) {
-    this.dbPath = opts.dbPath || process.env.DB_PATH || path.join(process.cwd(), 'data', 'agentforge.db');
+    let dbPath = opts.dbPath || process.env.DB_PATH || path.join(process.cwd(), 'data', 'agentforge.db');
+    // If DB_PATH points at an existing directory, append a default filename
+    // so the server doesn't crash with SQLITE_CANTOPEN (common deployment mistake).
+    try {
+      if (fs.statSync(dbPath).isDirectory()) {
+        dbPath = path.join(dbPath, 'agentfactory.db');
+      }
+    } catch {
+      // path doesn't exist yet — that's fine, better-sqlite3 will create it
+    }
+    this.dbPath = dbPath;
     this.migrationsDir = opts.migrationsDir || process.env.MIGRATIONS_DIR || path.join(process.cwd(), 'migrations');
 
     fs.mkdirSync(path.dirname(this.dbPath), { recursive: true });

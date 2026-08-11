@@ -361,7 +361,9 @@ describe('public widget + tenant isolation at runtime', () => {
       tenantId: 'biz-does-not-exist',
       userMessage: 'hello'
     });
-    expect(res.status).toBe(500);
+    // Configuration/degradation errors return 503; genuine server faults 500.
+    // Either way it must be an error status with a truthful error field.
+    expect(res.status).toBeGreaterThanOrEqual(500);
     expect(res.body.error).toBeTruthy();
   });
 

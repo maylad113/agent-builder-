@@ -127,6 +127,27 @@ export async function processAgentMessage(params: {
     throw new Error(`No agent configured for business: ${business.name}`);
   }
 
+  // Production conversations require an ACTIVE agent. A PAUSED or ARCHIVED
+  // agent must not serve real customers — escalate to a human instead. The
+  // simulator bypasses this so owners can test non-active agents.
+  if (!simulator && agent.status !== 'ACTIVE') {
+    const conv = ensureConversation(params, business, channel);
+    return {
+      reply: "I'm having trouble connecting to the assistant service right now. I've notified the team and someone will follow up with you shortly.",
+      conversationId: conv.id,
+      status: 'WAITING_FOR_HUMAN',
+      debug: {
+        systemPrompt: '',
+        retrievedKnowledge: [],
+        toolCalls: [],
+        latencyMs: Date.now() - startTime,
+        tokensUsed: 0,
+        model: agent.model || 'none',
+        executionId
+      }
+    };
+  }
+
   // Resolve the effective config.
   //  - Simulator (versionId set): use that DRAFT/TESTING version's snapshot.
   //  - Simulator (no versionId): use the PUBLISHED version (or agent row as a

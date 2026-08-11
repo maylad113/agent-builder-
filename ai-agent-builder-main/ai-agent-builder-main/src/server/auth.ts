@@ -85,12 +85,18 @@ export function destroySession(sessionId: string): void {
   if (idx !== -1) db.sessions.splice(idx, 1);
 }
 
-export function setSessionCookie(res: Response, sessionId: string): void {
+export function setSessionCookie(req: Request, res: Response, sessionId: string): void {
   const value = `${sessionId}.${sign(sessionId)}`;
   res.cookie(SESSION_COOKIE, value, {
     httpOnly: true,
     sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production', // HTTPS-only in production
+    // Secure cookies require HTTPS. In production we default to secure=true,
+    // but honor the X-Forwarded-Proto header (set by nginx/load balancers doing
+    // TLS termination) so auth works behind a proxy. COOKIE_SECURE=0 is an
+    // explicit escape hatch for HTTP-only deployments/testing.
+    secure: process.env.COOKIE_SECURE === '0'
+      ? false
+      : (process.env.NODE_ENV === 'production' && (req.protocol === 'https' || req.secure)),
     path: '/',
     maxAge: SESSION_TTL_MS
   });

@@ -112,7 +112,7 @@ router.post('/auth/login', rateLimit({ ...RATE_LIMITS.auth, max: 10, prefix: 'lo
       error: process.env.NODE_ENV === 'production' ? 'Internal server error.' : msg
     });
   }
-  setSessionCookie(res, session.id);
+  setSessionCookie(req, res, session.id);
   res.json({ user: toPublicUser(user) });
 });
 
@@ -774,7 +774,14 @@ router.post('/runtime/chat', rateLimit({ ...RATE_LIMITS.public, prefix: 'chat' }
       status: result.status
     });
   } catch (err: any) {
-    res.status(500).json({
+    // Configuration errors (no agent, no published version) are expected
+    // degradation, not server faults — return 503 with a customer-friendly
+    // message so the widget shows a graceful state instead of a crash.
+    const msg = err?.message || '';
+    const isConfigError = /No agent configured|Business not found|No published version|not ACTIVE/i.test(msg);
+    const status = isConfigError ? 503 : 500;
+    console.error(`[runtime/chat] ${msg || 'Agent runtime processing failed'}`);
+    res.status(status).json({
       error: 'Agent runtime processing failed',
       fallbackMessage: "I am having trouble processing your request right now. I will connect you with a team member."
     });
