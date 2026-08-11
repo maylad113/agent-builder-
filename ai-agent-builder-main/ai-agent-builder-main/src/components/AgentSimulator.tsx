@@ -61,7 +61,12 @@ export const AgentSimulator: React.FC<AgentSimulatorProps> = ({
         body: JSON.stringify({
           tenantId: business.id,
           userMessage: userText,
-          channel: 'web_chat'
+          channel: 'web_chat',
+          // The simulator is internal (runs inside the authenticated
+          // dashboard), so it may test a SPECIFIC agent — including one that
+          // is still DRAFT/TESTING/READY and not yet ACTIVE. The server only
+          // honors agentId for an authenticated session scoped to this tenant.
+          agentId: agent.id
         })
       });
 

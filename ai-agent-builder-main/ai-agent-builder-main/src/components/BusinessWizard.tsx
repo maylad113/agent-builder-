@@ -136,7 +136,7 @@ export const BusinessWizard: React.FC<BusinessWizardProps> = ({
         bookingRules: 'Require full name and phone number',
         orderRules: 'Standard product order',
         refundRules: 'Non-refundable',
-        toolsEnabled: ['check_business_hours', 'get_business_information', 'check_availability', 'book_appointment', 'transfer_to_human']
+        toolsEnabled: ['check_business_hours', 'get_business_information', 'check_availability', 'book_appointment', 'search_knowledge', 'transfer_to_human']
       }
     } : null;
 

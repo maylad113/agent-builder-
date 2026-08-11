@@ -5,6 +5,13 @@ export interface ToolContext {
   tenantId: string;
   conversationId?: string;
   channel?: string;
+  /**
+   * The exact set of tools enabled for the agent in scope. When provided,
+   * executeAgentTool refuses to run any tool NOT in this set — the backend
+   * enforces enablement even if the LLM (or a caller) requests a tool that
+   * was not offered in the function declarations.
+   */
+  toolsEnabled?: string[];
 }
 
 // Gemini Function Declarations Schema for tool calling
@@ -33,6 +40,20 @@ export const agentToolDeclarations: FunctionDeclaration[] = [
           description: 'Topic filter, e.g. "services", "pricing", "location", "faqs", "policies"'
         }
       }
+    }
+  },
+  {
+    name: 'search_knowledge',
+    description: 'Search the business knowledge base (FAQs, policies, service catalog, documents) and return matching entries with title, type, content snippet and tags.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        query: {
+          type: Type.STRING,
+          description: 'Search term, e.g. "pricing", "opening hours", "beard oil", "cancellation policy".'
+        }
+      },
+      required: ['query']
     }
   },
   {
@@ -177,6 +198,13 @@ export async function executeAgentTool(
     return { success: false, error: `Unauthorized tenant ID: ${tenantId}` };
   }
 
+  // HARD tool enablement gate: even if the LLM (or a caller) requests a tool
+  // that is not enabled for the agent in scope, we refuse to execute it. This
+  // is enforced for EVERY tool in the switch below — never trust the frontend.
+  if (context.toolsEnabled && !context.toolsEnabled.includes(toolName)) {
+    return { success: false, error: `Tool ${toolName} is not enabled for this agent` };
+  }
+
   try {
     switch (toolName) {
       case 'check_business_hours': {
@@ -230,6 +258,44 @@ export async function executeAgentTool(
         }
 
         return { success: true, data: result };
+      }
+
+      case 'search_knowledge': {
+        const rawQuery = String(args.query || '').trim();
+        const q = rawQuery.toLowerCase();
+        if (!q) {
+          return { success: true, data: { query: rawQuery, count: 0, matches: [], message: 'No search query provided.' } };
+        }
+
+        // Tenant-scoped search over THIS business's knowledge chunks only
+        // (title / tags / content — same approach as retrieveKnowledgeChunks).
+        const scored = db.knowledgeChunks
+          .filter(k => k.businessId === tenantId)
+          .map(k => {
+            const titleMatch = k.title.toLowerCase().includes(q);
+            const tagMatch = k.tags.some(t => q.includes(t.toLowerCase()));
+            const contentMatch = k.content.toLowerCase().includes(q);
+            const score = (titleMatch ? 3 : 0) + (tagMatch ? 2 : 0) + (contentMatch ? 1 : 0);
+            return { k, score };
+          })
+          .filter(m => m.score > 0)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 5);
+
+        return {
+          success: true,
+          data: {
+            query: rawQuery,
+            count: scored.length,
+            matches: scored.map(m => ({
+              id: m.k.id,
+              title: m.k.title,
+              type: m.k.type,
+              snippet: m.k.content.length > 300 ? `${m.k.content.slice(0, 300)}…` : m.k.content,
+              tags: m.k.tags
+            }))
+          }
+        };
       }
 
       case 'check_availability': {
@@ -312,7 +378,7 @@ export async function executeAgentTool(
         let customer = db.customers.find(c => c.businessId === tenantId && c.phone === customerPhone);
         if (!customer) {
           customer = {
-            id: `cust-${Date.now()}`,
+            id: `cust-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
             businessId: tenantId,
             name: customerName,
             phone: customerPhone,
@@ -333,7 +399,7 @@ export async function executeAgentTool(
         const staff = db.staffMembers.find(s => s.businessId === tenantId);
 
         const newAppointment = {
-          id: `app-${Date.now()}`,
+          id: `app-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           businessId: tenantId,
           serviceId: service ? service.id : 'srv-1',
           serviceName: service ? service.name : 'Haircut',
@@ -354,7 +420,7 @@ export async function executeAgentTool(
 
         // Audit Log
         db.auditLogs.push({
-          id: `log-${Date.now()}`,
+          id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           businessId: tenantId,
           action: 'APPOINTMENT_BOOKED',
           details: `Appointment #${newAppointment.id} booked for ${customerName} (${service.name} at ${startTime} on ${date})`,
@@ -397,7 +463,7 @@ export async function executeAgentTool(
         db.appointments.update(app);
 
         db.auditLogs.push({
-          id: `log-${Date.now()}`,
+          id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           businessId: tenantId,
           action: 'APPOINTMENT_CANCELLED',
           details: `Appointment #${app.id} cancelled for ${app.customerName}`,
@@ -497,7 +563,7 @@ export async function executeAgentTool(
         let customer = db.customers.find(c => c.businessId === tenantId && c.phone === customerPhone);
         if (!customer) {
           customer = {
-            id: `cust-${Date.now()}`,
+            id: `cust-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
             businessId: tenantId,
             name: customerName,
             phone: customerPhone,
@@ -507,7 +573,7 @@ export async function executeAgentTool(
         }
 
         const newOrder = {
-          id: `ord-${Date.now()}`,
+          id: `ord-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           businessId: tenantId,
           customerId: customer.id,
           customerName,
@@ -561,7 +627,7 @@ export async function executeAgentTool(
       case 'notify_business_owner': {
         const { reason, customerDetails } = args;
         db.auditLogs.push({
-          id: `log-${Date.now()}`,
+          id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           businessId: tenantId,
           action: 'OWNER_NOTIFIED',
           details: `Urgent notification: ${reason} (Customer: ${customerDetails || 'N/A'})`,
@@ -585,7 +651,7 @@ export async function executeAgentTool(
         }
 
         db.auditLogs.push({
-          id: `log-${Date.now()}`,
+          id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           businessId: tenantId,
           action: 'HUMAN_HANDOFF_TRIGGERED',
           details: `Conversation transferred to human agent. Reason: ${reason}`,

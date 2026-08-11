@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { db } from './db';
 import { processAgentMessage, generateSuggestedAgentConfig } from './agentRuntime';
-import { Business, Agent, KnowledgeChunk, Product, Appointment, Order, User, Conversation } from '../types';
+import { Business, Agent, AgentStatus, KnowledgeChunk, Product, Appointment, Order, User, Conversation } from '../types';
 import { verifyPassword } from './passwords';
 import {
   requireAuth,
@@ -128,7 +128,7 @@ router.post('/businesses', requireAuth, requireRole('PLATFORM_OWNER'), (req: Req
   ] as const;
 
   const newBiz: Business = {
-    id: `biz-${Date.now()}`,
+    id: `biz-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     name,
     type,
     description: description || '',
@@ -188,7 +188,7 @@ router.post('/businesses', requireAuth, requireRole('PLATFORM_OWNER'), (req: Req
   });
 
   db.auditLogs.push({
-    id: `log-${Date.now()}`,
+    id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     businessId: newBiz.id,
     action: 'BUSINESS_CREATED',
     details: `Business "${newBiz.name}" (${newBiz.type}) created.`,
@@ -229,7 +229,7 @@ router.post('/businesses/:id/duplicate', requireAuth, requireRole('PLATFORM_OWNE
 
   const { newName } = req.body;
   const targetName = newName || `${sourceBiz.name} (Copy)`;
-  const newBizId = `biz-${Date.now()}`;
+  const newBizId = `biz-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   // Clone Business
   const clonedBiz: Business = JSON.parse(JSON.stringify(sourceBiz));
@@ -272,7 +272,7 @@ router.post('/businesses/:id/duplicate', requireAuth, requireRole('PLATFORM_OWNE
   });
 
   db.auditLogs.push({
-    id: `log-${Date.now()}`,
+    id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     businessId: newBizId,
     action: 'BUSINESS_DUPLICATED',
     details: `Duplicated business and agents from ${sourceBiz.name} to ${targetName}.`,
@@ -289,6 +289,52 @@ router.post('/businesses/:id/duplicate', requireAuth, requireRole('PLATFORM_OWNE
 // 2. AGENTS & WIZARD GENERATOR
 // =========================================
 
+/**
+ * Agent lifecycle — the ONLY legal status transitions (enforced server-side on
+ * POST /agents/:id/status and PUT /agents/:id):
+ *
+ *   DRAFT    → TESTING, ARCHIVED
+ *   TESTING  → READY, DRAFT, ARCHIVED          (back to DRAFT: edit & re-test)
+ *   READY    → ACTIVE, TESTING, ARCHIVED       (back to TESTING: iterate)
+ *   ACTIVE   → PAUSED, ARCHIVED
+ *   PAUSED   → ACTIVE, ARCHIVED                (un-pause = re-deploy)
+ *   ARCHIVED → (terminal — no transitions out)
+ *
+ * Invariant: at most ONE agent per business is ACTIVE. When an agent becomes
+ * ACTIVE, every other agent of the same business is automatically PAUSED.
+ * Pausing/archiving the active agent leaves the business with NO active agent
+ * — the public widget then honestly reports the assistant is unavailable.
+ * Same-status transitions are idempotent no-ops.
+ */
+const AGENT_STATUS_TRANSITIONS: Record<AgentStatus, AgentStatus[]> = {
+  DRAFT: ['TESTING', 'ARCHIVED'],
+  TESTING: ['READY', 'DRAFT', 'ARCHIVED'],
+  READY: ['ACTIVE', 'TESTING', 'ARCHIVED'],
+  ACTIVE: ['PAUSED', 'ARCHIVED'],
+  PAUSED: ['ACTIVE', 'ARCHIVED'],
+  ARCHIVED: []
+};
+
+const AGENT_STATUSES = Object.keys(AGENT_STATUS_TRANSITIONS) as AgentStatus[];
+
+/** Pause every other ACTIVE agent of the business (keeps exactly one ACTIVE). */
+function pauseOtherActiveAgents(businessId: string, keepAgentId: string): void {
+  const others = db.agents.filter(a => a.businessId === businessId && a.id !== keepAgentId && a.status === 'ACTIVE');
+  for (const other of others) {
+    other.status = 'PAUSED';
+    other.updatedAt = new Date().toISOString();
+    db.agents.update(other);
+    db.auditLogs.push({
+      id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      businessId,
+      agentId: other.id,
+      action: 'AGENT_STATUS_CHANGED',
+      details: `Agent "${other.name}" auto-paused because agent ${keepAgentId} became ACTIVE (one ACTIVE agent per business).`,
+      timestamp: new Date().toISOString()
+    });
+  }
+}
+
 // Get Agents (optionally filtered by businessId; tenant enforced server-side)
 router.get('/agents', requireAuth, requireTenantScope, (req: Request, res: Response) => {
   const businessId = res.locals.businessId as string | null;
@@ -297,8 +343,9 @@ router.get('/agents', requireAuth, requireTenantScope, (req: Request, res: Respo
 });
 
 // Generate Suggested Agent Configuration (AI Assistant Wizard)
+// Auth required. Produces an EDITABLE PROPOSAL only — never auto-activates.
 router.post('/agents/generate-config', requireAuth, async (req: Request, res: Response) => {
-  const { name, type, description, hours, services } = req.body;
+  const { name, type, description, hours, services, faqs } = req.body;
   if (!name || !type) {
     return res.status(400).json({ error: 'Name and type are required for agent generation.' });
   }
@@ -308,7 +355,8 @@ router.post('/agents/generate-config', requireAuth, async (req: Request, res: Re
     type,
     description,
     hours,
-    services
+    services,
+    faqs
   });
 
   res.json(suggestedConfig);
@@ -316,31 +364,42 @@ router.post('/agents/generate-config', requireAuth, async (req: Request, res: Re
 
 // Create Agent — tenant derived from the session (body businessId cannot widen access)
 router.post('/agents', requireAuth, requireTenantScope, (req: Request, res: Response) => {
-  const { name, description, systemPrompt, structuredConfig, llmProvider = 'gemini', model = 'gemini-3.6-flash' } = req.body;
+  const {
+    name,
+    description,
+    systemPrompt,
+    structuredConfig,
+    llmProvider = 'gemini',
+    model = 'gemini-3.6-flash',
+    status = 'READY'
+  } = req.body;
   const businessId = res.locals.businessId as string | null;
 
   if (!businessId || !name) {
     return res.status(400).json({ error: 'businessId and agent name are required.' });
   }
+  if (!AGENT_STATUSES.includes(status)) {
+    return res.status(400).json({ error: `Invalid status. Must be one of: ${AGENT_STATUSES.join(', ')}.` });
+  }
 
   const newAgent: Agent = {
-    id: `agent-${Date.now()}`,
+    id: `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     businessId,
     name,
     description: description || 'AI Receptionist & Assistant',
     version: 1,
-    status: 'READY',
+    status,
     systemPrompt: systemPrompt || 'You are an AI assistant. Answer customer queries politely based on business context.',
     structuredConfig: structuredConfig || {
       personality: { tone: 'friendly', behavior: 'service', language: 'en' },
       goals: ['Answer FAQs', 'Book appointments'],
-      allowedActions: ['check_business_hours', 'get_business_information', 'check_availability', 'book_appointment', 'transfer_to_human'],
+      allowedActions: ['check_business_hours', 'get_business_information', 'check_availability', 'book_appointment', 'search_knowledge', 'transfer_to_human'],
       restrictedActions: ['Do not make up fake information'],
       escalationRules: ['Customer requests human'],
       bookingRules: 'Require name and phone number',
       orderRules: 'Standard checkout',
       refundRules: 'Non-refundable',
-      toolsEnabled: ['check_business_hours', 'get_business_information', 'check_availability', 'book_appointment', 'transfer_to_human']
+      toolsEnabled: ['check_business_hours', 'get_business_information', 'check_availability', 'book_appointment', 'search_knowledge', 'transfer_to_human']
     },
     llmProvider,
     model,
@@ -350,12 +409,17 @@ router.post('/agents', requireAuth, requireTenantScope, (req: Request, res: Resp
 
   db.agents.push(newAgent);
 
+  // Creating an agent directly as ACTIVE also enforces exactly-one-ACTIVE.
+  if (newAgent.status === 'ACTIVE') {
+    pauseOtherActiveAgents(businessId, newAgent.id);
+  }
+
   db.auditLogs.push({
-    id: `log-${Date.now()}`,
+    id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     businessId,
     agentId: newAgent.id,
     action: 'AGENT_CREATED',
-    details: `Created agent "${newAgent.name}" v1.`,
+    details: `Created agent "${newAgent.name}" v1 (status ${newAgent.status}).`,
     timestamp: new Date().toISOString()
   });
 
@@ -370,6 +434,14 @@ router.put(
   (req: Request, res: Response) => {
     const agent = res.locals.resource as Agent;
 
+    // Status is owned by the lifecycle endpoint — changing it via PUT would
+    // bypass the transition rules, so it is rejected here.
+    if (req.body.status !== undefined && req.body.status !== agent.status) {
+      return res.status(400).json({
+        error: 'Change agent status via POST /api/agents/:id/status (lifecycle transitions are enforced server-side).'
+      });
+    }
+
     // Increment version on update
     const newVersion = agent.version + 1;
     Object.assign(agent, req.body, {
@@ -379,7 +451,7 @@ router.put(
     db.agents.update(agent);
 
     db.auditLogs.push({
-      id: `log-${Date.now()}`,
+      id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       businessId: agent.businessId,
       agentId: agent.id,
       action: 'AGENT_UPDATED',
@@ -391,7 +463,7 @@ router.put(
   }
 );
 
-// Toggle Agent Deployment Status — resource belongs to the authorized tenant
+// Change Agent Status — lifecycle enforced server-side (see transition map)
 router.post(
   '/agents/:id/status',
   requireAuth,
@@ -400,28 +472,39 @@ router.post(
     const agent = res.locals.resource as Agent;
 
     const { status } = req.body;
-    if (!['DRAFT', 'TESTING', 'READY', 'ACTIVE', 'PAUSED', 'ARCHIVED'].includes(status)) {
-      return res.status(400).json({ error: 'Invalid status state.' });
+    if (!AGENT_STATUSES.includes(status)) {
+      return res.status(400).json({ error: `Invalid status. Must be one of: ${AGENT_STATUSES.join(', ')}.` });
     }
 
-    // Validate readiness before setting ACTIVE
-    if (status === 'ACTIVE') {
-      const biz = db.businesses.find(b => b.id === agent.businessId);
-      if (!biz) return res.status(400).json({ error: 'Cannot activate agent: Business not found.' });
+    // Same status = idempotent no-op.
+    if (status !== agent.status) {
+      const allowed = AGENT_STATUS_TRANSITIONS[agent.status];
+      if (!allowed.includes(status)) {
+        return res.status(400).json({
+          error: `Invalid status transition: ${agent.status} -> ${status}. Allowed: ${[...allowed, agent.status].join(', ')}.`
+        });
+      }
+
+      // Validate readiness before setting ACTIVE
+      if (status === 'ACTIVE') {
+        const biz = db.businesses.find(b => b.id === agent.businessId);
+        if (!biz) return res.status(400).json({ error: 'Cannot activate agent: Business not found.' });
+        pauseOtherActiveAgents(agent.businessId, agent.id);
+      }
+
+      agent.status = status;
+      agent.updatedAt = new Date().toISOString();
+      db.agents.update(agent);
+
+      db.auditLogs.push({
+        id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        businessId: agent.businessId,
+        agentId: agent.id,
+        action: 'AGENT_STATUS_CHANGED',
+        details: `Agent "${agent.name}" state set to ${status}.`,
+        timestamp: new Date().toISOString()
+      });
     }
-
-    agent.status = status;
-    agent.updatedAt = new Date().toISOString();
-    db.agents.update(agent);
-
-    db.auditLogs.push({
-      id: `log-${Date.now()}`,
-      businessId: agent.businessId,
-      agentId: agent.id,
-      action: 'AGENT_STATUS_CHANGED',
-      details: `Agent "${agent.name}" state set to ${status}.`,
-      timestamp: new Date().toISOString()
-    });
 
     res.json(agent);
   }
@@ -431,11 +514,46 @@ router.post(
 // 3. RUNTIME CHAT & SIMULATOR (PUBLIC — customer-facing widget, no login)
 // =========================================
 
+/**
+ * /api/runtime/chat — one endpoint, two callers:
+ *
+ *  PUBLIC WIDGET (no session): serves ONLY the business's ACTIVE agent. When
+ *  the business has no ACTIVE agent it returns 200 with `agentAvailable:
+ *  false` and an honest message (the widget must render it as an error, not
+ *  a fake answer). Debug is ALWAYS null for unauthenticated callers — the
+ *  widget never receives system prompts, retrieved knowledge, or tool results.
+ *
+ *  SIMULATOR (authenticated session scoped to the tenant): may pass
+ *  `agentId` to run a SPECIFIC agent regardless of status (so owners can test
+ *  DRAFT/TESTING/READY agents before deploying). Passing agentId requires a
+ *  valid session AND tenant access to that agent. Debug is included only for
+ *  authenticated sessions scoped to the tenant being chatted with.
+ */
 router.post('/runtime/chat', async (req: Request, res: Response) => {
-  const { tenantId, userMessage, conversationId, channel, customerName, customerPhone } = req.body;
+  const { tenantId, userMessage, conversationId, channel, customerName, customerPhone, agentId } = req.body;
 
   if (!tenantId || !userMessage) {
     return res.status(400).json({ error: 'tenantId and userMessage are required.' });
+  }
+
+  // Debug gating: authenticated AND scoped to the tenant in the request.
+  const user = loadUserFromSession(req);
+  const tenantAccess = !!user && (user.role === 'PLATFORM_OWNER' || user.businessId === tenantId);
+  const includeDebug = tenantAccess;
+
+  // Internal agent selection (simulator): agentId is honored ONLY for a
+  // valid session with access to that agent's business.
+  if (agentId) {
+    if (!user) {
+      return res.status(401).json({ error: 'Authentication required to simulate a specific agent.' });
+    }
+    if (!tenantAccess) {
+      return res.status(403).json({ error: 'Forbidden: you do not have access to this business.' });
+    }
+    const agent = db.agents.find(a => a.id === agentId);
+    if (!agent || agent.businessId !== tenantId) {
+      return res.status(403).json({ error: 'Forbidden: agent does not belong to this business.' });
+    }
   }
 
   try {
@@ -445,7 +563,9 @@ router.post('/runtime/chat', async (req: Request, res: Response) => {
       conversationId,
       channel: channel || 'web_chat',
       customerName,
-      customerPhone
+      customerPhone,
+      agentId,
+      includeDebug
     });
 
     res.json(result);
@@ -477,7 +597,7 @@ router.post('/knowledge', requireAuth, requireTenantScope, (req: Request, res: R
   }
 
   const chunk: KnowledgeChunk = {
-    id: `kc-${Date.now()}`,
+    id: `kc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     businessId,
     title,
     type,
@@ -529,11 +649,11 @@ router.post('/appointments', requireAuth, requireTenantScope, (req: Request, res
   const service = biz.services.find(s => s.id === serviceId) || biz.services[0];
 
   const app: Appointment = {
-    id: `app-${Date.now()}`,
+    id: `app-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     businessId,
     serviceId: service ? service.id : 'srv-1',
     serviceName: service ? service.name : 'Service',
-    customerId: `cust-${Date.now()}`,
+    customerId: `cust-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     customerName,
     customerPhone,
     date,
@@ -575,10 +695,10 @@ router.post('/products', requireAuth, requireTenantScope, (req: Request, res: Re
   const { name, sku, price, inventory, description, category } = req.body;
   const businessId = res.locals.businessId as string | null;
   const prod: Product = {
-    id: `prod-${Date.now()}`,
+    id: `prod-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     businessId,
     name,
-    sku: sku || `SKU-${Date.now()}`,
+    sku: sku || `SKU-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     price: Number(price) || 0,
     inventory: Number(inventory) || 0,
     description: description || '',
@@ -706,7 +826,7 @@ router.put(
     db.channels.update(chan);
 
     db.auditLogs.push({
-      id: `log-${Date.now()}`,
+      id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       businessId: chan.businessId,
       action: 'CHANNEL_UPDATED',
       details: `Channel ${chan.type} status updated to ${chan.status}.`,
@@ -739,7 +859,7 @@ router.put(
     db.integrations.update(integ);
 
     db.auditLogs.push({
-      id: `log-${Date.now()}`,
+      id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       businessId: integ.businessId,
       action: 'INTEGRATION_UPDATED',
       details: `Integration ${integ.provider} set to ${integ.connected ? 'Configured/Connected' : 'Not configured'}.`,
