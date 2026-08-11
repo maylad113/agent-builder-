@@ -9,6 +9,10 @@ export interface ToolContext {
   tenantId: string;
   conversationId?: string;
   channel?: string;
+  /** Tool names the agent is permitted to invoke. If provided, any tool not
+   * in this set is rejected before execution — defense-in-depth against the
+   * LLM hallucinating a tool call that was never declared to it. */
+  allowedToolNames?: string[];
 }
 
 // Time helpers (timeToMinutes, addMinutes, intervalsOverlap, isFail, dayOfWeek,
@@ -185,6 +189,13 @@ export async function executeAgentTool(
   const business = db.businesses.find(b => b.id === tenantId);
   if (!business) {
     return { success: false, error: `Unauthorized tenant ID: ${tenantId}` };
+  }
+
+  // Defense-in-depth: verify the tool is permitted for this agent. Even though
+  // undeclared tools are never sent to the LLM, the model could hallucinate a
+  // tool name; the backend must independently reject it.
+  if (context.allowedToolNames && !context.allowedToolNames.includes(toolName)) {
+    return { success: false, error: `Tool '${toolName}' is not permitted for this agent.` };
   }
 
   try {

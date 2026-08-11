@@ -359,7 +359,8 @@ CRITICAL MANDATES:
         const result = await executeAgentTool(toolName, args, {
           tenantId,
           conversationId: conversation.id,
-          channel
+          channel,
+          allowedToolNames: activeTools.map(t => t.name)
         });
 
         const rec: ToolCallRecord = {

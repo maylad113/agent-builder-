@@ -201,3 +201,45 @@ describe('debug-found regressions', () => {
     expect(knowledge.body[0].businessId).toBe(newId);
   });
 });
+
+describe('tool permission enforcement (defense-in-depth)', () => {
+  it('rejects an LLM-hallucinated tool not in the agent\'s allowed set', async () => {
+    const { executeAgentTool, agentToolDeclarations } = await import('../src/server/tools');
+    const { db } = await import('../src/server/db');
+    const biz = db.businesses.find(b => b.id === 'biz-tonys-barber');
+    expect(biz).toBeTruthy();
+    // Simulate the LLM calling 'book_appointment' when the agent only allows
+    // 'check_business_hours' — the backend must refuse to execute it.
+    const result = await executeAgentTool('book_appointment', {
+      serviceId: 'svc-haircut', date: '2025-01-15', time: '10:00'
+    }, {
+      tenantId: 'biz-tonys-barber',
+      allowedToolNames: ['check_business_hours', 'get_business_information']
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('not permitted');
+  });
+
+  it('executes a permitted tool normally', async () => {
+    const { executeAgentTool } = await import('../src/server/tools');
+    const { db } = await import('../src/server/db');
+    const biz = db.businesses.find(b => b.id === 'biz-tonys-barber');
+    expect(biz).toBeTruthy();
+    const result = await executeAgentTool('check_business_hours', {}, {
+      tenantId: 'biz-tonys-barber',
+      allowedToolNames: ['check_business_hours']
+    });
+    expect(result.success).toBe(true);
+    expect(result.data).toBeTruthy();
+  });
+
+  it('rejects a tool call for an unknown tenant (IDOR guard)', async () => {
+    const { executeAgentTool } = await import('../src/server/tools');
+    const result = await executeAgentTool('check_business_hours', {}, {
+      tenantId: 'biz-does-not-exist',
+      allowedToolNames: ['check_business_hours']
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('Unauthorized');
+  });
+});
