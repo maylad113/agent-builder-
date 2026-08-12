@@ -15,3 +15,11 @@ data/
 # Logs & misc
 *.log
 .DS_Store
+
+# Build artifacts / archives
+*.zip
+ai-agent-builder.zip
+
+# Temporary conversion helper scripts (one-off, not source)
+_convert_routes.py
+_convert_*.py
