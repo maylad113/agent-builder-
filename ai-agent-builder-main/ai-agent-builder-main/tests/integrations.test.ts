@@ -44,6 +44,7 @@ const platformAgent = request.agent(app);
 let googleIntegId = '';
 
 beforeAll(async () => {
+  await db.init();
   const login = await platformAgent.post('/api/auth/login').send({
     email: 'owner@agentfactory.io',
     password: 'Password123!'
@@ -58,7 +59,7 @@ beforeAll(async () => {
   expect(google.state).toBe('NOT_CONFIGURED');
 });
 
-afterAll(() => { db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
+afterAll(async () => { await db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
 describe('integration lifecycle security (P1.1)', () => {
   it('rejects client-supplied state/connected via PUT (mass-assignment guard)', async () => {

@@ -38,11 +38,12 @@ const tonyAgent = request.agent(app);
 const tonyAgentId = 'agent-tonys-1';
 
 beforeAll(async () => {
+  await db.init();
   await platformAgent.post('/api/auth/login').send({ email: 'owner@agentfactory.io', password: 'Password123!' });
   const tonyLogin = await tonyAgent.post('/api/auth/login').send({ email: 'tony@tonysbarber.com', password: 'Password123!' });
   expect(tonyLogin.status).toBe(200);
 });
-afterAll(() => { db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
+afterAll(async () => { await db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
 describe('agent versioning lifecycle', () => {
   it('the seeded agent has exactly one PUBLISHED version', async () => {

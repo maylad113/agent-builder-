@@ -39,13 +39,14 @@ beforeAll(async () => {
   // (P1.2). The seed business has an empty list; configure it so the external
   // origin used by these tests is allowed. This mirrors the real production
   // flow: the operator sets allowedWidgetOrigins before embedding the widget.
-  const biz = db.businesses.find(b => b.id === 'biz-tonys-barber');
+  await db.init();
+  const biz = await db.businesses.find(b => b.id === 'biz-tonys-barber');
   if (biz) {
     biz.allowedWidgetOrigins = [EXTERNAL_ORIGIN, 'http://localhost:5173'];
-    db.businesses.update(biz);
+    await db.businesses.update(biz);
   }
 });
-afterAll(() => { db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
+afterAll(async () => { await db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
 describe('widget cross-origin (Phase 17)', () => {
   it('reflects the request Origin and allows cross-origin POST', async () => {

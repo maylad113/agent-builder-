@@ -29,10 +29,11 @@ beforeAll(async () => {
   // The Tony seed business ships with a 30-min "Haircut" service (srv-1),
   // Monday hours 09:00-20:00, and products with small inventory.
   // Reset the relevant inventory so the order test is deterministic.
-  const p = db.products.find(p => p.businessId === 'biz-tonys-barber' && p.id === 'prod-1');
-  if (p) { p.inventory = 1; db.products.update(p); }
+  await db.init();
+  const p = await db.products.find(p => p.businessId === 'biz-tonys-barber' && p.id === 'prod-1');
+  if (p) { p.inventory = 1; await db.products.update(p); }
 });
-afterAll(() => { db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
+afterAll(async () => { await db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
 // Use a Monday far in the future that is open. The seed says Sunday closed.
 const MONDAY_DATE = '2099-01-04'; // a Monday (2099-01-04 is a Sunday? verify below)
@@ -94,7 +95,7 @@ describe('order oversell race (Phase 10 / critical #6)', () => {
   });
 
   it('inventory was decremented to exactly 0 (no negative inventory)', async () => {
-    const p = db.products.find(p => p.businessId === 'biz-tonys-barber' && p.id === 'prod-1');
+    const p = await db.products.find(p => p.businessId === 'biz-tonys-barber' && p.id === 'prod-1');
     expect(p?.inventory).toBe(0);
   });
 });

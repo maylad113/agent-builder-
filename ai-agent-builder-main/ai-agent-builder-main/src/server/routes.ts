@@ -29,7 +29,8 @@ import {
   setSessionCookie,
   clearSessionCookie,
   readCookie,
-  SESSION_COOKIE
+  SESSION_COOKIE,
+  asyncHandler
 } from './auth';
 
 export const router = Router();
@@ -58,12 +59,12 @@ function paginate<T>(items: T[], req: Request, res: Response): T[] {
 }
 
 // Health Check (public)
-router.get('/health', (req: Request, res: Response) => {
+router.get('/health', asyncHandler(async (req: Request, res: Response) => {
   // Lightweight DB liveness probe so a load-balancer/healthcheck can detect a
   // wedged database, not just a live process.
   let dbOk = false;
   try {
-    db.sqlite.prepare('SELECT 1').get();
+    await db.client.ping();
     dbOk = true;
   } catch {
     dbOk = false;
@@ -73,31 +74,31 @@ router.get('/health', (req: Request, res: Response) => {
     db: dbOk ? 'connected' : 'unreachable',
     timestamp: new Date().toISOString()
   });
-});
+}));
 
 // =========================================
 // AUTH (login/logout public; /auth/me is session-driven)
 // =========================================
 
 // Current User Context — real user from the session, or 401.
-router.get('/auth/me', (req: Request, res: Response) => {
-  const user = loadUserFromSession(req);
+router.get('/auth/me', asyncHandler(async (req: Request, res: Response) => {
+  const user = await loadUserFromSession(req);
   if (!user) {
     return res.status(401).json({ error: 'Authentication required.' });
   }
   res.json({ user: toPublicUser(user) });
-});
+}));
 
-// Login — public. Validates credentials, creates a SQLite-backed session,
+// Login — public. Validates credentials, creates a database-backed session,
 // sets the signed HttpOnly cookie. A missing SESSION_SECRET in production is
 // reported as a clear JSON 500 (not an HTML crash page) so operators can
 // diagnose it without the app becoming unresponsive.
-router.post('/auth/login', rateLimit({ ...RATE_LIMITS.auth, max: 10, prefix: 'login' }), (req: Request, res: Response) => {
+router.post('/auth/login', rateLimit({ ...RATE_LIMITS.auth, max: 10, prefix: 'login' }), asyncHandler(async (req: Request, res: Response) => {
   const { email, password } = req.body ?? {};
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required.' });
   }
-  const user = db.users.find(u => u.email.toLowerCase() === String(email).toLowerCase());
+  const user = await db.users.find(u => u.email.toLowerCase() === String(email).toLowerCase());
   if (!user) {
     return res.status(401).json({ error: 'Invalid email or password.' });
   }
@@ -106,7 +107,7 @@ router.post('/auth/login', rateLimit({ ...RATE_LIMITS.auth, max: 10, prefix: 'lo
   }
   let session;
   try {
-    session = createSession(user.id);
+    session = await createSession(user.id);
   } catch (err: any) {
     const msg = err?.message || 'Failed to create session.';
     return res.status(500).json({
@@ -115,18 +116,18 @@ router.post('/auth/login', rateLimit({ ...RATE_LIMITS.auth, max: 10, prefix: 'lo
   }
   setSessionCookie(req, res, session.id);
   res.json({ user: toPublicUser(user) });
-});
+}));
 
 // Logout — public. Always 200; invalidates the server-side session row when present.
-router.post('/auth/logout', (req: Request, res: Response) => {
+router.post('/auth/logout', asyncHandler(async (req: Request, res: Response) => {
   const raw = readCookie(req, SESSION_COOKIE);
   if (raw) {
     const sessionId = raw.split('.')[0];
-    if (sessionId) destroySession(sessionId);
+    if (sessionId) await destroySession(sessionId);
   }
   clearSessionCookie(res);
   res.json({ success: true });
-});
+}));
 
 // =========================================
 // 1. BUSINESSES (MULTI-TENANT MANAGEMENT)
@@ -134,10 +135,10 @@ router.post('/auth/logout', (req: Request, res: Response) => {
 
 // Get all businesses (with optional search/type filters).
 // Platform owner -> all businesses; business owner/staff -> ONLY their own.
-router.get('/businesses', requireAuth, (req: Request, res: Response) => {
+router.get('/businesses', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { search, type, status } = req.query;
   const user = res.locals.user as User;
-  let result = db.businesses.toJSON();
+  let result = await db.businesses.toJSON();
 
   if (user.role !== 'PLATFORM_OWNER') {
     result = result.filter(b => b.id === user.businessId);
@@ -154,10 +155,10 @@ router.get('/businesses', requireAuth, (req: Request, res: Response) => {
   }
 
   res.json(result);
-});
+}));
 
 // Create Business — PLATFORM_OWNER only.
-router.post('/businesses', requireAuth, requireRole('PLATFORM_OWNER'), (req: Request, res: Response) => {
+router.post('/businesses', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
   const {
     name,
     type,
@@ -227,12 +228,12 @@ router.post('/businesses', requireAuth, requireRole('PLATFORM_OWNER'), (req: Req
     updatedAt: new Date().toISOString()
   };
 
-  db.businesses.push(newBiz);
+  await db.businesses.push(newBiz);
 
   // Initialize Default Channels & Integrations for new tenant
   const defaultChannels = ['web_chat', 'instagram', 'sms', 'voice'] as const;
-  defaultChannels.forEach(chanType => {
-    db.channels.push({
+  for (const chanType of defaultChannels) {
+    await db.channels.push({
       id: `chan-${Date.now()}-${chanType}`,
       businessId: newBiz.id,
       type: chanType,
@@ -240,11 +241,11 @@ router.post('/businesses', requireAuth, requireRole('PLATFORM_OWNER'), (req: Req
       details: chanType === 'web_chat' ? 'Widget ready to embed' : 'Not configured',
       updatedAt: new Date().toISOString()
     });
-  });
+  }
 
   const providers = ['google_calendar', 'meta_instagram', 'twilio_sms', 'voice_ai'] as const;
-  providers.forEach(prov => {
-    db.integrations.push({
+  for (const prov of providers) {
+    await db.integrations.push({
       id: `integ-${Date.now()}-${prov}`,
       businessId: newBiz.id,
       provider: prov,
@@ -252,9 +253,9 @@ router.post('/businesses', requireAuth, requireRole('PLATFORM_OWNER'), (req: Req
       statusMessage: 'Not configured',
       credentialsSet: false
     });
-  });
+  }
 
-  db.auditLogs.push({
+  await db.auditLogs.push({
     id: `log-${Date.now()}`,
     businessId: newBiz.id,
     action: 'BUSINESS_CREATED',
@@ -263,24 +264,24 @@ router.post('/businesses', requireAuth, requireRole('PLATFORM_OWNER'), (req: Req
   });
 
   res.status(201).json(newBiz);
-});
+}));
 
 // Get Business by ID — platform owner or the business's own owner/staff.
 router.get(
   '/businesses/:id',
   requireAuth,
   requireResourceAccess(req => db.businesses.find(b => b.id === req.params.id), b => (b as Business).id),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     res.json(res.locals.resource);
   }
-);
+));
 
 // Update Business — platform owner or the business's own owner/staff.
 router.put(
   '/businesses/:id',
   requireAuth,
   requireResourceAccess(req => db.businesses.find(b => b.id === req.params.id), b => (b as Business).id),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const biz = res.locals.resource as Business;
     // Allowlist only the updatable fields. Never trust `id`, `createdAt`, or
     // arbitrary keys from the frontend (prevents mass-assignment).
@@ -306,15 +307,15 @@ router.put(
     if (Array.isArray(holidays)) biz.holidays = holidays;
     if (Array.isArray(allowedWidgetOrigins)) biz.allowedWidgetOrigins = allowedWidgetOrigins;
     biz.updatedAt = new Date().toISOString();
-    db.businesses.update(biz);
+    await db.businesses.update(biz);
     res.json(biz);
   }
-);
+));
 
 // Duplicate Business & Agent Feature (Section 33 Prompt Mandate) — PLATFORM_OWNER only,
 // because it creates a new tenant (same privilege as POST /businesses).
-router.post('/businesses/:id/duplicate', requireAuth, requireRole('PLATFORM_OWNER'), (req: Request, res: Response) => {
-  const sourceBiz = db.businesses.find(b => b.id === req.params.id);
+router.post('/businesses/:id/duplicate', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  const sourceBiz = await db.businesses.find(b => b.id === req.params.id);
   if (!sourceBiz) return res.status(404).json({ error: 'Source business not found.' });
 
   const { newName } = req.body;
@@ -328,23 +329,23 @@ router.post('/businesses/:id/duplicate', requireAuth, requireRole('PLATFORM_OWNE
   clonedBiz.createdAt = new Date().toISOString();
   clonedBiz.updatedAt = new Date().toISOString();
 
-  db.businesses.push(clonedBiz);
+  await db.businesses.push(clonedBiz);
 
   // Clone Agents
-  const sourceAgents = db.agents.filter(a => a.businessId === sourceBiz.id);
-  sourceAgents.forEach(a => {
+  const sourceAgents = await db.agents.filter(a => a.businessId === sourceBiz.id);
+  for (const a of sourceAgents) {
     const clonedAgent: Agent = JSON.parse(JSON.stringify(a));
     clonedAgent.id = `agent-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     clonedAgent.businessId = newBizId;
     clonedAgent.name = `${a.name} for ${targetName}`;
     clonedAgent.createdAt = new Date().toISOString();
     clonedAgent.updatedAt = new Date().toISOString();
-    db.agents.push(clonedAgent);
+    await db.agents.push(clonedAgent);
     // Clone the agent's published version so the new agent starts with a
     // complete version history (factory workflow: duplicate template).
-    const srcPub = db.agentVersions.find(v => v.agentId === a.id && v.status === 'PUBLISHED');
+    const srcPub = await db.agentVersions.find(v => v.agentId === a.id && v.status === 'PUBLISHED');
     if (srcPub) {
-      db.agentVersions.push({
+      await db.agentVersions.push({
         id: `ver-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
         agentId: clonedAgent.id,
         businessId: newBizId,
@@ -358,30 +359,30 @@ router.post('/businesses/:id/duplicate', requireAuth, requireRole('PLATFORM_OWNE
         publishedAt: new Date().toISOString()
       });
     }
-  });
+  }
 
   // Clone Knowledge Chunks
-  const sourceChunks = db.knowledgeChunks.filter(k => k.businessId === sourceBiz.id);
-  sourceChunks.forEach(k => {
+  const sourceChunks = await db.knowledgeChunks.filter(k => k.businessId === sourceBiz.id);
+  for (const k of sourceChunks) {
     const clonedChunk: KnowledgeChunk = JSON.parse(JSON.stringify(k));
     clonedChunk.id = `kc-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     clonedChunk.businessId = newBizId;
     clonedChunk.createdAt = new Date().toISOString();
-    db.knowledgeChunks.push(clonedChunk);
+    await db.knowledgeChunks.push(clonedChunk);
     // Re-index under the new chunk id so RAG retrieval works for the clone.
     indexChunk(clonedChunk).catch(() => {/* non-fatal: keyword fallback still works */});
-  });
+  }
 
   // Clone Products
-  const sourceProds = db.products.filter(p => p.businessId === sourceBiz.id);
-  sourceProds.forEach(p => {
+  const sourceProds = await db.products.filter(p => p.businessId === sourceBiz.id);
+  for (const p of sourceProds) {
     const clonedProd: Product = JSON.parse(JSON.stringify(p));
     clonedProd.id = `prod-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     clonedProd.businessId = newBizId;
-    db.products.push(clonedProd);
-  });
+    await db.products.push(clonedProd);
+  }
 
-  db.auditLogs.push({
+  await db.auditLogs.push({
     id: `log-${Date.now()}`,
     businessId: newBizId,
     action: 'BUSINESS_DUPLICATED',
@@ -393,31 +394,31 @@ router.post('/businesses/:id/duplicate', requireAuth, requireRole('PLATFORM_OWNE
     message: 'Business and Agent successfully duplicated!',
     newBusiness: clonedBiz
   });
-});
+}));
 
 // =========================================
 // 2. AGENTS & WIZARD GENERATOR
 // =========================================
 
 // Get Agents (optionally filtered by businessId; tenant enforced server-side)
-router.get('/agents', requireAuth, requireTenantScope, (req: Request, res: Response) => {
+router.get('/agents', requireAuth, requireTenantScope, asyncHandler(async (req: Request, res: Response) => {
   const businessId = res.locals.businessId as string | null;
-  const agents = businessId ? db.agents.filter(a => a.businessId === businessId) : db.agents.toJSON();
+  const agents = businessId ? await db.agents.filter(a => a.businessId === businessId) : await db.agents.toJSON();
   res.json(agents);
-});
+}));
 
 // Get a single agent — tenant-scoped via requireResourceAccess.
 router.get(
   '/agents/:id',
   requireAuth,
   requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     res.json(res.locals.resource as Agent);
   }
-);
+));
 
 // Generate Suggested Agent Configuration (AI Assistant Wizard)
-router.post('/agents/generate-config', requireAuth, async (req: Request, res: Response) => {
+router.post('/agents/generate-config', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { name, type, description, hours, services } = req.body;
   if (!name || !type) {
     return res.status(400).json({ error: 'Name and type are required for agent generation.' });
@@ -432,10 +433,10 @@ router.post('/agents/generate-config', requireAuth, async (req: Request, res: Re
   });
 
   res.json(suggestedConfig);
-});
+}));
 
 // Create Agent — tenant derived from the session (body businessId cannot widen access)
-router.post('/agents', requireAuth, requireTenantScope, (req: Request, res: Response) => {
+router.post('/agents', requireAuth, requireTenantScope, asyncHandler(async (req: Request, res: Response) => {
   const { name, description, systemPrompt, structuredConfig, llmProvider = 'gemini', model = 'gemini-3.6-flash' } = req.body;
   const businessId = res.locals.businessId as string | null;
 
@@ -468,13 +469,13 @@ router.post('/agents', requireAuth, requireTenantScope, (req: Request, res: Resp
     updatedAt: new Date().toISOString()
   };
 
-  db.agents.push(newAgent);
+  await db.agents.push(newAgent);
 
   // Create the first DRAFT version snapshot. The agent row is the live config;
   // the version history is immutable. Editing happens on drafts, not the row.
-  createInitialDraft(newAgent);
+  await createInitialDraft(newAgent);
 
-  db.auditLogs.push({
+  await db.auditLogs.push({
     id: `log-${Date.now()}`,
     businessId,
     agentId: newAgent.id,
@@ -484,7 +485,7 @@ router.post('/agents', requireAuth, requireTenantScope, (req: Request, res: Resp
   });
 
   res.status(201).json(newAgent);
-});
+}));
 
 // Update Agent — resource belongs to the authorized tenant.
 // This edits metadata only (name/description). Config edits go through the
@@ -493,15 +494,15 @@ router.put(
   '/agents/:id',
   requireAuth,
   requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const agent = res.locals.resource as Agent;
     const { name, description } = req.body;
     if (name !== undefined) agent.name = name;
     if (description !== undefined) agent.description = description;
     agent.updatedAt = new Date().toISOString();
-    db.agents.update(agent);
+    await db.agents.update(agent);
 
-    db.auditLogs.push({
+    await db.auditLogs.push({
       id: `log-${Date.now()}`,
       businessId: agent.businessId,
       agentId: agent.id,
@@ -512,14 +513,14 @@ router.put(
 
     res.json(agent);
   }
-);
+));
 
 // Toggle Agent Deployment Status — resource belongs to the authorized tenant
 router.post(
   '/agents/:id/status',
   requireAuth,
   requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const agent = res.locals.resource as Agent;
 
     const { status } = req.body;
@@ -531,7 +532,7 @@ router.post(
     // composite checklist must pass. The frontend cannot bypass this.
     if (status === 'ACTIVE') {
       try {
-        assertActivatable(agent);
+        await assertActivatable(agent);
       } catch (err: any) {
         return res.status(400).json({
           error: err.message,
@@ -542,9 +543,9 @@ router.post(
 
     agent.status = status;
     agent.updatedAt = new Date().toISOString();
-    db.agents.update(agent);
+    await db.agents.update(agent);
 
-    db.auditLogs.push({
+    await db.auditLogs.push({
       id: `log-${Date.now()}`,
       businessId: agent.businessId,
       agentId: agent.id,
@@ -555,18 +556,18 @@ router.post(
 
     res.json(agent);
   }
-);
+));
 
 // Agent readiness checklist (Phase 20) — read-only snapshot for the UI.
 router.get(
   '/agents/:id/readiness',
   requireAuth,
   requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const agent = res.locals.resource as Agent;
-    res.json(readinessSnapshot(agent));
+    res.json(await readinessSnapshot(agent));
   }
-);
+));
 
 // =========================================
 // 2b. AGENT VERSIONS
@@ -579,67 +580,67 @@ router.get(
   '/agents/:id/versions',
   requireAuth,
   requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
-  (req: Request, res: Response) => {
-    res.json(listVersions(req.params.id));
+  asyncHandler(async (req: Request, res: Response) => {
+    res.json(await listVersions(req.params.id));
   }
-);
+));
 
 router.get(
   '/agents/:id/versions/published',
   requireAuth,
   requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
-  (req: Request, res: Response) => {
-    const pub = getPublishedVersion(req.params.id);
+  asyncHandler(async (req: Request, res: Response) => {
+    const pub = await getPublishedVersion(req.params.id);
     if (!pub) return res.status(404).json({ error: 'No published version.' });
     res.json(pub);
   }
-);
+));
 
 router.post(
   '/agents/:id/versions',
   requireAuth,
   requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     // Create a new draft from an existing version. Defaults to the published
     // version; if none is published yet (e.g. a brand-new agent that only has
     // its initial draft), fall back to the latest version of any status so the
     // user can still iterate before the first publish.
     const { fromVersionId, changeNote } = req.body;
     const sourceId = fromVersionId
-      || getPublishedVersion(req.params.id)?.id
-      || listVersions(req.params.id)[0]?.id;
+      || (await getPublishedVersion(req.params.id))?.id
+      || (await listVersions(req.params.id))[0]?.id;
     if (!sourceId) return res.status(400).json({ error: 'No source version to draft from.' });
     try {
-      const draft = createDraftFrom(sourceId, changeNote);
+      const draft = await createDraftFrom(sourceId, changeNote);
       res.status(201).json(draft);
     } catch (e: any) {
       res.status(400).json({ error: e.message });
     }
   }
-);
+));
 
 router.put(
   '/agents/:id/versions/:versionId',
   requireAuth,
   requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     try {
-      const updated = editDraft(req.params.versionId, req.body);
+      const updated = await editDraft(req.params.versionId, req.body);
       res.json(updated);
     } catch (e: any) {
       res.status(400).json({ error: e.message });
     }
   }
-);
+));
 
 router.post(
   '/agents/:id/versions/:versionId/publish',
   requireAuth,
   requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     try {
-      const pub = publishVersion(req.params.versionId);
-      db.auditLogs.push({
+      const pub = await publishVersion(req.params.versionId);
+      await db.auditLogs.push({
         id: `log-${Date.now()}`,
         businessId: (res.locals.resource as Agent).businessId,
         agentId: req.params.id,
@@ -652,47 +653,47 @@ router.post(
       res.status(400).json({ error: e.message });
     }
   }
-);
+));
 
 router.post(
   '/agents/:id/versions/:versionId/test',
   requireAuth,
   requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     try {
-      res.json(moveToTesting(req.params.versionId));
+      res.json(await moveToTesting(req.params.versionId));
     } catch (e: any) {
       res.status(400).json({ error: e.message });
     }
   }
-);
+));
 
 router.post(
   '/agents/:id/versions/:versionId/rollback',
   requireAuth,
   requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     try {
-      const pub = rollbackToVersion(req.params.versionId);
+      const pub = await rollbackToVersion(req.params.versionId);
       res.json(pub);
     } catch (e: any) {
       res.status(400).json({ error: e.message });
     }
   }
-);
+));
 
 router.post(
   '/agents/:id/versions/:versionId/archive',
   requireAuth,
   requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     try {
-      res.json(archiveVersion(req.params.versionId));
+      res.json(await archiveVersion(req.params.versionId));
     } catch (e: any) {
       res.status(400).json({ error: e.message });
     }
   }
-);
+));
 
 // =========================================
 // 3. RUNTIME CHAT & SIMULATOR
@@ -707,21 +708,21 @@ router.post(
 // OPTIONS preflight for the cross-origin widget. Origin is enforced per-business
 // (P1.2): only origins in the target business's allowedWidgetOrigins are allowed;
 // unknown origins receive 403.
-router.options('/runtime/chat', (req: Request, res: Response) => {
+router.options('/runtime/chat', asyncHandler(async (req: Request, res: Response) => {
   // The browser preflight cannot send the custom x-business-id value (preflight
   // only lists header names). Resolve the tenant from the `business` query param
   // the widget appends, then enforce the per-business origin allow-list.
   const tenantId = (req.query.business as string) || (req.headers['x-business-id'] as string) || undefined;
   const origin = req.headers.origin;
-  const headers = tenantId ? widgetCorsHeaders(tenantId, origin) : null;
+  const headers = tenantId ? await widgetCorsHeaders(tenantId, origin) : null;
   if (!headers) {
     return res.status(403).end();
   }
   for (const [k, v] of Object.entries(headers)) res.setHeader(k, String(v));
   return res.status(204).end();
-});
+}));
 
-router.post('/runtime/chat', rateLimit({ ...RATE_LIMITS.public, prefix: 'chat' }), (req: Request, res: Response, next: NextFunction) => {
+router.post('/runtime/chat', rateLimit({ ...RATE_LIMITS.public, prefix: 'chat' }), async (req: Request, res: Response, next: NextFunction) => {
   // Per-business origin enforcement (P1.2): the widget may only POST from an
   // origin the business explicitly allow-listed. This prevents cross-tenant
   // impersonation and arbitrary-origin abuse. Tenancy is still enforced by
@@ -735,7 +736,7 @@ router.post('/runtime/chat', rateLimit({ ...RATE_LIMITS.public, prefix: 'chat' }
   if (process.env.NODE_ENV === 'production' && !origin) {
     return res.status(403).json({ error: 'Origin not allowed.' });
   }
-  const headers = tenantId ? widgetCorsHeaders(tenantId, origin) : null;
+  const headers = tenantId ? await widgetCorsHeaders(tenantId, origin) : null;
   if (origin && !headers) {
     // Unknown origin: reject. Don't reflect the origin.
     return res.status(403).json({ error: 'Origin not allowed.' });
@@ -747,7 +748,7 @@ router.post('/runtime/chat', rateLimit({ ...RATE_LIMITS.public, prefix: 'chat' }
     return res.status(204).end();
   }
   next();
-}, async (req: Request, res: Response) => {
+}, asyncHandler(async (req: Request, res: Response) => {
   const { tenantId, userMessage, conversationId, channel, customerName, customerPhone } = req.body;
 
   if (!tenantId || !userMessage) {
@@ -788,7 +789,7 @@ router.post('/runtime/chat', rateLimit({ ...RATE_LIMITS.public, prefix: 'chat' }
       fallbackMessage: "I am having trouble processing your request right now. I will connect you with a team member."
     });
   }
-});
+}));
 
 // Authenticated simulator endpoint for business owners/staff testing an agent.
 // Returns the full result INCLUDING the developer-only debug block (system
@@ -799,7 +800,7 @@ router.post(
   '/runtime/simulate',
   requireAuth,
   requireTenantScope,
-  async (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const businessId = res.locals.businessId as string | null;
     if (!businessId) {
       return res.status(400).json({ error: 'businessId is required.' });
@@ -827,21 +828,21 @@ router.post(
       });
     }
   }
-);
+));
 
 // =========================================
 // 4. KNOWLEDGE BASE
 // =========================================
 
-router.get('/knowledge', requireAuth, requireTenantScope, (req: Request, res: Response) => {
+router.get('/knowledge', requireAuth, requireTenantScope, asyncHandler(async (req: Request, res: Response) => {
   const businessId = res.locals.businessId as string | null;
   if (!businessId) return res.status(400).json({ error: 'businessId required.' });
 
-  const items = db.knowledgeChunks.filter(k => k.businessId === businessId);
+  const items = await db.knowledgeChunks.filter(k => k.businessId === businessId);
   res.json(paginate(items, req, res));
-});
+}));
 
-router.post('/knowledge', requireAuth, requireTenantScope, async (req: Request, res: Response) => {
+router.post('/knowledge', requireAuth, requireTenantScope, asyncHandler(async (req: Request, res: Response) => {
   const { title, type = 'faq', content, tags = [] } = req.body;
   const businessId = res.locals.businessId as string | null;
   if (!businessId || !title || !content) {
@@ -858,60 +859,60 @@ router.post('/knowledge', requireAuth, requireTenantScope, async (req: Request, 
     createdAt: new Date().toISOString()
   };
 
-  db.knowledgeChunks.push(chunk);
+  await db.knowledgeChunks.push(chunk);
   // Index for semantic retrieval (re-indexes on change; no-op if no API key).
   indexChunk(chunk).catch(() => {/* embedding failures are non-fatal */});
   res.status(201).json(chunk);
-});
+}));
 
 router.put(
   '/knowledge/:id',
   requireAuth,
   requireResourceAccess(req => db.knowledgeChunks.find(k => k.id === req.params.id)),
-  async (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const chunk = res.locals.resource as KnowledgeChunk;
     const { title, content, tags, type } = req.body;
     if (title !== undefined) chunk.title = title;
     if (content !== undefined) chunk.content = content;
     if (type !== undefined) chunk.type = type;
     if (Array.isArray(tags)) chunk.tags = tags;
-    db.knowledgeChunks.update(chunk);
+    await db.knowledgeChunks.update(chunk);
     indexChunk(chunk).catch(() => {/* non-fatal */});
     res.json(chunk);
   }
-);
+));
 
 router.delete(
   '/knowledge/:id',
   requireAuth,
   requireResourceAccess(req => db.knowledgeChunks.find(k => k.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const chunk = res.locals.resource as KnowledgeChunk;
-    const idx = db.knowledgeChunks.findIndex(k => k.id === chunk.id);
+    const idx = await db.knowledgeChunks.findIndex(k => k.id === chunk.id);
     if (idx === -1) return res.status(404).json({ error: 'Item not found.' });
 
-    db.knowledgeChunks.splice(idx, 1);
+    await db.knowledgeChunks.splice(idx, 1);
     removeEmbedding(chunk.id).catch(() => {});
     res.json({ success: true });
   }
-);
+));
 
 // =========================================
 // 5. APPOINTMENTS
 // =========================================
 
-router.get('/appointments', requireAuth, requireTenantScope, (req: Request, res: Response) => {
+router.get('/appointments', requireAuth, requireTenantScope, asyncHandler(async (req: Request, res: Response) => {
   const { date, status } = req.query;
   const businessId = res.locals.businessId as string | null;
-  let apps = businessId ? db.appointments.filter(a => a.businessId === businessId) : db.appointments.toJSON();
+  let apps = businessId ? await db.appointments.filter(a => a.businessId === businessId) : await db.appointments.toJSON();
 
   if (date) apps = apps.filter(a => a.date === date);
   if (status) apps = apps.filter(a => a.status === status);
 
   res.json(paginate(apps, req, res));
-});
+}));
 
-router.post('/appointments', requireAuth, requireTenantScope, async (req: Request, res: Response) => {
+router.post('/appointments', requireAuth, requireTenantScope, asyncHandler(async (req: Request, res: Response) => {
   const { serviceId, customerName, customerPhone, date, startTime, notes } = req.body;
   const businessId = res.locals.businessId as string | null;
   if (!businessId) return res.status(400).json({ error: 'Invalid businessId.' });
@@ -932,15 +933,15 @@ router.post('/appointments', requireAuth, requireTenantScope, async (req: Reques
     return res.status(409).json({ error: result.error });
   }
   // The tool records the appointment; return the full record for the dashboard.
-  const created = db.appointments.find(a => a.id === result.data?.appointmentId);
+  const created = await db.appointments.find(a => a.id === result.data?.appointmentId);
   res.status(201).json(created ?? result.data);
-});
+}));
 
 router.put(
   '/appointments/:id',
   requireAuth,
   requireResourceAccess(req => db.appointments.find(a => a.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const app = res.locals.resource as Appointment;
     // Whitelist mutable fields only. NEVER Object.assign(req.body) — that would
     // let a caller overwrite id/businessId/serviceId (tenant-isolation bypass /
@@ -951,10 +952,10 @@ router.put(
       app.status = status as Appointment['status'];
     }
     if (typeof notes === 'string') app.notes = notes.slice(0, 1000);
-    db.appointments.update(app);
+    await db.appointments.update(app);
 
     if (status === 'CANCELLED') {
-      db.auditLogs.push({
+      await db.auditLogs.push({
         id: `log-${Date.now()}`,
         businessId: app.businessId,
         action: 'APPOINTMENT_CANCELLED',
@@ -964,19 +965,19 @@ router.put(
     }
     res.json(app);
   }
-);
+));
 
 // =========================================
 // 6. PRODUCTS & ORDERS
 // =========================================
 
-router.get('/products', requireAuth, requireTenantScope, (req: Request, res: Response) => {
+router.get('/products', requireAuth, requireTenantScope, asyncHandler(async (req: Request, res: Response) => {
   const businessId = res.locals.businessId as string | null;
-  const items = businessId ? db.products.filter(p => p.businessId === businessId) : db.products.toJSON();
+  const items = businessId ? await db.products.filter(p => p.businessId === businessId) : await db.products.toJSON();
   res.json(paginate(items, req, res));
-});
+}));
 
-router.post('/products', requireAuth, requireTenantScope, (req: Request, res: Response) => {
+router.post('/products', requireAuth, requireTenantScope, asyncHandler(async (req: Request, res: Response) => {
   const { name, sku, price, inventory, description, category } = req.body;
   const businessId = res.locals.businessId as string | null;
   if (!businessId) return res.status(400).json({ error: 'Invalid businessId.' });
@@ -1001,8 +1002,8 @@ router.post('/products', requireAuth, requireTenantScope, (req: Request, res: Re
     description: typeof description === 'string' ? description.slice(0, 2000) : '',
     category: category ? String(category).slice(0, 100) : 'General'
   };
-  db.products.push(prod);
-  db.auditLogs.push({
+  await db.products.push(prod);
+  await db.auditLogs.push({
     id: `log-${Date.now()}`,
     businessId,
     action: 'PRODUCT_CREATED',
@@ -1010,58 +1011,58 @@ router.post('/products', requireAuth, requireTenantScope, (req: Request, res: Re
     timestamp: new Date().toISOString()
   });
   res.status(201).json(prod);
-});
+}));
 
-router.get('/orders', requireAuth, requireTenantScope, (req: Request, res: Response) => {
+router.get('/orders', requireAuth, requireTenantScope, asyncHandler(async (req: Request, res: Response) => {
   const businessId = res.locals.businessId as string | null;
-  const orders = businessId ? db.orders.filter(o => o.businessId === businessId) : db.orders.toJSON();
+  const orders = businessId ? await db.orders.filter(o => o.businessId === businessId) : await db.orders.toJSON();
   res.json(paginate(orders, req, res));
-});
+}));
 
 // =========================================
 // 7. CONVERSATIONS & HUMAN HANDOFF
 // =========================================
 
-router.get('/conversations', requireAuth, requireTenantScope, (req: Request, res: Response) => {
+router.get('/conversations', requireAuth, requireTenantScope, asyncHandler(async (req: Request, res: Response) => {
   const businessId = res.locals.businessId as string | null;
-  const convs = businessId ? db.conversations.filter(c => c.businessId === businessId) : db.conversations.toJSON();
+  const convs = businessId ? await db.conversations.filter(c => c.businessId === businessId) : await db.conversations.toJSON();
   res.json(paginate(convs, req, res));
-});
+}));
 
 // Get a single conversation by id (tenant-scoped via requireResourceAccess).
 router.get(
   '/conversations/:id',
   requireAuth,
   requireResourceAccess(req => db.conversations.find(c => c.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     res.json(res.locals.resource);
   }
-);
+));
 
 router.get(
   '/conversations/:id/messages',
   requireAuth,
   requireResourceAccess(req => db.conversations.find(c => c.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const conv = res.locals.resource as { id: string };
-    const msgs = db.messages.filter(m => m.conversationId === conv.id);
+    const msgs = await db.messages.filter(m => m.conversationId === conv.id);
     res.json(paginate(msgs, req, res));
   }
-);
+));
 
 // Human Agent Takeover endpoint
 router.post(
   '/conversations/:id/takeover',
   requireAuth,
   requireResourceAccess(req => db.conversations.find(c => c.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const conv = res.locals.resource as Conversation;
 
     conv.status = 'HUMAN_HANDLING';
     conv.handoffStartedAt = new Date().toISOString();
-    db.conversations.update(conv);
+    await db.conversations.update(conv);
 
-    db.messages.push({
+    await db.messages.push({
       id: `msg-${Date.now()}-system`,
       conversationId: conv.id,
       sender: 'system',
@@ -1070,7 +1071,7 @@ router.post(
       timestamp: new Date().toISOString()
     });
 
-    db.auditLogs.push({
+    await db.auditLogs.push({
       id: `log-${Date.now()}`,
       businessId: conv.businessId,
       action: 'HUMAN_HANDOFF_ACCEPTED',
@@ -1080,14 +1081,14 @@ router.post(
 
     res.json({ success: true, conversation: conv });
   }
-);
+));
 
 // Send Human Agent Message directly
 router.post(
   '/conversations/:id/message',
   requireAuth,
   requireResourceAccess(req => db.conversations.find(c => c.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const conv = res.locals.resource as any;
 
     const { content } = req.body;
@@ -1102,44 +1103,44 @@ router.post(
       timestamp: new Date().toISOString()
     };
 
-    db.messages.push(msg);
+    await db.messages.push(msg);
     conv.lastMessageAt = new Date().toISOString();
-    db.conversations.update(conv);
+    await db.conversations.update(conv);
 
     res.json(msg);
   }
-);
+));
 
 // Resolve Conversation
 router.post(
   '/conversations/:id/resolve',
   requireAuth,
   requireResourceAccess(req => db.conversations.find(c => c.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const conv = res.locals.resource as Conversation;
 
     conv.status = 'RESOLVED';
     conv.resolvedAt = new Date().toISOString();
-    db.conversations.update(conv);
+    await db.conversations.update(conv);
     res.json(conv);
   }
-);
+));
 
 // Resume AI: re-enable the agent on a resolved/handed-off conversation.
 router.post(
   '/conversations/:id/resume',
   requireAuth,
   requireResourceAccess(req => db.conversations.find(c => c.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const conv = res.locals.resource as Conversation;
     // Only allow resuming from RESOLVED or HUMAN_HANDLING.
     if (conv.status !== 'RESOLVED' && conv.status !== 'HUMAN_HANDLING' && conv.status !== 'WAITING_FOR_HUMAN') {
       return res.status(400).json({ error: `Cannot resume a conversation in ${conv.status}.` });
     }
     conv.status = 'AI_HANDLING';
-    db.conversations.update(conv);
+    await db.conversations.update(conv);
 
-    db.messages.push({
+    await db.messages.push({
       id: `msg-${Date.now()}-system`,
       conversationId: conv.id,
       sender: 'system',
@@ -1150,23 +1151,23 @@ router.post(
 
     res.json({ success: true, conversation: conv });
   }
-);
+));
 
 // =========================================
 // 8. CHANNELS & INTEGRATIONS
 // =========================================
 
-router.get('/channels', requireAuth, requireTenantScope, (req: Request, res: Response) => {
+router.get('/channels', requireAuth, requireTenantScope, asyncHandler(async (req: Request, res: Response) => {
   const businessId = res.locals.businessId as string | null;
-  const chans = businessId ? db.channels.filter(c => c.businessId === businessId) : db.channels.toJSON();
+  const chans = businessId ? await db.channels.filter(c => c.businessId === businessId) : await db.channels.toJSON();
   res.json(chans);
-});
+}));
 
 router.put(
   '/channels/:id',
   requireAuth,
   requireResourceAccess(req => db.channels.find(c => c.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const chan = res.locals.resource as any;
 
     const { status, details, configData } = req.body;
@@ -1174,9 +1175,9 @@ router.put(
     if (details) chan.details = details;
     if (configData) chan.configData = configData;
     chan.updatedAt = new Date().toISOString();
-    db.channels.update(chan);
+    await db.channels.update(chan);
 
-    db.auditLogs.push({
+    await db.auditLogs.push({
       id: `log-${Date.now()}`,
       businessId: chan.businessId,
       action: 'CHANNEL_UPDATED',
@@ -1186,14 +1187,14 @@ router.put(
 
     res.json(chan);
   }
-);
+));
 
-router.get('/integrations', requireAuth, requireTenantScope, (req: Request, res: Response) => {
+router.get('/integrations', requireAuth, requireTenantScope, asyncHandler(async (req: Request, res: Response) => {
   const businessId = res.locals.businessId as string | null;
-  const items = businessId ? db.integrations.filter(i => i.businessId === businessId) : db.integrations.toJSON();
+  const items = businessId ? await db.integrations.filter(i => i.businessId === businessId) : await db.integrations.toJSON();
   // Never leak credentials. configData holds only non-secret config.
   res.json(items.map(sanitizeIntegrationForClient));
-});
+}));
 
 /**
  * Update an integration's NON-SECRET configData only.
@@ -1206,7 +1207,7 @@ router.put(
   '/integrations/:id',
   requireAuth,
   requireResourceAccess(req => db.integrations.find(i => i.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const integ = res.locals.resource as any;
     const { configData } = req.body;
     // Only non-secret configData is accepted; never `state`/`connected`.
@@ -1214,10 +1215,10 @@ router.put(
       integ.configData = { ...integ.configData, ...configData };
     }
     integ.updatedAt = new Date().toISOString();
-    db.integrations.update(integ);
+    await db.integrations.update(integ);
     res.json(sanitizeIntegrationForClient(integ));
   }
-);
+));
 
 /**
  * Submit credentials for an integration (server-side only). Stores them in
@@ -1228,7 +1229,7 @@ router.post(
   '/integrations/:id/credentials',
   requireAuth,
   requireResourceAccess(req => db.integrations.find(i => i.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const integ = res.locals.resource as any;
     const credentials = req.body?.credentials;
     if (!credentials || typeof credentials !== 'object' || Array.isArray(credentials)) {
@@ -1240,9 +1241,9 @@ router.post(
     integ.lastError = undefined;
     integ.statusMessage = 'Credentials received — pending validation.';
     integ.updatedAt = new Date().toISOString();
-    db.integrations.update(integ);
+    await db.integrations.update(integ);
 
-    db.auditLogs.push({
+    await db.auditLogs.push({
       id: `log-${Date.now()}`,
       businessId: integ.businessId,
       action: 'INTEGRATION_CREDENTIALS_SET',
@@ -1252,7 +1253,7 @@ router.post(
 
     res.json({ id: integ.id, state: integ.state, statusMessage: integ.statusMessage });
   }
-);
+));
 
 /**
  * Validate an integration against the real provider. This is the ONLY path to
@@ -1262,7 +1263,7 @@ router.post(
   '/integrations/:id/validate',
   requireAuth,
   requireResourceAccess(req => db.integrations.find(i => i.id === req.params.id)),
-  async (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const integ = res.locals.resource as any;
     const provider = getProvider(integ.provider);
     const credentials = getCredentials(integ.id) || {};
@@ -1278,9 +1279,9 @@ router.post(
       integ.configData = { ...(integ.configData || {}), ...outcome.meta };
     }
     if (outcome.state === 'CONNECTED') integ.lastSync = new Date().toISOString();
-    db.integrations.update(integ);
+    await db.integrations.update(integ);
 
-    db.auditLogs.push({
+    await db.auditLogs.push({
       id: `log-${Date.now()}`,
       businessId: integ.businessId,
       action: outcome.state === 'CONNECTED' ? 'INTEGRATION_CONNECTED' : 'INTEGRATION_VALIDATION_FAILED',
@@ -1290,14 +1291,14 @@ router.post(
 
     res.json({ id: integ.id, state: integ.state, statusMessage: integ.statusMessage, lastError: integ.lastError });
   }
-);
+));
 
 /** Disconnect an integration (clears stored credentials, state=DISCONNECTED). */
 router.post(
   '/integrations/:id/disconnect',
   requireAuth,
   requireResourceAccess(req => db.integrations.find(i => i.id === req.params.id)),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const integ = res.locals.resource as any;
     clearCredentials(integ.id);
     integ.credentialsSet = false;
@@ -1305,46 +1306,47 @@ router.post(
     integ.statusMessage = 'Disconnected by operator.';
     integ.lastError = undefined;
     integ.updatedAt = new Date().toISOString();
-    db.integrations.update(integ);
+    await db.integrations.update(integ);
     res.json({ id: integ.id, state: integ.state, statusMessage: integ.statusMessage });
   }
-);
+));
 
 // =========================================
 // 9. ANALYTICS & TEMPLATES
 // =========================================
 
 // Cross-tenant aggregate — PLATFORM_OWNER only.
-router.get('/analytics/overview', requireAuth, requireRole('PLATFORM_OWNER'), (req: Request, res: Response) => {
-  const totalBusinesses = db.businesses.length;
-  const activeAgents = db.agents.filter(a => a.status === 'ACTIVE').length;
-  const totalConversations = db.conversations.length;
-  const totalAppointments = db.appointments.length;
-  const totalOrders = db.orders.length;
+router.get('/analytics/overview', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  const totalBusinesses = await db.businesses.length();
+  const activeAgentsArr = await db.agents.filter(a => a.status === 'ACTIVE');
+  const activeAgents = activeAgentsArr.length;
+  const totalConversations = await db.conversations.length();
+  const totalAppointments = await db.appointments.length();
+  const totalOrders = await db.orders.length();
   
-  const totalTokens = db.usageRecords.reduce((acc, u) => acc + u.tokensUsed, 0);
-  const totalEstimatedCostUsd = db.usageRecords.reduce((acc, u) => acc + u.estimatedCostUsd, 0);
+  const totalTokens = await db.usageRecords.reduce((acc, u) => acc + u.tokensUsed, 0);
+  const totalEstimatedCostUsd = await db.usageRecords.reduce((acc, u) => acc + u.estimatedCostUsd, 0);
 
   res.json({
     totalBusinesses,
     activeAgents,
-    inactiveAgents: db.agents.length - activeAgents,
+    inactiveAgents: (await db.agents.length()) - activeAgents,
     totalConversations,
     totalAppointments,
     totalOrders,
     totalTokens,
     totalEstimatedCostUsd,
-    recentActivity: db.auditLogs.slice(-10).reverse()
+    recentActivity: (await db.auditLogs.slice(-10)).reverse()
   });
-});
+}));
 
 // Global UI data (industry templates) — authenticated users only.
-router.get('/templates', requireAuth, (req: Request, res: Response) => {
-  res.json(db.templates);
-});
+router.get('/templates', requireAuth, asyncHandler(async (req: Request, res: Response) => {
+  res.json(await db.templates.toJSON());
+}));
 
 // Audit logs — platform owner sees all; business users see only their own.
-router.get('/audit-logs', requireAuth, (req: Request, res: Response) => {
+router.get('/audit-logs', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { businessId } = req.query;
   const user = res.locals.user as User;
 
@@ -1352,15 +1354,15 @@ router.get('/audit-logs', requireAuth, (req: Request, res: Response) => {
     if (user.role !== 'PLATFORM_OWNER' && String(businessId) !== user.businessId) {
       return res.status(404).json({ error: 'Not found.' });
     }
-    const logs = db.auditLogs.filter(l => l.businessId === businessId).reverse();
+    const logs = (await db.auditLogs.filter(l => l.businessId === businessId)).reverse();
     return res.json(paginate(logs, req, res));
   }
   const logs = (user.role === 'PLATFORM_OWNER'
-    ? db.auditLogs.toJSON()
-    : db.auditLogs.filter(l => l.businessId === user.businessId)
+    ? await db.auditLogs.toJSON()
+    : await db.auditLogs.filter(l => l.businessId === user.businessId)
   ).reverse();
   res.json(paginate(logs, req, res));
-});
+}));
 
 // 404 catch-all for unmatched /api/* routes. Without this, unmatched API paths
 // fall through to the SPA catch-all in server.ts and return index.html, which

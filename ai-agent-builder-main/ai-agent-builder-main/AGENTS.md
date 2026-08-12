@@ -76,11 +76,29 @@ Persistent memory for this repository. Read first when working on this project.
   (the runtime filters declarations before handing them to the model).
 
 ## Transactions
-better-sqlite3 is synchronous and serializes writes. Use
-`db.sqlite.transaction(() => {...})()` for check-then-insert atomicity
-(appointment overlap, inventory decrement). TS narrowing note: `.transaction`
-widens literal `ok` types, so use the `isFail()` type guard in tools.ts
-instead of `if (!r.ok)`.
+The DB layer is fully async. All `Collection` methods (`find`, `filter`, `push`,
+`update`, `length`, `toJSON`, etc.) return Promises — always `await` them.
+Transactions use the async wrapper `db.client.transaction(async () => {...})`
+(BEGIN/COMMIT/ROLLBACK). Do NOT use `db.sqlite.transaction()` (sync) — it cannot
+wrap async bodies and is deprecated.
+
+`SqliteClient.transaction` serializes concurrent transactions on a per-connection
+mutex (SQLite is single-writer and disallows nested BEGIN), so two awaited
+transactions under `Promise.all` run strictly one after another. This is what
+makes the overlap/oversell tests deterministic: the second transaction sees the
+first's committed write. `PostgresClient.transaction` checks out a dedicated
+pool client per transaction, so concurrent transactions run in parallel.
+
+TS narrowing note: `.transaction` widens literal `ok` types, so use the
+`isFail()` type guard in tools.ts instead of `if (!r.ok)`.
+
+## DB initialization
+The singleton `db` (`src/server/db.ts`) is constructed at import but NOT
+migrated/seeded until `await db.init()` runs. `server.ts` calls
+`await db.init()` at startup. Tests that import the singleton must call
+`await db.init()` in `beforeAll` (and `await db.close()` in `afterAll`) before
+touching the routes. Constructing `new AppDatabase({...})` directly also
+requires `await instance.init({ seed })` before use.
 
 ## Commands
 - `npm run dev` — dev server (tsx, with Vite middleware)
@@ -94,8 +112,8 @@ instead of `if (!r.ok)`.
 - `PORT` (default 12000 dev / 12000 prod)
 - `DB_PATH` (default `./data/app.db`)
 - `SESSION_SECRET` — REQUIRED in production for signing session cookies.
-  In dev a random per-process secret is generated. If missing in prod, the
-  server starts but login returns a clean JSON 500 (not a crash).
+  In dev a fixed fallback secret is used. If missing in prod, login returns a
+  clean JSON 500 (per-request; the server still starts).
 - `GEMINI_API_KEY` — optional; runtime degrades gracefully.
 - Optional integrations (Google/Meta/Twilio/Voice) — not yet wired; must NOT
   block startup when absent.

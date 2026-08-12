@@ -39,6 +39,7 @@ let apptBId = '';
 let apptBServiceId = '';
 
 beforeAll(async () => {
+  await db.init();
   const login = await owner.post('/api/auth/login').send({ email: 'owner@agentfactory.io', password: 'Password123!' });
   expect(login.status).toBe(200);
 
@@ -65,7 +66,7 @@ beforeAll(async () => {
   apptBId = apptRes.body.id;
 });
 
-afterAll(() => { db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
+afterAll(async () => { await db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
 describe('PUT /api/appointments/:id mass-assignment guard', () => {
   it('ignores attempts to overwrite businessId / id / serviceId', async () => {
@@ -82,7 +83,7 @@ describe('PUT /api/appointments/:id mass-assignment guard', () => {
     expect(r.body.serviceId).toBe(apptBServiceId);
     expect(r.body.status).toBe('CANCELLED');
     // The DB record must not have moved tenants.
-    const stored = db.appointments.find(a => a.id === apptBId);
+    const stored = await db.appointments.find(a => a.id === apptBId);
     expect(stored?.businessId).toBe(bizBId);
   });
 

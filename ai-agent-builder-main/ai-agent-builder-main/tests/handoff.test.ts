@@ -39,10 +39,11 @@ const platformAgent = request.agent(app);
 const tonyAgent = request.agent(app);
 
 beforeAll(async () => {
+  await db.init();
   await platformAgent.post('/api/auth/login').send({ email: 'owner@agentfactory.io', password: 'Password123!' });
   await tonyAgent.post('/api/auth/login').send({ email: 'tony@tonysbarber.com', password: 'Password123!' });
 });
-afterAll(() => { db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
+afterAll(async () => { await db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
 describe('human handoff lifecycle', () => {
   it('transfer_to_human sets WAITING_FOR_HUMAN and captures reason + timestamp', async () => {

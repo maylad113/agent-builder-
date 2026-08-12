@@ -78,8 +78,8 @@ function verifyMetaSignature(rawBody: string | Buffer, signatureHeader: string |
  * This is the ONLY way an inbound Meta event reaches a business — the page id in
  * the payload is matched server-side, never trusting any client-supplied tenant.
  */
-function resolveBusinessByMetaPageId(pageId: string): { businessId: string; integrationId: string } | null {
-  for (const integ of db.integrations.toJSON()) {
+async function resolveBusinessByMetaPageId(pageId: string): Promise<{ businessId: string; integrationId: string } | null> {
+  for (const integ of await db.integrations.toJSON()) {
     if (integ.provider !== 'meta_instagram') continue;
     const cfg = integ.configData || {};
     if (cfg.pageId === pageId || cfg.igUserId === pageId) {
@@ -175,7 +175,7 @@ webhookRouter.post('/meta', rawBodyParser, async (req: Request, res: Response) =
       if (isDuplicate(messageId)) continue;
 
       // Resolve the business from the page id the message was sent TO.
-      const resolved = resolveBusinessByMetaPageId(recipientId);
+      const resolved = await resolveBusinessByMetaPageId(recipientId);
       if (!resolved) continue; // no business owns this page -> drop silently
 
       const creds = getCredentials(resolved.integrationId) || {};
@@ -228,10 +228,10 @@ function verifyTwilioSignature(url: string, params: Record<string, string>, sign
 }
 
 /** Resolve a business by the Twilio phone number the inbound call/SMS reached. */
-function resolveBusinessByPhoneNumber(phone: string): { businessId: string; integrationId: string } | null {
+async function resolveBusinessByPhoneNumber(phone: string): Promise<{ businessId: string; integrationId: string } | null> {
   if (!phone) return null;
   const norm = phone.replace(/\D/g, '');
-  for (const integ of db.integrations.toJSON()) {
+  for (const integ of await db.integrations.toJSON()) {
     if (integ.provider !== 'twilio_sms') continue;
     const cfg = integ.configData || {};
     const cfgNum = (cfg.phoneNumber || '').replace(/\D/g, '');
@@ -311,7 +311,7 @@ webhookRouter.post('/twilio', twilioFormParser, async (req: Request, res: Respon
     // Idempotency on the provider message id.
     if (isDuplicate(messageSid)) return res.status(200).type('text/xml').send('<Response/>');
 
-    const resolved = resolveBusinessByPhoneNumber(toNumber);
+    const resolved = await resolveBusinessByPhoneNumber(toNumber);
     if (!resolved) return res.status(200).type('text/xml').send('<Response/>');
     if (isOptedOut(resolved.businessId, fromNumber)) {
       // Honour opt-out: never reply to a customer who opted out.
@@ -353,14 +353,14 @@ webhookRouter.post('/twilio', twilioFormParser, async (req: Request, res: Respon
       return res.status(200).type('text/xml').send('<Response/>');
     }
 
-    const resolved = resolveBusinessByPhoneNumber(toNumber);
+    const resolved = await resolveBusinessByPhoneNumber(toNumber);
     if (!resolved) return res.status(200).type('text/xml').send('<Response/>');
     if (isOptedOut(resolved.businessId, fromNumber)) {
       return res.status(200).type('text/xml').send('<Response/>');
     }
 
     // Create/update the customer record for this caller (tenant-scoped).
-    let customer = db.customers.find(c => c.businessId === resolved.businessId && c.phone === fromNumber);
+    let customer = await db.customers.find(c => c.businessId === resolved.businessId && c.phone === fromNumber);
     if (!customer) {
       customer = {
         id: `cust-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -369,7 +369,7 @@ webhookRouter.post('/twilio', twilioFormParser, async (req: Request, res: Respon
         phone: fromNumber,
         createdAt: new Date().toISOString(),
       };
-      db.customers.push(customer);
+      await db.customers.push(customer);
     }
 
     // Trigger the missed-call follow-up via the agent (template-driven intro).

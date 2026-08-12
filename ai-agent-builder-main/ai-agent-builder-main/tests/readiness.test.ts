@@ -32,10 +32,11 @@ const platformAgent = request.agent(app);
 const tonyAgent = request.agent(app);
 
 beforeAll(async () => {
+  await db.init();
   await platformAgent.post('/api/auth/login').send({ email: 'owner@agentfactory.io', password: 'Password123!' });
   await tonyAgent.post('/api/auth/login').send({ email: 'tony@tonysbarber.com', password: 'Password123!' });
 });
-afterAll(() => { db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
+afterAll(async () => { await db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
 describe('agent readiness gate', () => {
   it('blocks ACTIVE when critical requirements are missing and reports them', async () => {

@@ -37,10 +37,11 @@ const platformAgent = request.agent(app);
 const tonyAgent = request.agent(app);
 
 beforeAll(async () => {
+  await db.init();
   await platformAgent.post('/api/auth/login').send({ email: 'owner@agentfactory.io', password: 'Password123!' });
   await tonyAgent.post('/api/auth/login').send({ email: 'tony@tonysbarber.com', password: 'Password123!' });
 });
-afterAll(() => { db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
+afterAll(async () => { await db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
 describe('knowledge retrieval (RAG)', () => {
   it('keyword retrieval returns matching chunks for the owning tenant', async () => {

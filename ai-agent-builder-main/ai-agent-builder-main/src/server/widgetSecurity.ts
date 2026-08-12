@@ -14,9 +14,9 @@ import { db } from './db';
 
 const LOCALHOST_RE = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
 
-export function isOriginAllowed(businessId: string, origin: string | undefined): boolean {
+export async function isOriginAllowed(businessId: string, origin: string | undefined): Promise<boolean> {
   if (!origin) return false;
-  const biz = db.businesses.find(b => b.id === businessId);
+  const biz = await db.businesses.find(b => b.id === businessId);
   if (!biz) return false;
 
   const allowed = biz.allowedWidgetOrigins;
@@ -37,8 +37,8 @@ export function isOriginAllowed(businessId: string, origin: string | undefined):
  * Build the per-request CORS headers for the widget endpoint, or null if the
  * origin is not allowed (caller returns 403).
  */
-export function widgetCorsHeaders(businessId: string, origin: string | undefined): Record<string, string> | null {
-  if (!isOriginAllowed(businessId, origin)) return null;
+export async function widgetCorsHeaders(businessId: string, origin: string | undefined): Promise<Record<string, string> | null> {
+  if (!(await isOriginAllowed(businessId, origin))) return null;
   return {
     'Access-Control-Allow-Origin': origin as string,
     'Vary': 'Origin',

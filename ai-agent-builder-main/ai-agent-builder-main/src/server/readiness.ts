@@ -35,12 +35,12 @@ export interface ReadinessResult {
   checks: ReadinessCheck[];
 }
 
-export function computeAgentReadiness(agent: Agent): ReadinessResult {
-  const biz = db.businesses.find(b => b.id === agent.businessId);
+export async function computeAgentReadiness(agent: Agent): Promise<ReadinessResult> {
+  const biz = await db.businesses.find(b => b.id === agent.businessId);
   const services = biz?.services ?? [];
-  const knowledge = db.knowledgeChunks.filter(k => k.businessId === agent.businessId);
-  const channels = db.channels.filter(c => c.businessId === agent.businessId);
-  const published = getPublishedVersion(agent.id);
+  const knowledge = await db.knowledgeChunks.filter(k => k.businessId === agent.businessId);
+  const channels = await db.channels.filter(c => c.businessId === agent.businessId);
+  const published = await getPublishedVersion(agent.id);
 
   const structured = agent.structuredConfig;
   const instructions = agent.systemPrompt || published?.systemPrompt || structured?.personality?.customPrompt;
@@ -113,8 +113,8 @@ export function computeAgentReadiness(agent: Agent): ReadinessResult {
 }
 
 /** Assert readiness for ACTIVE; throw an Error the route can return as 400. */
-export function assertActivatable(agent: Agent): ReadinessResult {
-  const result = computeAgentReadiness(agent);
+export async function assertActivatable(agent: Agent): Promise<ReadinessResult> {
+  const result = await computeAgentReadiness(agent);
   if (!result.ready) {
     const err: any = new Error('Agent is not ready for activation. Missing requirements: ' + result.missing.join(', '));
     err.readiness = result;
@@ -124,7 +124,7 @@ export function assertActivatable(agent: Agent): ReadinessResult {
 }
 
 /** GET-friendly snapshot (no secrets surfaced). */
-export function readinessSnapshot(agent: Agent): ReadinessResult {
+export async function readinessSnapshot(agent: Agent): Promise<ReadinessResult> {
   return computeAgentReadiness(agent);
 }
 

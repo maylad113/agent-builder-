@@ -17,7 +17,7 @@ const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentforge-api-'));
 process.env.DB_PATH = path.join(tmpDir, 'api.db');
 
 const { router } = await import('../src/server/routes');
-const { AppDatabase } = await import('../src/server/db');
+const { AppDatabase, db } = await import('../src/server/db');
 
 function makeApp() {
   const app = express();
@@ -30,6 +30,9 @@ const app = makeApp();
 const agent = request.agent(app);
 
 beforeAll(async () => {
+  // Initialize the shared DB singleton (migrations + seed) so the auth tables
+  // and demo tenant exist before login.
+  await db.init();
   const res = await agent.post('/api/auth/login').send({
     email: 'owner@agentfactory.io',
     password: 'Password123!'
@@ -94,18 +97,20 @@ describe('API over SQLite', () => {
 
     // Prove the write landed on disk: open a fresh connection to the same file.
     const fresh = new AppDatabase({ dbPath: process.env.DB_PATH, seed: false });
-    const onDisk = fresh.businesses.find(b => b.id === newId);
+    await fresh.init({ seed: false });
+    const onDisk = await fresh.businesses.find(b => b.id === newId);
     expect(onDisk?.name).toBe('API Created Shop');
     expect(onDisk?.services).toHaveLength(1);
-    expect(fresh.channels.filter(c => c.businessId === newId)).toHaveLength(4);
-    fresh.close();
+    expect(await fresh.channels.filter(c => c.businessId === newId)).toHaveLength(4);
+    await fresh.close();
 
     // PUT persists too.
     const putRes = await agent.put(`/api/businesses/${newId}`).send({ name: 'API Created Shop v2' });
     expect(putRes.status).toBe(200);
     const fresh2 = new AppDatabase({ dbPath: process.env.DB_PATH, seed: false });
-    expect(fresh2.businesses.find(b => b.id === newId)?.name).toBe('API Created Shop v2');
-    fresh2.close();
+    await fresh2.init({ seed: false });
+    expect((await fresh2.businesses.find(b => b.id === newId))?.name).toBe('API Created Shop v2');
+    await fresh2.close();
   });
 
   it('tenant filtering is applied server-side (businessId scoping)', async () => {

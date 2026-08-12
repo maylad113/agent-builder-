@@ -54,16 +54,16 @@ async function retrieveKnowledgeChunks(businessId: string, query: string): Promi
  * customer can never load another tenant's conversation by supplying its id —
  * the lookup requires both id AND businessId == tenantId.
  */
-function ensureConversation(params: { tenantId: string; conversationId?: string; customerName?: string; customerPhone?: string; }, business: { id: string; name: string; }, channel: ChannelType): import('../types').Conversation {
+async function ensureConversation(params: { tenantId: string; conversationId?: string; customerName?: string; customerPhone?: string; }, business: { id: string; name: string; }, channel: ChannelType): Promise<import('../types').Conversation> {
   const tenantId = params.tenantId;
   let conversation = params.conversationId
-    ? db.conversations.find(c => c.id === params.conversationId && c.businessId === tenantId)
+    ? await db.conversations.find(c => c.id === params.conversationId && c.businessId === tenantId)
     : null;
 
   if (!conversation) {
     const name = params.customerName || 'Customer';
     const phone = params.customerPhone || '+1000000000';
-    let customer = db.customers.find(c => c.businessId === tenantId && (c.phone === phone || c.name === name));
+    let customer = await db.customers.find(c => c.businessId === tenantId && (c.phone === phone || c.name === name));
     if (!customer) {
       customer = {
         id: `cust-${Date.now()}`,
@@ -72,7 +72,7 @@ function ensureConversation(params: { tenantId: string; conversationId?: string;
         phone,
         createdAt: new Date().toISOString()
       };
-      db.customers.push(customer);
+      await db.customers.push(customer);
     }
 
     conversation = {
@@ -87,7 +87,7 @@ function ensureConversation(params: { tenantId: string; conversationId?: string;
       lastMessageAt: new Date().toISOString(),
       createdAt: new Date().toISOString()
     };
-    db.conversations.push(conversation);
+    await db.conversations.push(conversation);
   }
   return conversation;
 }
@@ -112,7 +112,7 @@ export async function processAgentMessage(params: {
   const { tenantId, userMessage, channel = 'web_chat', simulator = !!params.versionId } = params;
 
   // 1. Resolve Tenant & Business Information
-  const business = db.businesses.find(b => b.id === tenantId);
+  const business = await db.businesses.find(b => b.id === tenantId);
   if (!business) {
     throw new Error(`Business not found for ID: ${tenantId}`);
   }
@@ -121,7 +121,7 @@ export async function processAgentMessage(params: {
   // Production conversations MUST use the PUBLISHED agent version. The simulator
   // (simulator=true, with an optional versionId) may use DRAFT/TESTING. We never
   // fall back to an arbitrary non-published agent in production.
-  const agent = db.agents.find(a => a.businessId === tenantId);
+  const agent = await db.agents.find(a => a.businessId === tenantId);
 
   if (!agent) {
     throw new Error(`No agent configured for business: ${business.name}`);
@@ -131,7 +131,7 @@ export async function processAgentMessage(params: {
   // agent must not serve real customers — escalate to a human instead. The
   // simulator bypasses this so owners can test non-active agents.
   if (!simulator && agent.status !== 'ACTIVE') {
-    const conv = ensureConversation(params, business, channel);
+    const conv = await ensureConversation(params, business, channel);
     return {
       reply: "I'm having trouble connecting to the assistant service right now. I've notified the team and someone will follow up with you shortly.",
       conversationId: conv.id,
@@ -160,18 +160,18 @@ export async function processAgentMessage(params: {
   let effectiveModel = agent.model;
   if (params.versionId) {
     const { getVersionForSim } = await import('./agentVersions');
-    const resolved = getVersionForSim(agent.id, params.versionId);
+    const resolved = await getVersionForSim(agent.id, params.versionId);
     effectiveSystemPrompt = resolved.systemPrompt;
     effectiveConfig = resolved.structuredConfig;
     effectiveModel = resolved.model;
   } else if (!simulator) {
     // PRODUCTION path: published version only.
     const { getPublishedVersion } = await import('./agentVersions');
-    const pub = getPublishedVersion(agent.id);
+    const pub = await getPublishedVersion(agent.id);
     if (!pub) {
       // No published version — refuse to serve customers. Return a graceful
       // human-escalation rather than the raw agent row (which may be a draft).
-      const conv = ensureConversation(params, business, channel);
+      const conv = await ensureConversation(params, business, channel);
       return {
         reply: "I'm having trouble connecting to the assistant service right now. I've notified the team and someone will follow up with you shortly.",
         conversationId: conv.id,
@@ -195,7 +195,7 @@ export async function processAgentMessage(params: {
   // 3. Resolve or Create Conversation (TENANT-SCOPED: a customer can never
   //    load another tenant's conversation by supplying its id — the lookup
   //    requires both id AND businessId == tenantId.)
-  const conversation = ensureConversation(params, business, channel);
+  const conversation = await ensureConversation(params, business, channel);
 
   // HUMAN HANDOFF GUARD: when a human team member has taken over (HUMAN_HANDLING)
   // or the conversation is resolved, the AI must NOT autonomously answer. The
@@ -204,7 +204,7 @@ export async function processAgentMessage(params: {
   if (conversation.status === 'HUMAN_HANDLING') {
     const holdingReply =
       'A team member is currently handling our conversation and will reply to you shortly. Thank you for your patience.';
-    db.messages.push({
+    await db.messages.push({
       id: `msg-${Date.now()}-agent`,
       conversationId: conversation.id,
       sender: 'system',
@@ -213,7 +213,7 @@ export async function processAgentMessage(params: {
       timestamp: new Date().toISOString()
     });
     conversation.lastMessageAt = new Date().toISOString();
-    db.conversations.update(conversation);
+    await db.conversations.update(conversation);
     return {
       reply: holdingReply,
       conversationId: conversation.id,
@@ -250,7 +250,7 @@ export async function processAgentMessage(params: {
   }
 
   // Save incoming customer message
-  db.messages.push({
+  await db.messages.push({
     id: `msg-${Date.now()}-user`,
     conversationId: conversation.id,
     sender: 'customer',
@@ -291,8 +291,8 @@ CRITICAL MANDATES:
 4. Keep answers clear, helpful, and polite.`;
 
   // 6. Build History from Conversation Messages
-  const existingMsgs = db.messages
-    .filter(m => m.conversationId === conversation.id)
+  const existingMsgs = (await db.messages
+    .filter(m => m.conversationId === conversation.id))
     .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
 
   // Convert to Gemini API contents structure
@@ -426,10 +426,10 @@ CRITICAL MANDATES:
   // Update conversation record
   conversation.lastMessageAt = new Date().toISOString();
   conversation.summary = `Last exchange: "${userMessage.substring(0, 30)}..." -> "${finalReply.substring(0, 30)}..."`;
-  db.conversations.update(conversation);
+  await db.conversations.update(conversation);
 
   // Store Agent Reply Message
-  db.messages.push({
+  await db.messages.push({
     id: `msg-${Date.now()}-agent`,
     conversationId: conversation.id,
     sender: 'agent',
@@ -443,7 +443,7 @@ CRITICAL MANDATES:
   // Aggregate per business per day; agent/model/provider recorded for later
   // per-conversation breakdown.
   const todayStr = new Date().toISOString().split('T')[0];
-  let usage = db.usageRecords.find(u => u.businessId === tenantId && u.date === todayStr);
+  let usage = await db.usageRecords.find(u => u.businessId === tenantId && u.date === todayStr);
   if (!usage) {
     usage = {
       id: `usr-${Date.now()}`,
@@ -458,7 +458,7 @@ CRITICAL MANDATES:
       outputTokens: 0,
       provider: 'google'
     };
-    db.usageRecords.push(usage);
+    await db.usageRecords.push(usage);
   }
   usage.tokensUsed += tokensUsed;
   usage.inputTokens = (usage.inputTokens ?? 0) + usedInputTokens;
@@ -472,7 +472,7 @@ CRITICAL MANDATES:
     || (tokensUsed / 1000) * 0.0001;
   usage.requestsCount += 1;
   if (!usage.model) usage.model = usedModel;
-  db.usageRecords.update(usage);
+  await db.usageRecords.update(usage);
 
   return {
     reply: finalReply,

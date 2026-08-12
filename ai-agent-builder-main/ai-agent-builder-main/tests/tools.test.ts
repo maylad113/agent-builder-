@@ -54,10 +54,13 @@ function nextSunday(): string {
 }
 const SUNDAY_DATE = nextSunday();
 
-afterAll(() => {
-  db.close();
+afterAll(async () => {
+  await db.close();
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
+
+// Initialize the singleton DB (migrations + seed) before any tool runs.
+beforeAll(async () => { await db.init(); });
 
 describe('book_appointment: honest failure + duration + business hours', () => {
   it('reports failure (not success) when the service does not exist', async () => {
@@ -71,8 +74,8 @@ describe('book_appointment: honest failure + duration + business hours', () => {
     expect(r.success).toBe(false);
     expect(r.error).toContain('not found');
     // Nothing was booked.
-    const before = db.appointments.filter(a => a.businessId === TENANT).length;
-    const after = db.appointments.filter(a => a.businessId === TENANT).length;
+    const before = (await db.appointments.filter(a => a.businessId === TENANT)).length;
+    const after = (await db.appointments.filter(a => a.businessId === TENANT)).length;
     expect(after).toBe(before);
   });
 
@@ -110,7 +113,7 @@ describe('book_appointment: honest failure + duration + business hours', () => {
     }, { tenantId: TENANT });
     expect(r.success).toBe(true);
     expect(r.data.time).toBe('14:00 - 14:30'); // 30-min service
-    const created = db.appointments.find(a => a.id === r.data.appointmentId);
+    const created = await db.appointments.find(a => a.id === r.data.appointmentId);
     expect(created.endTime).toBe('14:30');
   });
 });
@@ -142,7 +145,7 @@ describe('book_appointment: concurrent overlap prevention (#5)', () => {
     expect(failure.error).toMatch(/overlap|already booked/i);
 
     // And exactly one appointment row exists for that start time.
-    const rows = db.appointments.filter(
+    const rows = await db.appointments.filter(
       a => a.businessId === TENANT && a.date === date && a.startTime === startTime && a.status !== 'CANCELLED'
     );
     expect(rows).toHaveLength(1);
@@ -185,8 +188,8 @@ describe('create_order: concurrency + inventory (#6, #12)', () => {
   // Seed a product with exactly 1 unit of stock for the tenant.
   const productId = 'prod-test-oversell';
 
-  beforeAll(() => {
-    db.products.push({
+  beforeAll(async () => {
+    await db.products.push({
       id: productId,
       businessId: TENANT,
       name: 'Limited Pomade',
@@ -216,10 +219,10 @@ describe('create_order: concurrency + inventory (#6, #12)', () => {
     expect(failure.error).toMatch(/insufficient stock|inventory/i);
 
     // Inventory must never go negative.
-    const prod = db.products.find(p => p.id === productId)!;
+    const prod = (await db.products.find(p => p.id === productId))!;
     expect(prod.inventory).toBe(0);
     // Exactly one order references this product.
-    const orders = db.orders.filter(
+    const orders = await db.orders.filter(
       o => o.businessId === TENANT && o.items.some(i => i.productId === productId)
     );
     expect(orders).toHaveLength(1);
@@ -227,9 +230,9 @@ describe('create_order: concurrency + inventory (#6, #12)', () => {
 
   it('rejects an order with quantity exceeding stock (no oversell, honest error)', async () => {
     // Reset stock to 2 for this case.
-    const prod = db.products.find(p => p.id === productId)!;
+    const prod = (await db.products.find(p => p.id === productId))!;
     prod.inventory = 2;
-    db.products.update(prod);
+    await db.products.update(prod);
 
     const r = await executeAgentTool('create_order', {
       customerName: 'Greedy', customerPhone: '+10000000102',
@@ -238,7 +241,7 @@ describe('create_order: concurrency + inventory (#6, #12)', () => {
     expect(r.success).toBe(false);
     expect(r.error).toMatch(/insufficient stock/i);
     // Stock unchanged.
-    expect(db.products.find(p => p.id === productId)!.inventory).toBe(2);
+    expect((await db.products.find(p => p.id === productId))!.inventory).toBe(2);
   });
 });
 

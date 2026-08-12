@@ -40,6 +40,7 @@ let unpublishedBizId = '';
 let unpublishedAgentId = '';
 
 beforeAll(async () => {
+  await db.init();
   await platformAgent.post('/api/auth/login').send({ email: 'owner@agentfactory.io', password: 'Password123!' });
 
   // Create a fresh business with NO published agent.
@@ -54,9 +55,9 @@ beforeAll(async () => {
   unpublishedBizId = biz.body.id;
 
   // Allow-list localhost so the widget POST is allowed in test env.
-  const bizRow = db.businesses.find(b => b.id === unpublishedBizId)!;
+  const bizRow = (await db.businesses.find(b => b.id === unpublishedBizId))!;
   bizRow.allowedWidgetOrigins = ['http://localhost:5173'];
-  db.businesses.update(bizRow);
+  await db.businesses.update(bizRow);
 
   // Create an agent (this creates an initial DRAFT version, NOT published).
   const agentRes = await platformAgent.post('/api/agents').send({
@@ -73,7 +74,7 @@ beforeAll(async () => {
   expect(published.length).toBe(0);
 });
 
-afterAll(() => { db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
+afterAll(async () => { await db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
 describe('published-version enforcement (P1.3)', () => {
   it('public chat with no published version escalates (never serves draft)', async () => {

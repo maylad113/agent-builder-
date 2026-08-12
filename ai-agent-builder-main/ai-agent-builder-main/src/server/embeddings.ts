@@ -83,19 +83,26 @@ export interface StoredEmbedding {
   hash: string;
 }
 
-function loadRow(r: any): StoredEmbedding | null {
-  if (!r) return null;
+async function loadRow(r: any): Promise<StoredEmbedding | null> {
+  // r.vector is TEXT (JSON string) on SQLite or JSONB (already-parsed array)
+  // on PostgreSQL. Normalize to number[].
   let vec: number[];
-  try { vec = JSON.parse(r.vector); } catch { return null; }
+  if (typeof r.vector === 'string') {
+    try { vec = JSON.parse(r.vector); } catch { return null; }
+  } else if (Array.isArray(r.vector)) {
+    vec = r.vector;
+  } else {
+    return null;
+  }
   return { chunkId: r.chunk_id, businessId: r.business_id, vector: vec, hash: r.hash };
 }
 
 async function allEmbeddings(): Promise<StoredEmbedding[]> {
   const db = await getDb();
-  const rows = db.sqlite.prepare('SELECT chunk_id, business_id, vector, hash FROM knowledge_embeddings').all() as any[];
+  const res = await db.client.query('SELECT chunk_id, business_id, vector, hash FROM knowledge_embeddings');
   const out: StoredEmbedding[] = [];
-  for (const r of rows) {
-    const e = loadRow(r);
+  for (const r of res.rows) {
+    const e = await loadRow(r);
     if (e) out.push(e);
   }
   return out;
@@ -105,29 +112,25 @@ async function allEmbeddings(): Promise<StoredEmbedding[]> {
 export async function indexChunk(chunk: KnowledgeChunk): Promise<void> {
   const db = await getDb();
   const hash = contentHash(chunk.title + '\n' + chunk.content);
-  const existing = db.sqlite.prepare('SELECT hash FROM knowledge_embeddings WHERE chunk_id = ?').get(chunk.id) as { hash: string } | undefined;
+  const existingRes = await db.client.query('SELECT hash FROM knowledge_embeddings WHERE chunk_id = ?', [chunk.id]);
+  const existing = existingRes.rows[0] as { hash: string } | undefined;
   if (existing && existing.hash === hash) return; // unchanged
 
   const vec = await embed(`${chunk.title}\n${chunk.content}`);
   if (!vec) return; // no key or failure — keyword fallback still works
 
-  db.sqlite.prepare(
+  await db.client.query(
     `INSERT INTO knowledge_embeddings (chunk_id, business_id, vector, hash, updated_at)
-     VALUES (@chunk_id, @business_id, @vector, @hash, @updated_at)
-     ON CONFLICT(chunk_id) DO UPDATE SET vector=excluded.vector, hash=excluded.hash, updated_at=excluded.updated_at`
-  ).run({
-    chunk_id: chunk.id,
-    business_id: chunk.businessId,
-    vector: JSON.stringify(vec),
-    hash,
-    updated_at: new Date().toISOString()
-  });
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(chunk_id) DO UPDATE SET vector=excluded.vector, hash=excluded.hash, updated_at=excluded.updated_at`,
+    [chunk.id, chunk.businessId, JSON.stringify(vec), hash, new Date().toISOString()]
+  );
 }
 
 /** Remove embedding(s) for a chunk (call on delete). */
 export async function removeEmbedding(chunkId: string): Promise<void> {
   const db = await getDb();
-  db.sqlite.prepare('DELETE FROM knowledge_embeddings WHERE chunk_id = ?').run(chunkId);
+  await db.client.query('DELETE FROM knowledge_embeddings WHERE chunk_id = ?', [chunkId]);
 }
 
 export interface RetrievalResult {
@@ -147,7 +150,7 @@ export async function retrieveRelevant(
   topK = 4
 ): Promise<RetrievalResult[]> {
   const db = await getDb();
-  const chunks = db.knowledgeChunks.filter(k => k.businessId === businessId);
+  const chunks = await db.knowledgeChunks.filterWhere('business_id = ?', [businessId]);
   if (chunks.length === 0) return [];
 
   const stored = (await allEmbeddings()).filter(e => e.businessId === businessId);
@@ -179,18 +182,23 @@ export async function retrieveRelevant(
   return selected.slice(0, topK).map(c => ({ chunk: c, score: 0, source: 'keyword' as const }));
 }
 
-/** Create the embeddings table on the given sqlite handle. Called by db.ts
- *  right after migrations run (avoids importing db back into this module). */
-export function initEmbeddingsTable(sqlite: { exec: (sql: string) => void }): void {
-  sqlite.exec(
+/** Create the embeddings table if it doesn't exist. Called by db.ts right
+ *  after migrations run (avoids importing db back into this module). On
+ *  PostgreSQL the migrations already create this table; the IF NOT EXISTS
+ *  makes this idempotent for both drivers. */
+export async function initEmbeddingsTable(client: { execMany: (sql: string) => Promise<void>; dialect: 'sqlite' | 'postgres' }): Promise<void> {
+  // The vector column is TEXT on SQLite (JSON string) and JSONB on PostgreSQL
+  // (already declared in migrations/pg/001). This CREATE TABLE IF NOT EXISTS
+  // is harmless when the table already exists.
+  await client.execMany(
     `CREATE TABLE IF NOT EXISTS knowledge_embeddings (
        chunk_id    TEXT PRIMARY KEY REFERENCES knowledge_chunks(id) ON DELETE CASCADE,
        business_id TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
-       vector      TEXT NOT NULL,
+       vector       ${client.dialect === 'postgres' ? 'JSONB' : 'TEXT'} NOT NULL,
        hash        TEXT NOT NULL,
        updated_at  TEXT NOT NULL
      )`
   );
-  sqlite.exec('CREATE INDEX IF NOT EXISTS idx_kb_embeddings_business ON knowledge_embeddings(business_id)');
+  await client.execMany('CREATE INDEX IF NOT EXISTS idx_kb_embeddings_business ON knowledge_embeddings(business_id)');
 }
 

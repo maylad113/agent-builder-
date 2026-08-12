@@ -44,9 +44,10 @@ const app = makeApp();
 const agent = request.agent(app);
 
 beforeAll(async () => {
+  await db.init();
   await agent.post('/api/auth/login').send({ email: 'owner@agentfactory.io', password: 'Password123!' });
 });
-afterAll(() => { db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
+afterAll(async () => { await db.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
 describe('platform works without any optional integration credentials (Phase 12)', () => {
   it('health endpoint responds', async () => {

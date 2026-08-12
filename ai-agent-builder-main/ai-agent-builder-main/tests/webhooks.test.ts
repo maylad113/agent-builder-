@@ -49,8 +49,11 @@ await new Promise<void>(resolve => server.listen(0, '127.0.0.1', () => {
 
 afterAll(async () => {
   await new Promise<void>(r => server.close(() => r()));
-  db.close(); fs.rmSync(tmpDir, { recursive: true, force: true });
+  await db.close(); fs.rmSync(tmpDir, { recursive: true, force: true });
 });
+
+// Initialize the singleton DB (migrations + seed) before webhook tests run.
+beforeAll(async () => { await db.init(); });
 
 function baseURL() { return `http://127.0.0.1:${port}`; }
 
@@ -73,10 +76,10 @@ function signTwilio(url: string, params: Record<string,string>): string {
 }
 
 // Seed a business + twilio integration mapped to a phone number.
-function seedTwilioIntegration(): void {
+async function seedTwilioIntegration(): Promise<void> {
   const bizId = 'biz-tw-test';
-  if (!db.businesses.find(b => b.id === bizId)) {
-    db.businesses.push({
+  if (!(await db.businesses.find(b => b.id === bizId))) {
+    await db.businesses.push({
       id: bizId, name: 'Twilio Test', type: 'restaurant', description: '', location: '',
       language: 'en', currency: 'usd', timezone: 'UTC',
       hours: [], services: [], faqs: [], policies: { cancellation: '', refund: '', bookingNotice: '' },
@@ -84,8 +87,8 @@ function seedTwilioIntegration(): void {
     } as any);
   }
   const integId = 'integ-tw-test';
-  if (!db.integrations.find(i => i.id === integId)) {
-    db.integrations.push({
+  if (!(await db.integrations.find(i => i.id === integId))) {
+    await db.integrations.push({
       id: integId, businessId: bizId, provider: 'twilio_sms', state: 'CONNECTED',
       statusMessage: 'ok', credentialsSet: true, configData: { phoneNumber: TWILIO_NUMBER },
     } as any);
@@ -149,7 +152,7 @@ describe('Twilio webhook signature verification', () => {
   });
 
   it('POST /twilio accepts a correctly signed inbound SMS (200) and dedupes a re-delivery', async () => {
-    seedTwilioIntegration();
+    await seedTwilioIntegration();
     const params: Record<string,string> = { MessageSid: 'SM-DEDUP-1', From: '+15551112222', To: TWILIO_NUMBER, Body: 'hello' };
     const url = `${baseURL()}/api/webhooks/twilio`;
     const sig = signTwilio(url, params);
@@ -164,15 +167,15 @@ describe('Twilio webhook signature verification', () => {
 
     // Re-deliver the SAME MessageSid: must NOT create a second action. Customer
     // count for this caller must not grow on the duplicate delivery.
-    const beforeCount = db.customers.filter(c => c.businessId === 'biz-tw-test' && c.phone === '+15551112222').length;
+    const beforeCount = (await db.customers.filter(c => c.businessId === 'biz-tw-test' && c.phone === '+15551112222')).length;
     const r2 = await post('/api/webhooks/twilio', headers, form);
     expect(r2.status).toBe(200);
-    const afterCount = db.customers.filter(c => c.businessId === 'biz-tw-test' && c.phone === '+15551112222').length;
+    const afterCount = (await db.customers.filter(c => c.businessId === 'biz-tw-test' && c.phone === '+15551112222')).length;
     expect(afterCount).toBe(beforeCount);
   });
 
   it('POST /twilio handles a missed-call status callback (200)', async () => {
-    seedTwilioIntegration();
+    await seedTwilioIntegration();
     const params: Record<string,string> = { CallSid: 'CA-MISSED-1', From: '+15559998888', To: TWILIO_NUMBER, CallStatus: 'no-answer' };
     const url = `${baseURL()}/api/webhooks/twilio`;
     const sig = signTwilio(url, params);
@@ -180,17 +183,17 @@ describe('Twilio webhook signature verification', () => {
     const r = await post('/api/webhooks/twilio', { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Twilio-Signature': sig }, form);
     expect(r.status).toBe(200);
     // A customer record should have been created for the missed caller.
-    const cust = db.customers.find(c => c.businessId === 'biz-tw-test' && c.phone === '+15559998888');
+    const cust = await db.customers.find(c => c.businessId === 'biz-tw-test' && c.phone === '+15559998888');
     expect(cust).toBeTruthy();
     // A re-delivery of the same CallSid must not create a second customer.
-    const beforeCount = db.customers.filter(c => c.businessId === 'biz-tw-test' && c.phone === '+15559998888').length;
+    const beforeCount = (await db.customers.filter(c => c.businessId === 'biz-tw-test' && c.phone === '+15559998888')).length;
     await post('/api/webhooks/twilio', { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Twilio-Signature': sig }, form);
-    const afterCount = db.customers.filter(c => c.businessId === 'biz-tw-test' && c.phone === '+15559998888').length;
+    const afterCount = (await db.customers.filter(c => c.businessId === 'biz-tw-test' && c.phone === '+15559998888')).length;
     expect(afterCount).toBe(beforeCount);
   });
 
   it('POST /twilio honours STOP opt-out (no reply path beyond acknowledgement)', async () => {
-    seedTwilioIntegration();
+    await seedTwilioIntegration();
     const params: Record<string,string> = { MessageSid: 'SM-STOP-1', From: '+15550000001', To: TWILIO_NUMBER, Body: 'STOP' };
     const url = `${baseURL()}/api/webhooks/twilio`;
     const sig = signTwilio(url, params);

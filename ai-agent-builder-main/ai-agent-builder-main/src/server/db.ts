@@ -23,21 +23,33 @@ import {
 } from '../types';
 import { hashPassword } from './passwords';
 import { initEmbeddingsTable } from './embeddings';
+import { DbClient, SqliteClient, PostgresClient } from './dbClient';
 
 /**
- * SQLite-backed repository for the AI Agent Factory MVP.
+ * Database repository for the AI Agent Factory.
+ *
+ * The repository is backed by a driver-agnostic async `DbClient` (the
+ * "compatibility layer" that lets the runtime migrate from SQLite to
+ * PostgreSQL incrementally):
+ *   - SQLite (better-sqlite3): the default dev/test backend when DATABASE_URL
+ *     is absent.
+ *   - PostgreSQL (node-postgres `pg`): the production backend selected when
+ *     DATABASE_URL is set.
  *
  * Design goals:
  *  - Keep the exact call-site shape the rest of the server code uses
- *    (`db.businesses.find(...)`, `db.agents.filter(...)`, `db.customers.push(...)`,
- *    `db.knowledgeChunks.splice(...)`, `db.usageRecords.reduce(...)`, ...).
- *  - Every read goes to SQLite; every write goes to SQLite. No business data
- *    lives in JS arrays.
+ *    (`await db.businesses.find(...)`, `await db.agents.filter(...)`,
+ *    `await db.customers.push(...)`, `await db.knowledgeChunks.splice(...)`,
+ *    `await db.usageRecords.reduce(...)`, ...). The collection methods are now
+ *    async so the same code runs against either driver.
+ *  - Every read goes to the database; every write goes to the database. No
+ *    business data lives in JS arrays.
  *  - Objects returned by `find`/`filter` are fresh parses of DB rows, so a
  *    caller that mutates the object (e.g. `conversation.status = ...`) must
- *    call `<collection>.update(record)` to persist — the call sites do that.
- *  - Nested/structured fields (arrays/objects) are stored as JSON TEXT and
- *    parsed back into the exact shapes defined in src/types/index.ts.
+ *    call `await <collection>.update(record)` to persist — the call sites do.
+ *  - Nested/structured fields (arrays/objects) are stored as JSON (TEXT for
+ *    SQLite, JSONB for PostgreSQL) and parsed back into the exact shapes
+ *    defined in src/types/index.ts.
  */
 
 // ---------------------------------------------------------------------------
@@ -157,8 +169,8 @@ function snakeToCamel(s: string): string {
 // Migrations
 // ---------------------------------------------------------------------------
 
-function runMigrations(sqlite: BetterSqlite3.Database, migrationsDir: string): void {
-  sqlite.exec(
+async function runMigrations(client: DbClient, migrationsDir: string): Promise<void> {
+  await client.execMany(
     `CREATE TABLE IF NOT EXISTS schema_migrations (
        id INTEGER PRIMARY KEY AUTOINCREMENT,
        name TEXT NOT NULL UNIQUE,
@@ -175,33 +187,68 @@ function runMigrations(sqlite: BetterSqlite3.Database, migrationsDir: string): v
     .filter(f => f.endsWith('.sql'))
     .sort();
 
-  const appliedRows = sqlite.prepare('SELECT name FROM schema_migrations').all() as Array<{ name: string }>;
-  const applied = new Set(appliedRows.map(r => r.name));
+  const appliedRes = await client.query('SELECT name FROM schema_migrations');
+  const applied = new Set(appliedRes.rows.map(r => r.name as string));
 
   for (const file of files) {
     if (applied.has(file)) continue;
     const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
-    sqlite.exec(sql);
-    sqlite.prepare('INSERT INTO schema_migrations (name) VALUES (?)').run(file);
+    await client.execMany(sql);
+    await client.query('INSERT INTO schema_migrations (name) VALUES (?)', [file]);
+    console.log(`[db] applied migration: ${file}`);
+  }
+}
+
+/** PostgreSQL migration runner: the schema_migrations table uses BIGSERIAL and
+ *  a UTC timestamp default, and the migration files live under migrations/pg. */
+async function runPostgresMigrations(client: DbClient, migrationsDir: string): Promise<void> {
+  await client.execMany(
+    `CREATE TABLE IF NOT EXISTS schema_migrations (
+       id BIGSERIAL PRIMARY KEY,
+       name TEXT NOT NULL UNIQUE,
+       applied_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+     )`
+  );
+
+  if (!fs.existsSync(migrationsDir)) {
+    throw new Error(`Migrations directory not found: ${migrationsDir}`);
+  }
+
+  const files = fs
+    .readdirSync(migrationsDir)
+    .filter(f => f.endsWith('.sql'))
+    .sort();
+
+  const appliedRes = await client.query('SELECT name FROM schema_migrations');
+  const applied = new Set(appliedRes.rows.map(r => r.name as string));
+
+  for (const file of files) {
+    if (applied.has(file)) continue;
+    const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
+    await client.execMany(sql);
+    await client.query('INSERT INTO schema_migrations (name) VALUES (?)', [file]);
     console.log(`[db] applied migration: ${file}`);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Collection: array-like facade over a SQLite table
+// Collection: array-like facade over a database table (async, driver-agnostic)
 // ---------------------------------------------------------------------------
 
 type Row = Record<string, any>;
 
 class Collection<T extends { id: string }> {
+  private cachedColumns: string[] | null = null;
+
   constructor(
-    private sqlite: BetterSqlite3.Database,
+    private client: DbClient,
     private config: TableConfig
   ) {}
 
-  private columnNames(): string[] {
-    const rows = this.sqlite.prepare(`PRAGMA table_info(${this.config.table})`).all() as Array<{ name: string }>;
-    return rows.map(r => r.name);
+  private async columnNames(): Promise<string[]> {
+    if (this.cachedColumns) return this.cachedColumns;
+    this.cachedColumns = await this.client.getColumns(this.config.table);
+    return this.cachedColumns;
   }
 
   private rowToObject(row: Row): T {
@@ -211,7 +258,15 @@ class Collection<T extends { id: string }> {
     for (const [col, value] of Object.entries(row)) {
       const field = snakeToCamel(col);
       if (jsonSet.has(field)) {
-        obj[field] = value == null ? undefined : JSON.parse(value);
+        // JSONB (PG) returns already-parsed objects/arrays; TEXT (SQLite)
+        // returns strings that must be JSON.parse'd. Handle both.
+        if (typeof value === 'string') {
+          obj[field] = value === '' ? undefined : safeJsonParse(value);
+        } else if (value == null) {
+          obj[field] = undefined;
+        } else {
+          obj[field] = value;
+        }
       } else if (boolSet.has(field)) {
         obj[field] = value === 1 || value === true;
       } else {
@@ -243,83 +298,138 @@ class Collection<T extends { id: string }> {
   }
 
   /** Load every row (insertion order), parsed to domain objects. */
-  private allRows(): T[] {
-    const rows = this.sqlite.prepare(`SELECT * FROM ${this.config.table} ORDER BY rowid`).all() as Row[];
-    return rows.map(r => this.rowToObject(r));
+  private async allRows(): Promise<T[]> {
+    // SQLite: ORDER BY rowid preserves insertion order. PostgreSQL has no
+    // rowid, so we order by the ctid-independent created_at when present is
+    // not enough for id-less tables; we order by id as a stable fallback that
+    // matches the legacy "insertion-ish" order closely enough for the
+    // array-facade semantics callers rely on. (Callers needing a specific
+    // order pass their own ORDER BY via filterWhere.)
+    const order = this.client.dialect === 'sqlite' ? 'ORDER BY rowid' : 'ORDER BY id';
+    const res = await this.client.query(`SELECT * FROM ${this.config.table} ${order}`);
+    return res.rows.map(r => this.rowToObject(r));
   }
 
-  find(predicate: (item: T) => boolean): T | undefined {
-    return this.allRows().find(predicate);
+  async find(predicate: (item: T) => boolean): Promise<T | undefined> {
+    const rows = await this.allRows();
+    return rows.find(predicate);
   }
 
-  filter(predicate: (item: T) => boolean): T[] {
-    return this.allRows().filter(predicate);
+  async filter(predicate: (item: T) => boolean): Promise<T[]> {
+    const rows = await this.allRows();
+    return rows.filter(predicate);
   }
 
-  findIndex(predicate: (item: T) => boolean): number {
-    return this.allRows().findIndex(predicate);
+  async findIndex(predicate: (item: T) => boolean): Promise<number> {
+    const rows = await this.allRows();
+    return rows.findIndex(predicate);
   }
 
-  push(...items: T[]): number {
-    const columns = this.columnNames();
+  async push(...items: T[]): Promise<number> {
+    const columns = await this.columnNames();
     const allowed = new Set(columns);
-    const insert = this.sqlite.prepare(
-      `INSERT INTO ${this.config.table} (id, ${columns.filter(c => c !== 'id').join(', ')}) VALUES (${columns
-        .map(() => '?')
-        .join(', ')})`
-    );
+    const colsNoId = columns.filter(c => c !== 'id');
+    const placeholders = columns.map(() => '?').join(', ');
+    const colList = columns.join(', ');
     for (const item of items) {
       const row = this.objectToRow(item);
       const values = columns.map(c => (c === 'id' ? row.id : allowed.has(c) ? row[c] ?? null : null));
-      insert.run(values);
+      await this.client.query(
+        `INSERT INTO ${this.config.table} (${colList}) VALUES (${placeholders})`,
+        values
+      );
     }
-    return this.length;
+    return this.length();
   }
 
   /** Persist the current state of a record that a caller mutated in place. */
-  update(item: T): void {
-    const columns = this.columnNames().filter(c => c !== 'id');
+  async update(item: T): Promise<void> {
+    const columns = (await this.columnNames()).filter(c => c !== 'id');
     const row = this.objectToRow(item);
     const setClause = columns.map(c => `${c} = ?`).join(', ');
-    const stmt = this.sqlite.prepare(`UPDATE ${this.config.table} SET ${setClause} WHERE id = ?`);
-    const result = stmt.run([...columns.map(c => row[c] ?? null), item.id]);
-    if (result.changes === 0) {
+    const values = columns.map(c => row[c] ?? null);
+    values.push(item.id);
+    const res = await this.client.query(
+      `UPDATE ${this.config.table} SET ${setClause} WHERE id = ?`,
+      values
+    );
+    if (res.changes === 0) {
       throw new Error(`Cannot update: no row with id '${item.id}' in ${this.config.table}`);
     }
   }
 
   /** Array semantics: delete rows between start and start+deleteCount. */
-  splice(start: number, deleteCount?: number): T[] {
-    const rows = this.allRows();
+  async splice(start: number, deleteCount?: number): Promise<T[]> {
+    const rows = await this.allRows();
     const removed = rows.splice(start, deleteCount === undefined ? rows.length - start : deleteCount);
-    const del = this.sqlite.prepare(`DELETE FROM ${this.config.table} WHERE id = ?`);
     for (const r of removed) {
-      del.run(r.id);
+      await this.client.query(`DELETE FROM ${this.config.table} WHERE id = ?`, [r.id]);
     }
     return removed;
   }
 
-  slice(start?: number, end?: number): T[] {
-    return this.allRows().slice(start, end);
+  async slice(start?: number, end?: number): Promise<T[]> {
+    const rows = await this.allRows();
+    return rows.slice(start, end);
   }
 
-  reduce<U>(callback: (acc: U, item: T) => U, initial: U): U {
-    return this.allRows().reduce(callback, initial);
+  async reduce<U>(callback: (acc: U, item: T) => U, initial: U): Promise<U> {
+    const rows = await this.allRows();
+    return rows.reduce(callback, initial);
   }
 
-  get length(): number {
-    const row = this.sqlite.prepare(`SELECT COUNT(*) AS c FROM ${this.config.table}`).get() as { c: number };
-    return row.c;
+  async length(): Promise<number> {
+    const res = await this.client.query(`SELECT COUNT(*) AS c FROM ${this.config.table}`);
+    const c = res.rows[0]?.c;
+    return typeof c === 'number' ? c : Number(c ?? 0);
   }
 
-  /** Lets `res.json(db.<collection>)` serialize as the plain array it always was. */
-  toJSON(): T[] {
+  /** Lets `res.json(await db.<collection>.toJSON())` serialize as a plain array. */
+  async toJSON(): Promise<T[]> {
     return this.allRows();
   }
 
-  [Symbol.iterator](): Iterator<T> {
-    return this.allRows()[Symbol.iterator]();
+  // --- DB-side query helpers (P4: avoid materializing whole tables) --------
+
+  /** Return rows matching a WHERE clause + params, ordered, with optional
+   *  LIMIT/OFFSET pagination. `where` must use `?` placeholders. This is the
+   *  preferred path for high-volume collections (messages, conversations,
+   *  customers, usage, appointments). */
+  async filterWhere(where: string, params: any[], opts: { orderBy?: string; limit?: number; offset?: number; desc?: boolean } = {}): Promise<T[]> {
+    let sql = `SELECT * FROM ${this.config.table} WHERE ${where}`;
+    if (opts.orderBy) {
+      const dir = opts.desc ? 'DESC' : 'ASC';
+      // orderBy is a trusted column name passed by callers; validate it.
+      const cols = await this.columnNames();
+      if (!cols.includes(opts.orderBy)) throw new Error(`Invalid order column: ${opts.orderBy}`);
+      sql += ` ORDER BY ${opts.orderBy} ${dir}`;
+    } else if (this.client.dialect === 'sqlite') {
+      sql += ' ORDER BY rowid';
+    }
+    if (opts.limit != null) {
+      sql += ` LIMIT ${Number(opts.limit) | 0}`;
+      if (opts.offset != null) sql += ` OFFSET ${Number(opts.offset) | 0}`;
+    }
+    const res = await this.client.query(sql, params);
+    return res.rows.map(r => this.rowToObject(r));
   }
+
+  /** Count rows matching a WHERE clause without loading them. */
+  async countWhere(where: string, params: any[]): Promise<number> {
+    const res = await this.client.query(`SELECT COUNT(*) AS c FROM ${this.config.table} WHERE ${where}`, params);
+    const c = res.rows[0]?.c;
+    return typeof c === 'number' ? c : Number(c ?? 0);
+  }
+
+  /** Find the first row matching a WHERE clause + params (single DB round-trip). */
+  async findOneWhere(where: string, params: any[]): Promise<T | undefined> {
+    const rows = await this.filterWhere(where, params, { limit: 1 });
+    return rows[0];
+  }
+}
+
+function safeJsonParse(s: string): any {
+  try { return JSON.parse(s); } catch { return undefined; }
 }
 
 // ---------------------------------------------------------------------------
@@ -330,97 +440,139 @@ export interface AppDatabaseOptions {
   dbPath?: string;
   migrationsDir?: string;
   seed?: boolean;
+  /** Override the database URL (otherwise from process.env.DATABASE_URL). When
+   *  set, the database runs on PostgreSQL instead of SQLite. */
+  databaseUrl?: string;
 }
 
 export class AppDatabase {
-  public sqlite: BetterSqlite3.Database;
+  /** The async DB client (SQLite or PostgreSQL). Raw-SQL call sites that used
+   *  the old `db.sqlite` handle now use `db.client`. */
+  public client!: DbClient;
+  /** The raw better-sqlite3 handle, available only for the SQLite dialect.
+   *  Undefined when running on PostgreSQL. Kept for the embeddings module and
+   *  a couple of low-level call sites that branch on dialect. */
+  public sqlite: BetterSqlite3.Database | undefined;
   public readonly dbPath: string;
   public readonly migrationsDir: string;
+  public readonly dialect: 'sqlite' | 'postgres';
+  private initialized = false;
 
-  public businesses: Collection<Business>;
-  public agents: Collection<Agent>;
-  public agentVersions: Collection<AgentVersion>;
-  public knowledgeChunks: Collection<KnowledgeChunk>;
-  public customers: Collection<Customer>;
-  public conversations: Collection<Conversation>;
-  public messages: Collection<Message>;
-  public appointments: Collection<Appointment>;
-  public staffMembers: Collection<StaffMember>;
-  public products: Collection<Product>;
-  public orders: Collection<Order>;
-  public channels: Collection<ChannelConfig>;
-  public integrations: Collection<IntegrationConfig>;
-  public templates: Collection<AgentTemplate>;
-  public usageRecords: Collection<UsageRecord>;
-  public auditLogs: Collection<AuditLog>;
-  public users: Collection<User>;
-  public sessions: Collection<Session>;
+  public businesses!: Collection<Business>;
+  public agents!: Collection<Agent>;
+  public agentVersions!: Collection<AgentVersion>;
+  public knowledgeChunks!: Collection<KnowledgeChunk>;
+  public customers!: Collection<Customer>;
+  public conversations!: Collection<Conversation>;
+  public messages!: Collection<Message>;
+  public appointments!: Collection<Appointment>;
+  public staffMembers!: Collection<StaffMember>;
+  public products!: Collection<Product>;
+  public orders!: Collection<Order>;
+  public channels!: Collection<ChannelConfig>;
+  public integrations!: Collection<IntegrationConfig>;
+  public templates!: Collection<AgentTemplate>;
+  public usageRecords!: Collection<UsageRecord>;
+  public auditLogs!: Collection<AuditLog>;
+  public users!: Collection<User>;
+  public sessions!: Collection<Session>;
 
   constructor(opts: AppDatabaseOptions = {}) {
-    let dbPath = opts.dbPath || process.env.DB_PATH || path.join(process.cwd(), 'data', 'agentforge.db');
-    // If DB_PATH points at an existing directory, append a default filename
-    // so the server doesn't crash with SQLITE_CANTOPEN (common deployment mistake).
-    try {
-      if (fs.statSync(dbPath).isDirectory()) {
-        dbPath = path.join(dbPath, 'agentfactory.db');
+    // Select the driver. DATABASE_URL (postgres://...) -> PostgreSQL production
+    // backend; otherwise better-sqlite3 (dev/test default). Optional provider
+    // env vars never gate startup (see noOptionalEnv tests).
+    const databaseUrl = opts.databaseUrl ?? process.env.DATABASE_URL;
+    if (databaseUrl) {
+      this.dialect = 'postgres';
+      this.dbPath = '';
+      this.migrationsDir = opts.migrationsDir || process.env.MIGRATIONS_DIR || path.join(process.cwd(), 'migrations', 'pg');
+      this.client = new PostgresClient({ connectionString: databaseUrl });
+    } else {
+      this.dialect = 'sqlite';
+      let dbPath = opts.dbPath || process.env.DB_PATH || path.join(process.cwd(), 'data', 'agentforge.db');
+      // If DB_PATH points at an existing directory, append a default filename
+      // so the server doesn't crash with SQLITE_CANTOPEN (common deployment mistake).
+      try {
+        if (fs.statSync(dbPath).isDirectory()) {
+          dbPath = path.join(dbPath, 'agentfactory.db');
+        }
+      } catch {
+        // path doesn't exist yet — that's fine, better-sqlite3 will create it
       }
-    } catch {
-      // path doesn't exist yet — that's fine, better-sqlite3 will create it
+      this.dbPath = dbPath;
+      this.migrationsDir = opts.migrationsDir || process.env.MIGRATIONS_DIR || path.join(process.cwd(), 'migrations');
+      fs.mkdirSync(path.dirname(this.dbPath), { recursive: true });
+      const sqlite = new BetterSqlite3(this.dbPath);
+      sqlite.pragma('journal_mode = WAL');
+      sqlite.pragma('foreign_keys = ON');
+      this.sqlite = sqlite;
+      this.client = new SqliteClient(sqlite);
     }
-    this.dbPath = dbPath;
-    this.migrationsDir = opts.migrationsDir || process.env.MIGRATIONS_DIR || path.join(process.cwd(), 'migrations');
 
-    fs.mkdirSync(path.dirname(this.dbPath), { recursive: true });
-    this.sqlite = new BetterSqlite3(this.dbPath);
-    this.sqlite.pragma('journal_mode = WAL');
-    this.sqlite.pragma('foreign_keys = ON');
+    this.businesses = new Collection<Business>(this.client, TABLES.businesses);
+    this.agents = new Collection<Agent>(this.client, TABLES.agents);
+    this.agentVersions = new Collection<AgentVersion>(this.client, TABLES.agentVersions);
+    this.knowledgeChunks = new Collection<KnowledgeChunk>(this.client, TABLES.knowledgeChunks);
+    this.customers = new Collection<Customer>(this.client, TABLES.customers);
+    this.conversations = new Collection<Conversation>(this.client, TABLES.conversations);
+    this.messages = new Collection<Message>(this.client, TABLES.messages);
+    this.appointments = new Collection<Appointment>(this.client, TABLES.appointments);
+    this.staffMembers = new Collection<StaffMember>(this.client, TABLES.staffMembers);
+    this.products = new Collection<Product>(this.client, TABLES.products);
+    this.orders = new Collection<Order>(this.client, TABLES.orders);
+    this.channels = new Collection<ChannelConfig>(this.client, TABLES.channels);
+    this.integrations = new Collection<IntegrationConfig>(this.client, TABLES.integrations);
+    this.templates = new Collection<AgentTemplate>(this.client, TABLES.templates);
+    this.usageRecords = new Collection<UsageRecord>(this.client, TABLES.usageRecords);
+    this.auditLogs = new Collection<AuditLog>(this.client, TABLES.auditLogs);
+    this.users = new Collection<User>(this.client, TABLES.users);
+    this.sessions = new Collection<Session>(this.client, TABLES.sessions);
+  }
 
-    runMigrations(this.sqlite, this.migrationsDir);
-    initEmbeddingsTable(this.sqlite);
+  /** Run migrations, initialize the embeddings table, and seed demo data.
+   *  Idempotent. Must be awaited before the database is used (the server and
+   *  tests do this at startup / in beforeAll). For SQLite it resolves on the
+   *  microtask queue; for PostgreSQL it runs real async migrations. */
+  async init(opts: { seed?: boolean } = {}): Promise<void> {
+    if (this.initialized) return;
+    this.initialized = true;
+    const shouldSeed = opts.seed !== false;
 
-    this.businesses = new Collection<Business>(this.sqlite, TABLES.businesses);
-    this.agents = new Collection<Agent>(this.sqlite, TABLES.agents);
-    this.agentVersions = new Collection<AgentVersion>(this.sqlite, TABLES.agentVersions);
-    this.knowledgeChunks = new Collection<KnowledgeChunk>(this.sqlite, TABLES.knowledgeChunks);
-    this.customers = new Collection<Customer>(this.sqlite, TABLES.customers);
-    this.conversations = new Collection<Conversation>(this.sqlite, TABLES.conversations);
-    this.messages = new Collection<Message>(this.sqlite, TABLES.messages);
-    this.appointments = new Collection<Appointment>(this.sqlite, TABLES.appointments);
-    this.staffMembers = new Collection<StaffMember>(this.sqlite, TABLES.staffMembers);
-    this.products = new Collection<Product>(this.sqlite, TABLES.products);
-    this.orders = new Collection<Order>(this.sqlite, TABLES.orders);
-    this.channels = new Collection<ChannelConfig>(this.sqlite, TABLES.channels);
-    this.integrations = new Collection<IntegrationConfig>(this.sqlite, TABLES.integrations);
-    this.templates = new Collection<AgentTemplate>(this.sqlite, TABLES.templates);
-    this.usageRecords = new Collection<UsageRecord>(this.sqlite, TABLES.usageRecords);
-    this.auditLogs = new Collection<AuditLog>(this.sqlite, TABLES.auditLogs);
-    this.users = new Collection<User>(this.sqlite, TABLES.users);
-    this.sessions = new Collection<Session>(this.sqlite, TABLES.sessions);
+    if (this.dialect === 'sqlite') {
+      await runMigrations(this.client, this.migrationsDir);
+    } else {
+      await runPostgresMigrations(this.client, this.migrationsDir);
+    }
+    await initEmbeddingsTable(this.client);
 
-    if (opts.seed !== false) {
-      this.seed();
-      this.seedUsers();
+    if (shouldSeed) {
+      await this.seed();
+      await this.seedUsers();
     }
 
     // Best-effort background indexing of seeded knowledge when an embedding
     // key is configured. Fire-and-forget: failures are non-fatal (keyword
     // fallback remains) and we must not block startup for optional providers.
     if (process.env.GEMINI_API_KEY) {
-      import('./embeddings').then(({ indexChunk }) => {
-        for (const c of this.knowledgeChunks.toJSON()) {
-          indexChunk(c).catch(() => {});
-        }
+      import('./embeddings').then(async ({ indexChunk }) => {
+        try {
+          const chunks = await this.knowledgeChunks.toJSON();
+          for (const c of chunks) {
+            indexChunk(c).catch(() => {});
+          }
+        } catch { /* non-fatal */ }
       }).catch(() => {});
     }
   }
 
-  close(): void {
-    this.sqlite.close();
+  async close(): Promise<void> {
+    try { await this.client.close(); } catch { /* ignore */ }
   }
 
   /** Seed the Tony's Barber Shop demo tenant. Idempotent: only runs when the DB is empty. */
-  private seed(): void {
-    const businessCount = (this.sqlite.prepare('SELECT COUNT(*) AS c FROM businesses').get() as { c: number }).c;
+  private async seed(): Promise<void> {
+    const businessCount = await this.businesses.length();
+
     if (businessCount > 0) {
       return;
     }
@@ -469,7 +621,7 @@ export class AppDatabase {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
-    this.businesses.push(tonysBarber);
+    await this.businesses.push(tonysBarber);
 
     // 2. Staff Members for Tony's
     const staff1: StaffMember = {
@@ -486,7 +638,7 @@ export class AppDatabase {
       role: 'Barber & Stylist',
       servicesHandled: ['srv-1', 'srv-2', 'srv-3']
     };
-    this.staffMembers.push(staff1, staff2);
+    await this.staffMembers.push(staff1, staff2);
 
     // 3. Seed Agent for Tony's
     const tonysAgent: Agent = {
@@ -553,12 +705,12 @@ Never invent prices, hours, services, or availability that do not exist in the d
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
-    this.agents.push(tonysAgent);
+    await this.agents.push(tonysAgent);
 
     // Seed a PUBLISHED version snapshot so the versioning system is consistent
     // for the demo tenant (runtime reads the agent row, but the dashboard +
     // simulator rely on version records existing).
-    this.agentVersions.push({
+    await this.agentVersions.push({
       id: 'ver-tonys-1',
       agentId: 'agent-tonys-1',
       businessId: 'biz-tonys-barber',
@@ -572,7 +724,7 @@ Never invent prices, hours, services, or availability that do not exist in the d
       publishedAt: new Date().toISOString()
     });
     // 4. Knowledge Chunks
-    this.knowledgeChunks.push(
+    await this.knowledgeChunks.push(
       {
         id: 'kc-1',
         businessId: 'biz-tonys-barber',
@@ -603,7 +755,7 @@ Never invent prices, hours, services, or availability that do not exist in the d
     );
 
     // 5. Products
-    this.products.push(
+    await this.products.push(
       {
         id: 'prod-1',
         businessId: 'biz-tonys-barber',
@@ -643,11 +795,11 @@ Never invent prices, hours, services, or availability that do not exist in the d
       notes: 'Regular beard trim customer.',
       createdAt: new Date().toISOString()
     };
-    this.customers.push(cust1, cust2);
+    await this.customers.push(cust1, cust2);
 
     // 7. Appointments
     const todayStr = new Date().toISOString().split('T')[0];
-    this.appointments.push(
+    await this.appointments.push(
       {
         id: 'app-1',
         businessId: 'biz-tonys-barber',
@@ -685,7 +837,7 @@ Never invent prices, hours, services, or availability that do not exist in the d
     );
 
     // 8. Channels & Integrations for Tony's
-    this.channels.push(
+    await this.channels.push(
       {
         id: 'chan-1',
         businessId: 'biz-tonys-barber',
@@ -720,7 +872,7 @@ Never invent prices, hours, services, or availability that do not exist in the d
       }
     );
 
-    this.integrations.push(
+    await this.integrations.push(
       {
         id: 'integ-1',
         businessId: 'biz-tonys-barber',
@@ -768,9 +920,9 @@ Never invent prices, hours, services, or availability that do not exist in the d
       lastMessageAt: new Date().toISOString(),
       createdAt: new Date().toISOString()
     };
-    this.conversations.push(conv1);
+    await this.conversations.push(conv1);
 
-    this.messages.push(
+    await this.messages.push(
       {
         id: 'msg-1',
         conversationId: 'conv-1',
@@ -790,7 +942,7 @@ Never invent prices, hours, services, or availability that do not exist in the d
     );
 
     // 10. Pre-built Industry Templates
-    this.templates.push(
+    await this.templates.push(
       {
         id: 'tpl-barbershop',
         name: 'Barbershop & Grooming',
@@ -902,7 +1054,7 @@ Never invent prices, hours, services, or availability that do not exist in the d
     );
 
     // 11. Initial Audit Logs & Usage
-    this.auditLogs.push(
+    await this.auditLogs.push(
       {
         id: 'log-1',
         businessId: 'biz-tonys-barber',
@@ -913,7 +1065,7 @@ Never invent prices, hours, services, or availability that do not exist in the d
       }
     );
 
-    this.usageRecords.push(
+    await this.usageRecords.push(
       {
         id: 'usr-1',
         businessId: 'biz-tonys-barber',
@@ -932,7 +1084,7 @@ Never invent prices, hours, services, or availability that do not exist in the d
    * partially-seeded DB self-heals and a reseeded DB never duplicates. Passwords
    * are scrypt-hashed and only computed for emails that are actually missing.
    */
-  private seedUsers(): void {
+  private async seedUsers(): Promise<void> {
     const now = new Date().toISOString();
     const demoUsers: Array<Omit<User, 'createdAt' | 'updatedAt' | 'passwordHash'>> = [
       {
@@ -959,14 +1111,19 @@ Never invent prices, hours, services, or availability that do not exist in the d
     ];
     // Demo password for all seeded accounts (documented in the report).
     const demoPassword = 'Password123!';
-    const existsStmt = this.sqlite.prepare('SELECT 1 FROM users WHERE email = ?');
-    const insertStmt = this.sqlite.prepare(
-      `INSERT OR IGNORE INTO users (id, email, password_hash, name, role, business_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    );
+    // Use INSERT ... ON CONFLICT DO NOTHING so seeding is idempotent on both
+    // SQLite (supports ON CONFLICT since 3.24) and PostgreSQL.
+    const upsertSql =
+      `INSERT INTO users (id, email, password_hash, name, role, business_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (email) DO NOTHING`;
     for (const u of demoUsers) {
-      if (existsStmt.get(u.email)) continue;
-      insertStmt.run(u.id, u.email, hashPassword(demoPassword), u.name, u.role, u.businessId, now, now);
+      // Only hash + insert when the email isn't already present.
+      const existing = await this.users.findOneWhere('email = ?', [u.email]);
+      if (existing) continue;
+      await this.client.query(upsertSql, [
+        u.id, u.email, hashPassword(demoPassword), u.name, u.role, u.businessId, now, now
+      ]);
     }
   }
 }

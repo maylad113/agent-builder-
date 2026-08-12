@@ -186,7 +186,7 @@ export async function executeAgentTool(
   const { tenantId, conversationId } = context;
 
   // Validate tenant exists
-  const business = db.businesses.find(b => b.id === tenantId);
+  const business = await db.businesses.find(b => b.id === tenantId);
   if (!business) {
     return { success: false, error: `Unauthorized tenant ID: ${tenantId}` };
   }
@@ -279,8 +279,8 @@ export async function executeAgentTool(
         // slot generation accounts for its duration + buffer.
         const service = (serviceId ? business.services.find(s => s.id === serviceId) : undefined)
           || business.services[0];
-        const existingApps = db.appointments.filter(a => a.businessId === tenantId && a.date === requestedDate && a.status !== 'CANCELLED');
-        const staff = db.staffMembers.filter(s => s.businessId === tenantId);
+        const existingApps = await db.appointments.filter(a => a.businessId === tenantId && a.date === requestedDate && a.status !== 'CANCELLED');
+        const staff = await db.staffMembers.filter(s => s.businessId === tenantId);
         const availableSlots = service
           ? generateAvailableSlots(business, staff, service, existingApps, requestedDate)
           : [];
@@ -327,20 +327,19 @@ export async function executeAgentTool(
         const blockEnd = bufferAfter > 0 ? addMinutes(endTime, bufferAfter) : endTime;
 
         // TRANSACTIONAL booking with overlap prevention (incl. buffer). The
-        // overlap check and the INSERT run inside one SQLite transaction.
-        // better-sqlite3 is synchronous and serializes writes, so the
-        // transaction makes the check-then-insert atomic: two concurrent
-        // bookings for an overlapping slot cannot both succeed.
+        // overlap check and the INSERT run inside one DB transaction so the
+        // check-then-insert is atomic. On PostgreSQL this is a real SERIALIZABLE
+        // transaction; on SQLite the better-sqlite3 handle serializes writes.
         const appointmentId = `app-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
         const customerId = `cust-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
         const nowIso = new Date().toISOString();
 
-        const bookTxn = db.sqlite.transaction((): { ok: true; appointment: any } | { ok: false; error: string } => {
+        const result = await db.client.transaction(async (): Promise<{ ok: true; appointment: any } | { ok: false; error: string }> => {
           // Re-check for an overlapping (not just identical) non-cancelled
           // appointment for this tenant on this date. Both the new booking AND
           // each existing appointment extend by their own service buffer, so a
           // turnaround period is respected in both directions.
-          const overlapping = db.appointments.filter(
+          const overlapping = await db.appointments.filter(
             a => a.businessId === tenantId && a.date === date && a.status !== 'CANCELLED'
           );
           for (const a of overlapping) {
@@ -353,15 +352,15 @@ export async function executeAgentTool(
           }
 
           // Find or create the customer inside the transaction.
-          let customer = db.customers.find(c => c.businessId === tenantId && c.phone === customerPhone);
+          let customer = await db.customers.find(c => c.businessId === tenantId && c.phone === customerPhone);
           if (!customer) {
             customer = { id: customerId, businessId: tenantId, name: customerName, phone: customerPhone, createdAt: nowIso };
-            db.customers.push(customer);
+            await db.customers.push(customer);
           }
 
           // Assign an eligible staff member (engine honors staff hours, services,
           // timeOff). Falls back to the first staff member when none configured.
-          const staffList = db.staffMembers.filter(s => s.businessId === tenantId);
+          const staffList = await db.staffMembers.filter(s => s.businessId === tenantId);
           const staff = findEligibleStaff(business, staffList, service, date, startTime, endTime);
 
           const newAppointment = {
@@ -381,9 +380,9 @@ export async function executeAgentTool(
             notes: notes || 'Booked via AI Assistant',
             createdAt: nowIso
           };
-          db.appointments.push(newAppointment);
+          await db.appointments.push(newAppointment);
 
-          db.auditLogs.push({
+          await db.auditLogs.push({
             id: `log-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
             businessId: tenantId,
             action: 'APPOINTMENT_BOOKED',
@@ -393,8 +392,6 @@ export async function executeAgentTool(
 
           return { ok: true, appointment: newAppointment };
         });
-
-        const result = bookTxn();
 
         if (isFail(result)) {
           return { success: false, error: result.error };
@@ -420,7 +417,7 @@ export async function executeAgentTool(
 
       case 'cancel_appointment': {
         const { appointmentId, customerPhone } = args;
-        const app = db.appointments.find(a => 
+        const app = await db.appointments.find(a => 
           a.businessId === tenantId && 
           (a.id === appointmentId || a.customerPhone === customerPhone) &&
           a.status !== 'CANCELLED'
@@ -434,9 +431,9 @@ export async function executeAgentTool(
         }
 
         app.status = 'CANCELLED';
-        db.appointments.update(app);
+        await db.appointments.update(app);
 
-        db.auditLogs.push({
+        await db.auditLogs.push({
           id: `log-${Date.now()}`,
           businessId: tenantId,
           action: 'APPOINTMENT_CANCELLED',
@@ -459,7 +456,7 @@ export async function executeAgentTool(
         if (!appointmentId || !newDate || !newTime) {
           return { success: false, error: 'appointmentId, newDate and newTime are required.' };
         }
-        const app = db.appointments.find(a => a.businessId === tenantId && a.id === appointmentId);
+        const app = await db.appointments.find(a => a.businessId === tenantId && a.id === appointmentId);
         if (!app) {
           return { success: false, error: 'Appointment not found.' };
         }
@@ -482,8 +479,8 @@ export async function executeAgentTool(
         const blockEnd = bufferAfter > 0 ? addMinutes(newEndTime, bufferAfter) : newEndTime;
 
         // Transactional overlap check (excluding the appointment being moved).
-        const rescheduleTxn = db.sqlite.transaction(() => {
-          const others = db.appointments.filter(
+        const r = await db.client.transaction(async () => {
+          const others = await db.appointments.filter(
             a => a.businessId === tenantId && a.date === newDate && a.status !== 'CANCELLED' && a.id !== app.id
           );
           for (const a of others) {
@@ -495,8 +492,8 @@ export async function executeAgentTool(
           app.startTime = newTime;
           app.endTime = newEndTime;
           app.status = 'RESCHEDULED';
-          db.appointments.update(app);
-          db.auditLogs.push({
+          await db.appointments.update(app);
+          await db.auditLogs.push({
             id: `log-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
             businessId: tenantId,
             action: 'APPOINTMENT_RESCHEDULED',
@@ -505,7 +502,6 @@ export async function executeAgentTool(
           });
           return { ok: true as const };
         });
-        const r = rescheduleTxn();
         if (isFail(r)) return { success: false, error: r.error };
 
         return {
@@ -523,7 +519,7 @@ export async function executeAgentTool(
 
       case 'search_products': {
         const query = (args.query || '').toLowerCase();
-        const tenantProds = db.products.filter(p => p.businessId === tenantId);
+        const tenantProds = await db.products.filter(p => p.businessId === tenantId);
         const matches = tenantProds.filter(p => 
           p.name.toLowerCase().includes(query) || 
           p.description.toLowerCase().includes(query) ||
@@ -565,73 +561,71 @@ export async function executeAgentTool(
         const orderId = `ord-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
         const nowIso = new Date().toISOString();
 
-        // The transaction THROWS on any failure so better-sqlite3 rolls back
-        // EVERY mutation made inside it (inventory decrements, customer create,
-        // order insert). Returning a failure value does NOT roll back — only a
-        // thrown exception triggers ROLLBACK. This guarantees a failed multi-
-        // item order leaves inventory completely unchanged (no partial deduction).
+        // The transaction THROWS on any failure so the DB rolls back EVERY
+        // mutation made inside it (inventory decrements, customer create, order
+        // insert). Returning a failure value does NOT roll back — only a thrown
+        // exception triggers ROLLBACK. This guarantees a failed multi-item order
+        // leaves inventory completely unchanged (no partial deduction). On
+        // PostgreSQL this is a real transaction; on SQLite the handle serializes.
         class OrderTxnError extends Error {
           constructor(public error: string) { super(error); this.name = 'OrderTxnError'; }
         }
 
-        const runOrderTxn = db.sqlite.transaction((): { order: any; totalAmount: number; orderItems: any[] } => {
-          const orderItems: Array<{ productId: string; productName: string; quantity: number; price: number }> = [];
-          let totalAmount = 0;
-
-          // Re-read each product inside the transaction and verify stock.
-          // better-sqlite3 is synchronous so the transaction serializes these
-          // writes — check + decrement are atomic, preventing two concurrent
-          // orders from overselling the same stock.
-          for (const item of items) {
-            const product = db.products.find(p => p.businessId === tenantId && p.id === item.productId);
-            if (!product) {
-              throw new OrderTxnError(`Product ID ${item.productId} not found.`);
-            }
-            if (product.inventory < item.quantity) {
-              throw new OrderTxnError(`Insufficient stock for ${product.name}. Available: ${product.inventory}, Requested: ${item.quantity}`);
-            }
-            product.inventory -= item.quantity;
-            // Guard against negative inventory even if the check above raced.
-            if (product.inventory < 0) {
-              throw new OrderTxnError(`Insufficient stock for ${product.name}.`);
-            }
-            db.products.update(product);
-
-            const itemTotal = product.price * item.quantity;
-            totalAmount += itemTotal;
-            orderItems.push({
-              productId: product.id,
-              productName: product.name,
-              quantity: item.quantity,
-              price: product.price
-            });
-          }
-
-          // Customer lookup/create inside the transaction.
-          let customer = db.customers.find(c => c.businessId === tenantId && c.phone === customerPhone);
-          if (!customer) {
-            customer = { id: `cust-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`, businessId: tenantId, name: customerName, phone: customerPhone, createdAt: nowIso };
-            db.customers.push(customer);
-          }
-
-          const newOrder = {
-            id: orderId,
-            businessId: tenantId,
-            customerId: customer.id,
-            customerName,
-            items: orderItems,
-            totalAmount,
-            status: 'PENDING' as const,
-            createdAt: nowIso
-          };
-          db.orders.push(newOrder);
-
-          return { order: newOrder, totalAmount, orderItems };
-        });
-
         let result: { order: any; totalAmount: number; orderItems: any[] };
         try {
-          result = runOrderTxn();
+          result = await db.client.transaction(async (): Promise<{ order: any; totalAmount: number; orderItems: any[] }> => {
+            const orderItems: Array<{ productId: string; productName: string; quantity: number; price: number }> = [];
+            let totalAmount = 0;
+
+            // Re-read each product inside the transaction and verify stock.
+            // Check + decrement run inside the transaction so two concurrent
+            // orders cannot oversell the same stock.
+            for (const item of items) {
+              const product = await db.products.find(p => p.businessId === tenantId && p.id === item.productId);
+              if (!product) {
+                throw new OrderTxnError(`Product ID ${item.productId} not found.`);
+              }
+              if (product.inventory < item.quantity) {
+                throw new OrderTxnError(`Insufficient stock for ${product.name}. Available: ${product.inventory}, Requested: ${item.quantity}`);
+              }
+              product.inventory -= item.quantity;
+              // Guard against negative inventory even if the check above raced.
+              if (product.inventory < 0) {
+                throw new OrderTxnError(`Insufficient stock for ${product.name}.`);
+              }
+              await db.products.update(product);
+
+              const itemTotal = product.price * item.quantity;
+              totalAmount += itemTotal;
+              orderItems.push({
+                productId: product.id,
+                productName: product.name,
+                quantity: item.quantity,
+                price: product.price
+              });
+            }
+
+            // Customer lookup/create inside the transaction.
+            let customer = await db.customers.find(c => c.businessId === tenantId && c.phone === customerPhone);
+            if (!customer) {
+              customer = { id: `cust-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`, businessId: tenantId, name: customerName, phone: customerPhone, createdAt: nowIso };
+              await db.customers.push(customer);
+            }
+
+            const newOrder = {
+              id: orderId,
+              businessId: tenantId,
+              customerId: customer.id,
+              customerName,
+              items: orderItems,
+              totalAmount,
+              status: 'PENDING' as const,
+              createdAt: nowIso
+            };
+            await db.orders.push(newOrder);
+
+            return { order: newOrder, totalAmount, orderItems };
+          });
         } catch (e) {
           if (e instanceof OrderTxnError) {
             return { success: false, error: e.error };
@@ -655,10 +649,17 @@ export async function executeAgentTool(
 
       case 'get_order_status': {
         const { orderId, customerPhone } = args;
-        const order = db.orders.find(o => 
-          o.businessId === tenantId && 
-          (o.id === orderId || (customerPhone && db.customers.find(c => c.id === o.customerId)?.phone === customerPhone))
-        );
+        // Look up by order id (tenant-scoped), then verify ownership via the
+        // customer's phone when provided. The customer lookup is a separate
+        // query (cannot `await` inside the orders.filter predicate).
+        let order = await db.orders.find(o => o.businessId === tenantId && o.id === orderId);
+        if (!order && customerPhone) {
+          // Fall back: find orders whose customer's phone matches.
+          const customer = await db.customers.find(c => c.businessId === tenantId && c.phone === customerPhone);
+          if (customer) {
+            order = await db.orders.find(o => o.businessId === tenantId && o.customerId === customer.id);
+          }
+        }
 
         if (!order) {
           return { success: false, error: 'No order found matching criteria.' };
@@ -680,7 +681,7 @@ export async function executeAgentTool(
 
       case 'notify_business_owner': {
         const { reason, customerDetails } = args;
-        db.auditLogs.push({
+        await db.auditLogs.push({
           id: `log-${Date.now()}`,
           businessId: tenantId,
           action: 'OWNER_NOTIFIED',
@@ -697,16 +698,16 @@ export async function executeAgentTool(
       case 'transfer_to_human': {
         const { reason } = args;
         if (conversationId) {
-          const conv = db.conversations.find(c => c.id === conversationId);
+          const conv = await db.conversations.find(c => c.id === conversationId);
           if (conv) {
             conv.status = 'WAITING_FOR_HUMAN';
             conv.handoffReason = reason || 'Customer requested human assistance.';
             conv.handoffRequestedAt = new Date().toISOString();
-            db.conversations.update(conv);
+            await db.conversations.update(conv);
           }
         }
 
-        db.auditLogs.push({
+        await db.auditLogs.push({
           id: `log-${Date.now()}`,
           businessId: tenantId,
           action: 'HUMAN_HANDOFF_TRIGGERED',

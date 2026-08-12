@@ -1,7 +1,16 @@
 import crypto from 'crypto';
-import { Request, Response, NextFunction } from 'express';
+import { Request, Response, NextFunction, RequestHandler } from 'express';
 import { db } from './db';
 import { User, PublicUser, Session, UserRole } from '../types';
+
+/** Wrap an async Express handler so rejected promises reach the error
+ *  middleware instead of becoming unhandled rejections (Express 4 does not
+ *  catch async middleware by default). */
+export function asyncHandler(fn: (req: Request, res: Response, next: NextFunction) => Promise<any>): RequestHandler {
+  return (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
 
 /**
  * Server-side auth + tenant isolation for the AI Agent Factory MVP.
@@ -69,20 +78,20 @@ export function toPublicUser(user: User): PublicUser {
 // Session lifecycle
 // ---------------------------------------------------------------------------
 
-export function createSession(userId: string): Session {
+export async function createSession(userId: string): Promise<Session> {
   const session: Session = {
     id: crypto.randomBytes(32).toString('hex'),
     userId,
     createdAt: new Date().toISOString(),
     expiresAt: new Date(Date.now() + SESSION_TTL_MS).toISOString()
   };
-  db.sessions.push(session);
+  await db.sessions.push(session);
   return session;
 }
 
-export function destroySession(sessionId: string): void {
-  const idx = db.sessions.findIndex(s => s.id === sessionId);
-  if (idx !== -1) db.sessions.splice(idx, 1);
+export async function destroySession(sessionId: string): Promise<void> {
+  const idx = await db.sessions.findIndex(s => s.id === sessionId);
+  if (idx !== -1) await db.sessions.splice(idx, 1);
 }
 
 export function setSessionCookie(req: Request, res: Response, sessionId: string): void {
@@ -107,7 +116,7 @@ export function clearSessionCookie(res: Response): void {
 }
 
 /** Resolve the session cookie to a user, or null. Validates signature, row, expiry. */
-export function loadUserFromSession(req: Request): User | null {
+export async function loadUserFromSession(req: Request): Promise<User | null> {
   const raw = readCookie(req, SESSION_COOKIE);
   if (!raw) return null;
   const dot = raw.indexOf('.');
@@ -120,13 +129,13 @@ export function loadUserFromSession(req: Request): User | null {
   const actual = Buffer.from(sig, 'hex');
   if (expected.length !== actual.length || !crypto.timingSafeEqual(expected, actual)) return null;
 
-  const session = db.sessions.find(s => s.id === sessionId);
+  const session = await db.sessions.find(s => s.id === sessionId);
   if (!session) return null;
   if (new Date(session.expiresAt).getTime() < Date.now()) {
-    destroySession(sessionId); // lazy cleanup of expired rows
+    await destroySession(sessionId); // lazy cleanup of expired rows
     return null;
   }
-  return db.users.find(u => u.id === session.userId) ?? null;
+  return (await db.users.find(u => u.id === session.userId)) ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -134,17 +143,17 @@ export function loadUserFromSession(req: Request): User | null {
 // ---------------------------------------------------------------------------
 
 /** 401 when there is no valid session. Attaches the user to res.locals.user. */
-export function requireAuth(req: Request, res: Response, next: NextFunction) {
-  const user = loadUserFromSession(req);
+export const requireAuth = asyncHandler(async (req: Request, res: Response, _next: NextFunction) => {
+  const user = await loadUserFromSession(req);
   if (!user) {
     return res.status(401).json({ error: 'Authentication required.' });
   }
   res.locals.user = user;
-  next();
-}
+  _next();
+});
 
 /** 403 on role mismatch. Must run after requireAuth. */
-export function requireRole(...roles: UserRole[]) {
+export function requireRole(...roles: UserRole[]): RequestHandler {
   return (req: Request, res: Response, next: NextFunction) => {
     const user = res.locals.user as User | undefined;
     if (!user) return res.status(401).json({ error: 'Authentication required.' });
@@ -170,7 +179,7 @@ function isReadMethod(req: Request): boolean {
  *
  * Sets res.locals.businessId = the effective tenant (or null for "all").
  */
-export function requireTenantScope(req: Request, res: Response, next: NextFunction) {
+export const requireTenantScope = asyncHandler(async (req: Request, res: Response, next: NextFunction) => {
   const user = res.locals.user as User | undefined;
   if (!user) return res.status(401).json({ error: 'Authentication required.' });
 
@@ -186,7 +195,7 @@ export function requireTenantScope(req: Request, res: Response, next: NextFuncti
 
   res.locals.businessId = requested || (isPlatformOwner ? null : user.businessId);
   next();
-}
+});
 
 /**
  * Resource-level tenant isolation for routes addressed by resource id
@@ -200,16 +209,19 @@ export function requireTenantScope(req: Request, res: Response, next: NextFuncti
  * `businessIdOf` extracts the tenant from the resource (defaults to the
  * resource's `businessId` field). Businesses are their own tenant root, so
  * callers pass `(b) => b.id` for business routes.
+ *
+ * `lookup` is async (it queries the database); the returned middleware awaits
+ * it so the tenant check is performed before the route handler runs.
  */
 export function requireResourceAccess(
-  lookup: (req: Request) => { businessId?: string } | { id: string } | undefined | null,
+  lookup: (req: Request) => Promise<{ businessId?: string } | { id: string } | undefined | null>,
   businessIdOf?: (resource: any) => string | undefined
-) {
-  return (req: Request, res: Response, next: NextFunction) => {
+): RequestHandler {
+  return asyncHandler(async (req: Request, res: Response, next: NextFunction) => {
     const user = res.locals.user as User | undefined;
     if (!user) return res.status(401).json({ error: 'Authentication required.' });
 
-    const resource = lookup(req);
+    const resource = await lookup(req);
     if (!resource) {
       return res.status(404).json({ error: 'Not found.' });
     }
@@ -223,5 +235,5 @@ export function requireResourceAccess(
     }
     res.locals.resource = resource;
     next();
-  };
+  });
 }

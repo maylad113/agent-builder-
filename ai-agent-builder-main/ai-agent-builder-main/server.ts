@@ -20,6 +20,12 @@ async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
+  // Initialize the persistent database (migrations + embeddings table + seed
+  // demo data) before mounting routes. On PostgreSQL this runs real async
+  // migrations; on SQLite it resolves on the microtask queue. Optional
+  // integration env vars never gate startup (Phase 12 / Phase 26).
+  await db.init();
+
   // Trust the first proxy hop so req.protocol / req.ip respect X-Forwarded-*
   // headers when running behind a reverse proxy (nginx, a load balancer, or a
   // PaaS like Render/Heroku). This is required for correct Secure-cookie
@@ -94,9 +100,9 @@ async function startServer() {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`\n[server] ${signal} received, shutting down gracefully...`);
-    server.close((err) => {
+    server.close(async (err) => {
       if (err) console.error('[server] error closing HTTP server:', err);
-      try { db.close(); } catch (e) { console.error('[server] error closing DB:', e); }
+      try { await db.close(); } catch (e) { console.error('[server] error closing DB:', e); }
       console.log('[server] shutdown complete.');
       process.exit(err ? 1 : 0);
     });

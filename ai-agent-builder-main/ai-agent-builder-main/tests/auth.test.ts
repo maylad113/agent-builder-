@@ -26,6 +26,7 @@ const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentforge-auth-'));
 process.env.DB_PATH = path.join(tmpDir, 'auth.db');
 
 const { router } = await import('../src/server/routes');
+const { db } = await import('../src/server/db');
 
 function makeApp() {
   const app = express();
@@ -57,6 +58,7 @@ let convBId = '';
 const BELLA_SECRET = 'ONLY-BELLA-KNOWS-SECRET';
 
 beforeAll(async () => {
+  await db.init();
   // Platform owner login.
   const login = await platformAgent.post('/api/auth/login').send({
     email: 'owner@agentfactory.io',
@@ -133,7 +135,8 @@ beforeAll(async () => {
   expect(staffLogin.status).toBe(200);
 });
 
-afterAll(() => {
+afterAll(async () => {
+  await db.close();
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
