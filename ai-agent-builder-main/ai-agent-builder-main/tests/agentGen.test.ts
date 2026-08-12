@@ -23,17 +23,19 @@ describe('agent generation never invents business facts', () => {
       // hours and services intentionally omitted
     });
 
-    // No invented price should appear anywhere in the suggested services.
+    // No invented price should appear anywhere in the suggested services: the
+    // fallback returns NO service rows at all (never a fabricated placeholder
+    // entry, never a numeric price/duration).
     const services = cfg.suggestedServices as any[];
-    expect(services.length).toBeGreaterThan(0);
+    expect(services.length).toBe(0);
     for (const s of services) {
       expect(s.price).toBe('NEEDS_INPUT');
       expect(s.durationMinutes).toBe('NEEDS_INPUT');
     }
 
-    // needsInput must list the missing business facts.
-    const needs = cfg.needsInput as string[];
-    const needsLower = needs.map(n => n.toLowerCase());
+    // needsInput must list the missing business facts ({field, label} markers).
+    const needs = cfg.needsInput as Array<{ field: string; label: string }>;
+    const needsLower = needs.map(n => n.label.toLowerCase());
     expect(needsLower).toEqual(expect.arrayContaining(['operating hours']));
     expect(needsLower.some(n => n.includes('service'))).toBe(true);
 
@@ -61,7 +63,7 @@ describe('agent generation never invents business facts', () => {
       services: 'Espresso $4, Latte $5'
       // hours omitted
     });
-    expect((cfg.needsInput as string[]).map(n => n.toLowerCase())).toEqual(
+    expect((cfg.needsInput as Array<{ field: string; label: string }>).map(n => n.label.toLowerCase())).toEqual(
       expect.arrayContaining(['operating hours'])
     );
   });

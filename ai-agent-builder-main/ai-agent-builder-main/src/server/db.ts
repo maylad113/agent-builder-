@@ -107,7 +107,7 @@ const TABLES: Record<string, TableConfig> = {
   },
   staffMembers: {
     table: 'staff_members',
-    jsonColumns: ['servicesHandled'],
+    jsonColumns: ['servicesHandled', 'workingHours', 'timeOff'],
     booleanColumns: []
   },
   products: {
@@ -669,6 +669,7 @@ Never invent prices, hours, services, or availability that do not exist in the d
         allowedActions: [
           'check_business_hours',
           'get_business_information',
+          'search_knowledge',
           'check_availability',
           'book_appointment',
           'cancel_appointment',
@@ -692,6 +693,7 @@ Never invent prices, hours, services, or availability that do not exist in the d
         toolsEnabled: [
           'check_business_hours',
           'get_business_information',
+          'search_knowledge',
           'check_availability',
           'book_appointment',
           'cancel_appointment',

@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   timeToMinutes, minutesToTime, addMinutes, intervalsOverlap,
   dayOfWeekForDate, parseBookingNotice, isHoliday, validateSlot,
-  generateAvailableSlots, findEligibleStaff
+  generateAvailableSlots, findEligibleStaff, zonedSlotInstant
 } from '../src/server/appointmentEngine';
 import type { Business, StaffMember, ServiceItem, Appointment } from '../src/types';
 
@@ -69,6 +69,23 @@ describe('dayOfWeekForDate (timezone-aware)', () => {
   });
   it('falls back to UTC when no timezone given', () => {
     expect(dayOfWeekForDate('2026-01-01')).toBe('thursday');
+  });
+});
+
+describe('zonedSlotInstant (business-timezone wall clock)', () => {
+  it('interprets wall-clock in the business timezone, not the server timezone', () => {
+    // Asia/Tehran is UTC+3:30 year-round (no DST since 2022): 14:00 Tehran == 10:30 UTC.
+    const inst = zonedSlotInstant('2026-01-05', '14:00', 'Asia/Tehran');
+    expect(inst.toISOString()).toBe('2026-01-05T10:30:00.000Z');
+  });
+  it('respects DST: a summer NY slot is UTC-4, a winter one UTC-5', () => {
+    // America/New_York: EDT in July (UTC-4), EST in January (UTC-5).
+    expect(zonedSlotInstant('2026-07-15', '12:00', 'America/New_York').toISOString()).toBe('2026-07-15T16:00:00.000Z');
+    expect(zonedSlotInstant('2026-01-15', '12:00', 'America/New_York').toISOString()).toBe('2026-01-15T17:00:00.000Z');
+  });
+  it('falls back to server-local parsing when no timezone is given', () => {
+    const inst = zonedSlotInstant('2026-01-05', '14:00');
+    expect(inst.getFullYear()).toBe(2026);
   });
 });
 
@@ -151,6 +168,29 @@ describe('validateSlot', () => {
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/too soon|in advance/i);
   });
+  it('enforces minimum notice measured in the BUSINESS timezone, not the server timezone', () => {
+    // Business is Asia/Tehran (UTC+3:30) with a 2-hour notice policy. The slot
+    // 2026-01-05 14:00 Tehran is 10:30 UTC. now = 10:30 UTC == exactly 14:00
+    // Tehran, i.e. ZERO notice — must be rejected. Parsing the wall-clock in
+    // the server's UTC clock would make the slot look 3.5h away and wrongly
+    // accept it.
+    const b = makeBusiness({
+      policies: { cancellation: 'at least 2 hours before', refund: '', bookingNotice: '' }
+    });
+    const now = new Date('2026-01-05T10:30:00Z'); // 14:00 Tehran
+    const r = validateSlot(b, svc(), '2026-01-05', '14:00', now);
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/too soon|in advance/i);
+  });
+  it('accepts a slot with sufficient notice measured in the business timezone', () => {
+    const b = makeBusiness({
+      policies: { cancellation: 'at least 2 hours before', refund: '', bookingNotice: '' }
+    });
+    // 2026-01-05 14:00 Tehran = 10:30 UTC; now = 07:30 UTC = 11:00 Tehran → 3h notice.
+    const now = new Date('2026-01-05T07:30:00Z');
+    const r = validateSlot(b, svc(), '2026-01-05', '14:00', now);
+    expect(r.ok).toBe(true);
+  });
 });
 
 describe('findEligibleStaff', () => {
@@ -183,6 +223,31 @@ describe('findEligibleStaff', () => {
     ];
     const s = findEligibleStaff(b, staff, svc(), OPEN_DATE, '11:00', '11:30');
     expect(s).toBeNull();
+  });
+  it('returns null when every staff member\'s schedule excludes the slot (no fallback to a scheduled-out member)', () => {
+    const b = makeBusiness();
+    const day = dayOfWeekForDate(MON_DATE, 'Asia/Tehran');
+    const staff: StaffMember[] = [
+      { id: 'st1', businessId: 'b1', name: 'A', role: 'r', servicesHandled: ['s1'],
+        workingHours: [{ day: day as any, isOpen: true, openTime: '09:00', closeTime: '12:00' }] },
+      { id: 'st2', businessId: 'b1', name: 'B', role: 'r', servicesHandled: ['s1'],
+        workingHours: [{ day: day as any, isOpen: true, openTime: '13:00', closeTime: '17:00' }] },
+    ];
+    // 18:00 is inside business hours (09:00-20:00) but outside BOTH schedules.
+    const s = findEligibleStaff(b, staff, svc(), MON_DATE, '18:00', '18:30');
+    expect(s).toBeNull();
+  });
+  it('falls back to a staff member with no schedule configured (business hours apply)', () => {
+    const b = makeBusiness();
+    const day = dayOfWeekForDate(MON_DATE, 'Asia/Tehran');
+    const staff: StaffMember[] = [
+      { id: 'st1', businessId: 'b1', name: 'A', role: 'r', servicesHandled: ['s1'],
+        workingHours: [{ day: day as any, isOpen: true, openTime: '09:00', closeTime: '12:00' }] },
+      { id: 'st2', businessId: 'b1', name: 'B', role: 'r', servicesHandled: ['s1'] },
+    ];
+    // 15:00 is outside st1's hours; st2 has no schedule → covers via business hours.
+    const s = findEligibleStaff(b, staff, svc(), MON_DATE, '15:00', '15:30');
+    expect(s?.id).toBe('st2');
   });
 });
 
@@ -222,5 +287,19 @@ describe('generateAvailableSlots', () => {
     expect(slots).not.toContain('14:30');
     // 15:00 is past the buffer -> available.
     expect(slots).toContain('15:00');
+  });
+  it('excludes slots no staff member is scheduled to work', () => {
+    const b = makeBusiness();
+    const day = dayOfWeekForDate(MON_DATE, 'Asia/Tehran');
+    const staff: StaffMember[] = [
+      { id: 'st1', businessId: 'b1', name: 'A', role: 'r', servicesHandled: ['s1'],
+        workingHours: [{ day: day as any, isOpen: true, openTime: '09:00', closeTime: '12:00' }] },
+      { id: 'st2', businessId: 'b1', name: 'B', role: 'r', servicesHandled: ['s1'],
+        workingHours: [{ day: day as any, isOpen: true, openTime: '13:00', closeTime: '17:00' }] },
+    ];
+    const slots = generateAvailableSlots(b, staff, svc(), [], MON_DATE);
+    expect(slots).toContain('10:00'); // st1 covers
+    expect(slots).toContain('14:00'); // st2 covers
+    expect(slots).not.toContain('18:00'); // inside business hours, but no staff scheduled
   });
 });

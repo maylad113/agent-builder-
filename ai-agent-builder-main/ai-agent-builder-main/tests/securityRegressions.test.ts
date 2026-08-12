@@ -133,7 +133,7 @@ describe('product input validation', () => {
     expect(r.status).toBe(201);
     expect(r.body.price).toBe(199);
     expect(r.body.inventory).toBe(50);
-    const audited = db.auditLogs.find(l => l.action === 'PRODUCT_CREATED' && l.businessId === bizBId);
+    const audited = await db.auditLogs.find(l => l.action === 'PRODUCT_CREATED' && l.businessId === bizBId);
     expect(audited).toBeTruthy();
   });
 });
@@ -207,7 +207,7 @@ describe('tool permission enforcement (defense-in-depth)', () => {
   it('rejects an LLM-hallucinated tool not in the agent\'s allowed set', async () => {
     const { executeAgentTool, agentToolDeclarations } = await import('../src/server/tools');
     const { db } = await import('../src/server/db');
-    const biz = db.businesses.find(b => b.id === 'biz-tonys-barber');
+    const biz = await db.businesses.find(b => b.id === 'biz-tonys-barber');
     expect(biz).toBeTruthy();
     // Simulate the LLM calling 'book_appointment' when the agent only allows
     // 'check_business_hours' — the backend must refuse to execute it.
@@ -224,7 +224,7 @@ describe('tool permission enforcement (defense-in-depth)', () => {
   it('executes a permitted tool normally', async () => {
     const { executeAgentTool } = await import('../src/server/tools');
     const { db } = await import('../src/server/db');
-    const biz = db.businesses.find(b => b.id === 'biz-tonys-barber');
+    const biz = await db.businesses.find(b => b.id === 'biz-tonys-barber');
     expect(biz).toBeTruthy();
     const result = await executeAgentTool('check_business_hours', {}, {
       tenantId: 'biz-tonys-barber',

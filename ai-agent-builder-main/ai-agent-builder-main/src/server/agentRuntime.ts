@@ -24,22 +24,39 @@ function getGeminiClient(): GoogleGenAI {
   return aiClient;
 }
 
+export interface RuntimeDebugInfo {
+  systemPrompt: string;
+  retrievedKnowledge: string[];
+  toolCalls: ToolCallRecord[];
+  latencyMs: number;
+  tokensUsed: number;
+  model: string;
+  /** Correlation id for this runtime execution (logged server-side for support). */
+  executionId: string;
+  /** Present when the LLM call itself failed (internal callers only). */
+  error?: string;
+}
+
 export interface RuntimeExecutionResult {
   reply: string;
   conversationId: string;
   status: string;
-  /** Internal diagnostics. NEVER sent to the customer-facing widget; only
-   *  returned to authenticated simulator/developer callers via the wrapper. */
-  debug: {
-    systemPrompt: string;
-    retrievedKnowledge: string[];
-    toolCalls: ToolCallRecord[];
-    latencyMs: number;
-    tokensUsed: number;
-    model: string;
-    executionId: string;
-  };
+  /** false when the business has no ACTIVE agent — the widget must treat it as an error, never a fake answer. */
+  agentAvailable: boolean;
+  /**
+   * Internal debug (system prompt, retrieved knowledge, raw tool results).
+   * ALWAYS null for public/unauthenticated callers — the public widget must
+   * never receive system prompts or raw knowledge dumps. Only an
+   * authenticated session scoped to the tenant (e.g. the in-dashboard
+   * simulator) receives this.
+   */
+  debug: RuntimeDebugInfo | null;
 }
+
+// Honest "assistant unavailable" message returned when the business has no
+// ACTIVE agent. Deliberately does NOT claim a human will follow up.
+export const AGENT_UNAVAILABLE_REPLY =
+  "This business's assistant is not available right now. Please try again later.";
 
 // Retrieve relevant business knowledge for context window grounding.
 // Semantic (cosine over Gemini embeddings) with a tenant-scoped keyword
@@ -66,7 +83,7 @@ async function ensureConversation(params: { tenantId: string; conversationId?: s
     let customer = await db.customers.find(c => c.businessId === tenantId && (c.phone === phone || c.name === name));
     if (!customer) {
       customer = {
-        id: `cust-${Date.now()}`,
+        id: `cust-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         businessId: tenantId,
         name,
         phone,
@@ -76,7 +93,7 @@ async function ensureConversation(params: { tenantId: string; conversationId?: s
     }
 
     conversation = {
-      id: `conv-${Date.now()}`,
+      id: `conv-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       businessId: tenantId,
       customerId: customer.id,
       customerName: customer.name,
@@ -106,10 +123,19 @@ export async function processAgentMessage(params: {
    * (production default), the runtime MUST use the PUBLISHED version only and
    * refuses to run against a non-published agent. */
   simulator?: boolean;
+  /** Internal (simulator) use: run a SPECIFIC agent regardless of status.
+   * Routes must verify the caller is authenticated AND scoped to the agent's
+   * tenant before passing this — the runtime trusts no one. */
+  agentId?: string;
+  /** Include internal debug (system prompt / knowledge / tool results) in the result. */
+  includeDebug?: boolean;
 }): Promise<RuntimeExecutionResult> {
   const startTime = Date.now();
   const executionId = `exec-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
-  const { tenantId, userMessage, channel = 'web_chat', simulator = !!params.versionId } = params;
+  const { tenantId, userMessage, channel = 'web_chat' } = params;
+  // The simulator may target a specific agent (agentId) or a specific draft
+  // version (versionId); the public widget targets the business's ACTIVE agent.
+  const simulator = params.simulator || !!params.agentId;
 
   // 1. Resolve Tenant & Business Information
   const business = await db.businesses.find(b => b.id === tenantId);
@@ -117,14 +143,41 @@ export async function processAgentMessage(params: {
     throw new Error(`Business not found for ID: ${tenantId}`);
   }
 
-  // 2. Load Active Agent Configuration
-  // Production conversations MUST use the PUBLISHED agent version. The simulator
-  // (simulator=true, with an optional versionId) may use DRAFT/TESTING. We never
-  // fall back to an arbitrary non-published agent in production.
-  const agent = await db.agents.find(a => a.businessId === tenantId);
+  // 2. Resolve the agent.
+  //  - Simulator (agentId): run that SPECIFIC agent regardless of status.
+  //  - Public: ONLY the business's ACTIVE agent may serve customers. A
+  //    DRAFT/READY/TESTING/PAUSED/ARCHIVED agent must never answer the widget.
+  const agent = params.agentId
+    ? await db.agents.find(a => a.id === params.agentId && a.businessId === tenantId)
+    : await db.agents.find(a => a.businessId === tenantId && a.status === 'ACTIVE');
 
   if (!agent) {
-    throw new Error(`No agent configured for business: ${business.name}`);
+    if (params.agentId) {
+      throw new Error(`Agent not found for business: ${tenantId}`);
+    }
+    // Honest unavailable result — never a fake answer. 200 + agentAvailable:false
+    // so the widget can render it as an error state.
+    const conv = await ensureConversation(params, business, channel);
+    conv.lastMessageAt = new Date().toISOString();
+    conv.summary = `Last exchange: "${userMessage.substring(0, 30)}..." -> assistant unavailable`;
+    await db.conversations.update(conv);
+
+    await db.messages.push({
+      id: `msg-${Date.now()}-agent`,
+      conversationId: conv.id,
+      sender: 'agent',
+      content: AGENT_UNAVAILABLE_REPLY,
+      channel,
+      timestamp: new Date().toISOString()
+    });
+
+    return {
+      reply: AGENT_UNAVAILABLE_REPLY,
+      conversationId: conv.id,
+      status: 'WAITING_FOR_HUMAN',
+      agentAvailable: false,
+      debug: null
+    };
   }
 
   // Production conversations require an ACTIVE agent. A PAUSED or ARCHIVED
@@ -133,18 +186,11 @@ export async function processAgentMessage(params: {
   if (!simulator && agent.status !== 'ACTIVE') {
     const conv = await ensureConversation(params, business, channel);
     return {
-      reply: "I'm having trouble connecting to the assistant service right now. I've notified the team and someone will follow up with you shortly.",
+      reply: AGENT_UNAVAILABLE_REPLY,
       conversationId: conv.id,
       status: 'WAITING_FOR_HUMAN',
-      debug: {
-        systemPrompt: '',
-        retrievedKnowledge: [],
-        toolCalls: [],
-        latencyMs: Date.now() - startTime,
-        tokensUsed: 0,
-        model: agent.model || 'none',
-        executionId
-      }
+      agentAvailable: false,
+      debug: null
     };
   }
 
@@ -176,15 +222,8 @@ export async function processAgentMessage(params: {
         reply: "I'm having trouble connecting to the assistant service right now. I've notified the team and someone will follow up with you shortly.",
         conversationId: conv.id,
         status: 'WAITING_FOR_HUMAN',
-        debug: {
-          systemPrompt: '',
-          retrievedKnowledge: [],
-          toolCalls: [],
-          latencyMs: Date.now() - startTime,
-          tokensUsed: 0,
-          model: effectiveModel || 'none',
-          executionId
-        }
+        agentAvailable: false,
+        debug: null
       };
     }
     effectiveSystemPrompt = pub.systemPrompt;
@@ -218,15 +257,8 @@ export async function processAgentMessage(params: {
       reply: holdingReply,
       conversationId: conversation.id,
       status: conversation.status,
-      debug: {
-        systemPrompt: '',
-        retrievedKnowledge: [],
-        toolCalls: [],
-        latencyMs: Date.now() - startTime,
-        tokensUsed: 0,
-        model: effectiveModel || 'gemini-3.6-flash',
-        executionId
-      }
+      agentAvailable: true,
+      debug: null
     };
   }
 
@@ -237,15 +269,8 @@ export async function processAgentMessage(params: {
       reply: holdingReply,
       conversationId: conversation.id,
       status: conversation.status,
-      debug: {
-        systemPrompt: '',
-        retrievedKnowledge: [],
-        toolCalls: [],
-        latencyMs: Date.now() - startTime,
-        tokensUsed: 0,
-        model: effectiveModel || 'gemini-3.6-flash',
-        executionId
-      }
+      agentAvailable: true,
+      debug: null
     };
   }
 
@@ -288,7 +313,9 @@ CRITICAL MANDATES:
 1. NEVER fabricate bookings, prices, services, or operating hours that are not in the database/knowledge base.
 2. If you need to check hours, prices, or book an appointment, ALWAYS call the corresponding tool.
 3. If the user asks for something outside your knowledge or requests a real person, use the 'transfer_to_human' tool immediately.
-4. Keep answers clear, helpful, and polite.`;
+4. Keep answers clear, helpful, and polite.
+5. HONEST FAILURE: If a tool reports failure (success: false), tell the customer the truth — e.g. "I could not complete the booking because the time is already taken" — and NEVER claim the action succeeded or was confirmed.
+6. Never claim a booking, order, or transfer happened unless the backend tool response confirmed it (success: true).`;
 
   // 6. Build History from Conversation Messages
   const existingMsgs = (await db.messages
@@ -307,6 +334,7 @@ CRITICAL MANDATES:
 
   const toolCallRecords: ToolCallRecord[] = [];
   let finalReply = '';
+  let runtimeError: string | undefined;
 
   // Real token usage from the provider's usageMetadata, accumulated across
   // the tool loop (Phase 19). Hoisted outside try so the catch block and the
@@ -355,11 +383,17 @@ CRITICAL MANDATES:
         const toolName = call.name;
         const args = (call.args as Record<string, any>) || {};
 
-        // Execute Tool safely on backend with tenant isolation
+        // Execute Tool safely on backend with tenant isolation + hard
+        // enablement enforcement. BOTH the agent's toolsEnabled set (the
+        // declarations offered to the model) and the derived allowedToolNames
+        // (defense-in-depth: even if the LLM hallucinates a tool name that was
+        // never declared, the backend refuses it) are passed so the tool layer
+        // independently verifies enablement.
         const result = await executeAgentTool(toolName, args, {
           tenantId,
           conversationId: conversation.id,
           channel,
+          toolsEnabled: structured.toolsEnabled,
           allowedToolNames: activeTools.map(t => t.name)
         });
 
@@ -407,10 +441,10 @@ CRITICAL MANDATES:
     // Log the real error internally with the execution id for support; never
     // expose the provider's error message/stack to the customer.
     console.error(`[runtime] ${executionId} Gemini error:`, err?.message || err);
-    finalReply =
-      "I'm having trouble connecting to the assistant service right now. I've notified the team and someone will follow up with you shortly.";
-    
-    // Auto-escalate conversation status on AI error
+    runtimeError = err?.message || 'AI Provider Error';
+    // Honest fallback: report the outage, never claim any action succeeded.
+    // Internal error details stay server-side (and in debug for internal callers).
+    finalReply = "I'm sorry, I'm having trouble connecting to the assistant service right now. Please try again in a moment.";
     conversation.status = 'WAITING_FOR_HUMAN';
   }
 
@@ -446,7 +480,7 @@ CRITICAL MANDATES:
   let usage = await db.usageRecords.find(u => u.businessId === tenantId && u.date === todayStr);
   if (!usage) {
     usage = {
-      id: `usr-${Date.now()}`,
+      id: `usr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       businessId: tenantId,
       date: todayStr,
       tokensUsed: 0,
@@ -474,40 +508,69 @@ CRITICAL MANDATES:
   if (!usage.model) usage.model = usedModel;
   await db.usageRecords.update(usage);
 
+  const debug: RuntimeDebugInfo | null = params.includeDebug
+    ? {
+        systemPrompt: fullSystemPrompt,
+        retrievedKnowledge,
+        toolCalls: toolCallRecords,
+        latencyMs,
+        tokensUsed,
+        model: agent.model || 'gemini-3.6-flash',
+        executionId,
+        ...(runtimeError ? { error: runtimeError } : {})
+      }
+    : null;
+
   return {
     reply: finalReply,
     conversationId: conversation.id,
     status: conversation.status,
-    debug: {
-      systemPrompt: fullSystemPrompt,
-      retrievedKnowledge,
-      toolCalls: toolCallRecords,
-      latencyMs,
-      tokensUsed,
-      model: usedModel,
-      executionId
-    }
+    agentAvailable: true,
+    debug
   };
 }
 
 // Generate Agent Configuration Wizard helper (AI Configuration Auto-Generator)
+//
+// The generator is a PROPOSAL factory — it never auto-activates anything and
+// it NEVER invents business facts. The LLM receives only the business input
+// the owner actually provided; anything missing is reported as a NEEDS_INPUT
+// entry, never as a fabricated value. The fallback path (no API key, or a
+// model error) follows the same rule.
 export async function generateSuggestedAgentConfig(businessInput: {
   name: string;
   type: string;
   description: string;
   hours?: string;
   services?: string;
+  faqs?: string;
 }): Promise<any> {
+  // Anything not provided by the owner is a NEEDS_INPUT entry, not a guess.
+  const needsInput: Array<{ field: string; label: string }> = [];
+  if (!businessInput.hours || !businessInput.hours.trim()) {
+    needsInput.push({ field: 'hours', label: 'Operating hours' });
+  }
+  if (!businessInput.services || !businessInput.services.trim()) {
+    needsInput.push({ field: 'services', label: 'Service list and prices' });
+  }
+  if (!businessInput.description || !businessInput.description.trim()) {
+    needsInput.push({ field: 'description', label: 'Business description' });
+  }
+
   try {
     const ai = getGeminiClient();
 
-    const prompt = `You are an expert AI Agent Architect for local business receptionists.
-Generate a structured AI agent configuration for the following business:
+    const prompt = `You are an expert AI Agent Architect designing the configuration for a new AI receptionist agent.
+
+You receive ONLY the business facts the owner provided. You must NEVER invent facts.
+
+BUSINESS FACTS PROVIDED:
 - Name: ${businessInput.name}
 - Type: ${businessInput.type}
-- Description: ${businessInput.description}
-- Operating Hours: ${businessInput.hours || 'NOT PROVIDED'}
+- Description: ${businessInput.description || 'NOT PROVIDED'}
+- Operating hours: ${businessInput.hours || 'NOT PROVIDED'}
 - Services: ${businessInput.services || 'NOT PROVIDED'}
+- FAQs: ${businessInput.faqs || 'NOT PROVIDED'}
 
 CRITICAL RULES — violate these and the configuration is useless:
 1. NEVER invent business facts. If a price, duration, hour, policy, or service
@@ -518,23 +581,31 @@ CRITICAL RULES — violate these and the configuration is useless:
    ONLY from the input or be "NEEDS_INPUT".
 3. System prompt and personality may be generated, but must instruct the agent
    to never state prices/hours/services that the business has not configured.
+4. For every business fact that is missing (e.g. exact prices, operating hours,
+   policies, address), add an entry to the "needsInput" array with a short
+   "field" name and a human-readable "label".
+5. Only fill suggestedServices / suggestedFaqs with information the owner
+   actually provided. If not provided, leave them empty arrays.
+6. You MAY propose: agent name, personality (tone/behavior/language), goals,
+   allowedActions (tool names), restrictedActions, escalationRules, and a
+   systemPrompt written in generic, safe language.
+7. The systemPrompt must instruct the agent to never invent facts, to use tools
+   for hours/prices/availability, and to tell the customer the truth when a
+   tool reports failure (never claim a booking or action succeeded unless the
+   backend confirmed it).
 
-Return a JSON object conforming strictly to this format:
+Return ONLY a JSON object (no markdown, no prose, no code fences) with exactly this shape:
 {
   "agentName": "Suggested agent name",
-  "systemPrompt": "Comprehensive system instructions; must tell the agent to never invent prices, hours, or services and to escalate when unsure.",
+  "systemPrompt": "Comprehensive but fact-safe system instructions",
   "personality": { "tone": "friendly", "behavior": "service", "language": "en" },
   "goals": ["Goal 1", "Goal 2", "Goal 3"],
-  "allowedActions": ["check_business_hours", "get_business_information", "check_availability", "book_appointment", "transfer_to_human"],
-  "restrictedActions": ["Do not state prices/hours/services not configured by the business", "Do not promise out-of-scope work"],
-  "escalationRules": ["When customer requests a human", "When customer reports a complaint", "When a required fact is missing"],
-  "suggestedFaqs": [
-    {"question": "Sample FAQ 1", "answer": "Suggested answer 1"}
-  ],
-  "suggestedServices": [
-    {"name": "Service from input or NEEDS_INPUT", "price": "NEEDS_INPUT or number", "durationMinutes": "NEEDS_INPUT or number", "description": "Service description or NEEDS_INPUT"}
-  ],
-  "needsInput": ["List every business fact that could not be derived from the input, e.g. 'operating hours', 'service prices', 'service durations'"]
+  "allowedActions": ["check_business_hours", "get_business_information", "check_availability", "book_appointment", "search_knowledge", "transfer_to_human"],
+  "restrictedActions": ["Never invent prices, hours, addresses, or policies", "Never claim a booking or action succeeded unless a tool confirmed it"],
+  "escalationRules": ["When customer requests a human", "When asked for facts not provided"],
+  "suggestedFaqs": [],
+  "suggestedServices": [],
+  "needsInput": [{ "field": "prices", "label": "Exact prices for each service" }]
 }`;
 
     const res = await ai.models.generateContent({
@@ -546,16 +617,67 @@ Return a JSON object conforming strictly to this format:
     });
 
     if (res.text) {
-      const parsed = JSON.parse(res.text);
+      // Robust parsing: tolerate markdown code fences and stray prose, then
+      // sanitize so the proposal can never carry fabricated business facts.
+      const parsed = parseJsonFromModel(res.text);
       return sanitizeGeneratedConfig(parsed, businessInput);
     }
   } catch (err: any) {
     console.error('Auto Agent Gen Error:', err);
   }
 
-  // Fact-safe fallback when Gemini is unavailable. Nothing is invented:
-  // every missing business fact is explicitly NEEDS_INPUT.
-  return factSafeFallback(businessInput);
+  // Honest fallback (no key / model error / invalid JSON): reflects ONLY the
+  // input the owner provided — no invented prices, hours, services or FAQs.
+  const factLines: string[] = [];
+  if (businessInput.description && businessInput.description.trim()) {
+    factLines.push(`- Business description: ${businessInput.description.trim()}`);
+  }
+  if (businessInput.hours && businessInput.hours.trim()) {
+    factLines.push(`- Operating hours (as provided by the owner): ${businessInput.hours.trim()}`);
+  }
+  if (businessInput.services && businessInput.services.trim()) {
+    factLines.push(`- Services (as provided by the owner): ${businessInput.services.trim()}`);
+  }
+  if (businessInput.faqs && businessInput.faqs.trim()) {
+    factLines.push(`- FAQs (as provided by the owner): ${businessInput.faqs.trim()}`);
+  }
+
+  const factsBlock = factLines.length > 0
+    ? `\nBUSINESS FACTS (provided by the owner — never extend these):\n${factLines.join('\n')}`
+    : '\nBUSINESS FACTS: none provided yet. If a fact is missing, say you do not know rather than guessing.';
+
+  return {
+    agentName: `${businessInput.name} AI Assistant`,
+    systemPrompt: `You are the AI receptionist for ${businessInput.name} (${businessInput.type}). Answer customer questions politely and helpfully.${factsBlock}
+
+CRITICAL MANDATES:
+1. NEVER invent business facts. Do not state prices, operating hours, addresses, policies, or services that are not in the BUSINESS FACTS above or retrievable via your tools.
+2. If you do not know a fact, say so honestly and offer to connect the customer with a human team member.
+3. Use your tools to check hours, prices, availability, and to book appointments.
+4. HONEST FAILURE: If a tool reports failure, tell the customer the truth (e.g. "I could not complete the booking because ...") and NEVER claim the action succeeded.
+5. Transfer to a human when asked, or when you are unsure.`,
+    personality: { tone: 'friendly', behavior: 'service', language: 'en' },
+    goals: ['Answer customer questions honestly', 'Book appointments', 'Explain services'],
+    allowedActions: [
+      'check_business_hours',
+      'get_business_information',
+      'check_availability',
+      'book_appointment',
+      'search_knowledge',
+      'transfer_to_human'
+    ],
+    restrictedActions: [
+      'Never invent prices, hours, addresses, or policies',
+      'Never claim a booking or action succeeded unless a tool confirmed it'
+    ],
+    escalationRules: [
+      'Customer requests a real human agent',
+      'Customer asks for a business fact that was not provided'
+    ],
+    suggestedFaqs: [],
+    suggestedServices: [],
+    needsInput
+  };
 }
 
 /**
@@ -563,7 +685,7 @@ Return a JSON object conforming strictly to this format:
  * carries a fabricated price/duration when the input didn't supply services.
  * Anything that looks placeholder is converted to NEEDS_INPUT.
  */
-function sanitizeGeneratedConfig(parsed: any, input: { name: string; type: string; description: string; hours?: string; services?: string }): any {
+function sanitizeGeneratedConfig(parsed: any, input: { name: string; type: string; description: string; hours?: string; services?: string; faqs?: string }): any {
   const servicesProvided = !!(input.services && input.services.trim());
   if (Array.isArray(parsed.suggestedServices)) {
     parsed.suggestedServices = parsed.suggestedServices.map((s: any) => {
@@ -580,35 +702,37 @@ function sanitizeGeneratedConfig(parsed: any, input: { name: string; type: strin
     }
   }
   parsed.needsInput = Array.isArray(parsed.needsInput) ? parsed.needsInput : [];
-  if (!input.hours && !parsed.needsInput.includes('operating hours')) parsed.needsInput.push('operating hours');
-  if (!servicesProvided && !parsed.needsInput.includes('service list and prices')) parsed.needsInput.push('service list and prices');
+  // Missing-fact markers use the same { field, label } shape everywhere so the
+  // wizard can render them uniformly, from the model path or the fallback.
+  if (!input.hours && !parsed.needsInput.some((n: any) => n && n.field === 'hours')) {
+    parsed.needsInput.push({ field: 'hours', label: 'Operating hours' });
+  }
+  if (!servicesProvided && !parsed.needsInput.some((n: any) => n && n.field === 'services')) {
+    parsed.needsInput.push({ field: 'services', label: 'Service list and prices' });
+  }
   return parsed;
 }
 
-function factSafeFallback(input: { name: string; type: string; description: string; hours?: string; services?: string }): any {
-  const needs: string[] = [];
-  if (!input.hours) needs.push('operating hours');
-  if (!input.services) needs.push('service list, prices, and durations');
-  if (!input.description) needs.push('business description / what you do');
-
-  return {
-    agentName: `${input.name} AI Assistant`,
-    systemPrompt:
-      `You are the official AI receptionist for ${input.name}. ` +
-      `Assist customers politely, answer questions using only configured knowledge, and book appointments when permitted. ` +
-      `NEVER state prices, operating hours, or service details that the business has not explicitly configured. ` +
-      `If a customer asks for something you don't have configured, say you'll check and escalate to a human rather than guessing.`,
-    personality: { tone: 'friendly', behavior: 'service', language: 'en' },
-    goals: ['Answer customer inquiries from configured knowledge', 'Book appointments', 'Escalate to a human when facts are missing'],
-    allowedActions: ['check_business_hours', 'get_business_information', 'check_availability', 'book_appointment', 'transfer_to_human'],
-    restrictedActions: ['Do not invent prices, hours, or services', 'Do not promise out-of-scope work'],
-    escalationRules: ['When customer requests a real human', 'When a required business fact is missing'],
-    suggestedFaqs: [
-      { question: 'How can I book an appointment?', answer: 'I can assist you directly with booking an appointment right here!' }
-    ],
-    suggestedServices: [
-      { name: 'NEEDS_INPUT', price: 'NEEDS_INPUT', durationMinutes: 'NEEDS_INPUT', description: 'NEEDS_INPUT' }
-    ],
-    needsInput: needs
-  };
+/**
+ * Parse model output as JSON, tolerating markdown code fences (```json ... ```)
+ * and stray prose around the JSON object. Throws when no valid JSON is found.
+ */
+function parseJsonFromModel(text: string): any {
+  const trimmed = text.trim();
+  const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = (fence ? fence[1] : trimmed).trim();
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    const start = candidate.indexOf('{');
+    const end = candidate.lastIndexOf('}');
+    if (start !== -1 && end > start) {
+      try {
+        return JSON.parse(candidate.slice(start, end + 1));
+      } catch {
+        // fall through
+      }
+    }
+    throw new Error('Model did not return valid JSON.');
+  }
 }

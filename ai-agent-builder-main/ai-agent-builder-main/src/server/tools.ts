@@ -9,6 +9,13 @@ export interface ToolContext {
   tenantId: string;
   conversationId?: string;
   channel?: string;
+  /**
+   * The exact set of tools enabled for the agent in scope. When provided,
+   * executeAgentTool refuses to run any tool NOT in this set — the backend
+   * enforces enablement even if the LLM (or a caller) requests a tool that
+   * was not offered in the function declarations.
+   */
+  toolsEnabled?: string[];
   /** Tool names the agent is permitted to invoke. If provided, any tool not
    * in this set is rejected before execution — defense-in-depth against the
    * LLM hallucinating a tool call that was never declared to it. */
@@ -47,6 +54,20 @@ export const agentToolDeclarations: FunctionDeclaration[] = [
           description: 'Topic filter, e.g. "services", "pricing", "location", "faqs", "policies"'
         }
       }
+    }
+  },
+  {
+    name: 'search_knowledge',
+    description: 'Search the business knowledge base (FAQs, policies, service catalog, documents) and return matching entries with title, type, content snippet and tags.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        query: {
+          type: Type.STRING,
+          description: 'Search term, e.g. "pricing", "opening hours", "beard oil", "cancellation policy".'
+        }
+      },
+      required: ['query']
     }
   },
   {
@@ -191,11 +212,18 @@ export async function executeAgentTool(
     return { success: false, error: `Unauthorized tenant ID: ${tenantId}` };
   }
 
-  // Defense-in-depth: verify the tool is permitted for this agent. Even though
-  // undeclared tools are never sent to the LLM, the model could hallucinate a
-  // tool name; the backend must independently reject it.
-  if (context.allowedToolNames && !context.allowedToolNames.includes(toolName)) {
-    return { success: false, error: `Tool '${toolName}' is not permitted for this agent.` };
+  // HARD tool enablement gate (both layers enforced): even if the LLM (or a
+  // caller) requests a tool that is not enabled for the agent in scope, we
+  // refuse to execute it. `toolsEnabled` is the agent's own configured set;
+  // `allowedToolNames` is the defense-in-depth set the runtime derived from
+  // the declarations it actually offered the model (so a hallucinated tool
+  // that was never declared is also rejected). This is enforced for EVERY
+  // tool in the switch below — never trust the frontend.
+  if (
+    (context.toolsEnabled && !context.toolsEnabled.includes(toolName)) ||
+    (context.allowedToolNames && !context.allowedToolNames.includes(toolName))
+  ) {
+    return { success: false, error: `Tool ${toolName} is not enabled for this agent (not permitted).` };
   }
 
   try {
@@ -251,6 +279,45 @@ export async function executeAgentTool(
         }
 
         return { success: true, data: result };
+      }
+
+      case 'search_knowledge': {
+        const rawQuery = String(args.query || '').trim();
+        const q = rawQuery.toLowerCase();
+        if (!q) {
+          return { success: true, data: { query: rawQuery, count: 0, matches: [], message: 'No search query provided.' } };
+        }
+
+        // Tenant-scoped search over THIS business's knowledge chunks only
+        // (title / tags / content — same approach as retrieveKnowledgeChunks).
+        const chunks = await db.knowledgeChunks
+          .filter(k => k.businessId === tenantId);
+        const scored = chunks
+          .map(k => {
+            const titleMatch = k.title.toLowerCase().includes(q);
+            const tagMatch = k.tags.some(t => q.includes(t.toLowerCase()));
+            const contentMatch = k.content.toLowerCase().includes(q);
+            const score = (titleMatch ? 3 : 0) + (tagMatch ? 2 : 0) + (contentMatch ? 1 : 0);
+            return { k, score };
+          })
+          .filter(m => m.score > 0)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 5);
+
+        return {
+          success: true,
+          data: {
+            query: rawQuery,
+            count: scored.length,
+            matches: scored.map(m => ({
+              id: m.k.id,
+              title: m.k.title,
+              type: m.k.type,
+              snippet: m.k.content.length > 300 ? `${m.k.content.slice(0, 300)}…` : m.k.content,
+              tags: m.k.tags
+            }))
+          }
+        };
       }
 
       case 'check_availability': {
@@ -351,17 +418,22 @@ export async function executeAgentTool(
             }
           }
 
+          // Assign an eligible staff member (engine honors staff hours, services,
+          // timeOff). A business with staff members requires at least one to
+          // cover the slot — fail honestly BEFORE creating the customer, so a
+          // rejected booking leaves no orphan rows.
+          const staffList = await db.staffMembers.filter(s => s.businessId === tenantId);
+          const staff = findEligibleStaff(business, staffList, service, date, startTime, endTime);
+          if (staffList.length > 0 && !staff) {
+            return { ok: false, error: 'No staff member is available at that time. Please choose another slot using check_availability.' };
+          }
+
           // Find or create the customer inside the transaction.
           let customer = await db.customers.find(c => c.businessId === tenantId && c.phone === customerPhone);
           if (!customer) {
             customer = { id: customerId, businessId: tenantId, name: customerName, phone: customerPhone, createdAt: nowIso };
             await db.customers.push(customer);
           }
-
-          // Assign an eligible staff member (engine honors staff hours, services,
-          // timeOff). Falls back to the first staff member when none configured.
-          const staffList = await db.staffMembers.filter(s => s.businessId === tenantId);
-          const staff = findEligibleStaff(business, staffList, service, date, startTime, endTime);
 
           const newAppointment = {
             id: appointmentId,
@@ -434,7 +506,7 @@ export async function executeAgentTool(
         await db.appointments.update(app);
 
         await db.auditLogs.push({
-          id: `log-${Date.now()}`,
+          id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           businessId: tenantId,
           action: 'APPOINTMENT_CANCELLED',
           details: `Appointment #${app.id} cancelled for ${app.customerName}`,
@@ -478,13 +550,29 @@ export async function executeAgentTool(
         const bufferAfter = Math.max(0, (svc as any).bufferMinutesAfter || 0);
         const blockEnd = bufferAfter > 0 ? addMinutes(newEndTime, bufferAfter) : newEndTime;
 
+        // Same staff rule as booking: if the business has staff members, the new
+        // slot must be covered by at least one (only when the service is known).
+        if (service) {
+          const staffList = await db.staffMembers.filter(s => s.businessId === tenantId);
+          const staffForSlot = findEligibleStaff(business, staffList, service, newDate, newTime, newEndTime);
+          if (staffList.length > 0 && !staffForSlot) {
+            return { success: false, error: 'No staff member is available at that time. Please choose another slot using check_availability.' };
+          }
+        }
+
         // Transactional overlap check (excluding the appointment being moved).
+        // Mirrors the booking overlap rule: each existing appointment also
+        // extends by its own service buffer, so a reschedule cannot land in
+        // another appointment's turnaround window.
         const r = await db.client.transaction(async () => {
           const others = await db.appointments.filter(
             a => a.businessId === tenantId && a.date === newDate && a.status !== 'CANCELLED' && a.id !== app.id
           );
           for (const a of others) {
-            if (intervalsOverlap(newTime, blockEnd, a.startTime, a.endTime)) {
+            const existingService = business.services.find(s => s.id === a.serviceId);
+            const existingBuffer = Math.max(0, existingService?.bufferMinutesAfter || 0);
+            const aBlockEnd = existingBuffer > 0 ? addMinutes(a.endTime, existingBuffer) : a.endTime;
+            if (intervalsOverlap(newTime, blockEnd, a.startTime, aBlockEnd)) {
               return { ok: false as const, error: `The time ${newTime}-${newEndTime} on ${newDate} overlaps an existing appointment (${a.startTime}-${a.endTime}).` };
             }
           }

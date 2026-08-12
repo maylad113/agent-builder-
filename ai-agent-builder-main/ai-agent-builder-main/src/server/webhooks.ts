@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { db } from './db';
 import { processAgentMessage } from './agentRuntime';
 import { getCredentials } from './integrations';
+import { rateLimit, RATE_LIMITS } from './security';
 
 /**
  * Phase 14/15: External channel webhooks (Meta/Instagram + Twilio/SMS).
@@ -28,6 +29,13 @@ import { getCredentials } from './integrations';
  */
 
 export const webhookRouter = Router();
+
+// H1: provider webhooks are PUBLIC endpoints that can trigger LLM replies (an
+// inbound message runs the agent runtime). Rate-limit per IP as defense-in-depth
+// on top of signature verification. The budget (RATE_LIMITS.webhooks) is
+// generous so legitimate provider bursts — Twilio callbacks, Meta event pages —
+// are never dropped, while a rogue client hammering the endpoint is throttled.
+webhookRouter.use(rateLimit({ ...RATE_LIMITS.webhooks, prefix: 'webhook' }));
 
 // ---------------------------------------------------------------------------
 // Idempotency: track processed inbound message ids for a short retention window.
