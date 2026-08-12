@@ -41,6 +41,12 @@ async function startServer() {
   app.use(secureHeaders);
   // Auth endpoints get a tighter budget to slow credential stuffing.
   app.use('/api/auth', rateLimit({ ...RATE_LIMITS.auth, prefix: 'auth' }));
+  // H1: umbrella budget for the whole dashboard API (RATE_LIMITS.api). Login,
+  // runtime chat, generate-config and webhooks also carry route/router-level
+  // budgets (see routes.ts / webhooks.ts); this covers every remaining
+  // authenticated route — including knowledge uploads, which trigger embedding
+  // calls. Skipped entirely in test mode, so the suite is unaffected.
+  app.use('/api', rateLimit({ ...RATE_LIMITS.api, prefix: 'api' }));
 
   // Static public directory (for embeddable widget.js script)
   app.use(express.static(path.join(projectRoot, 'public')));

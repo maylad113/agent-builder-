@@ -466,7 +466,9 @@ router.get(
 
 // Generate Suggested Agent Configuration (AI Assistant Wizard)
 // Auth required. Produces an EDITABLE PROPOSAL only — never auto-activates.
-router.post('/agents/generate-config', requireAuth, async (req: Request, res: Response) => {
+// H1: every call burns Gemini tokens, so it gets its own tighter budget,
+// applied BEFORE requireAuth so unauthenticated hammering is throttled too.
+router.post('/agents/generate-config', rateLimit({ ...RATE_LIMITS.generate, prefix: 'generate' }), requireAuth, async (req: Request, res: Response) => {
   const { name, type, description, hours, services, faqs } = req.body;
   if (!name || !type) {
     return res.status(400).json({ error: 'Name and type are required for agent generation.' });
