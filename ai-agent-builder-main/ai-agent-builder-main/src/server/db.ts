@@ -95,7 +95,7 @@ const TABLES: Record<string, TableConfig> = {
   },
   staffMembers: {
     table: 'staff_members',
-    jsonColumns: ['servicesHandled'],
+    jsonColumns: ['servicesHandled', 'workingHours', 'timeOff'],
     booleanColumns: []
   },
   products: {

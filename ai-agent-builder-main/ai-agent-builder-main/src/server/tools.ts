@@ -418,17 +418,22 @@ export async function executeAgentTool(
             }
           }
 
+          // Assign an eligible staff member (engine honors staff hours, services,
+          // timeOff). A business with staff members requires at least one to
+          // cover the slot — fail honestly BEFORE creating the customer, so a
+          // rejected booking leaves no orphan rows.
+          const staffList = db.staffMembers.filter(s => s.businessId === tenantId);
+          const staff = findEligibleStaff(business, staffList, service, date, startTime, endTime);
+          if (staffList.length > 0 && !staff) {
+            return { ok: false, error: 'No staff member is available at that time. Please choose another slot using check_availability.' };
+          }
+
           // Find or create the customer inside the transaction.
           let customer = db.customers.find(c => c.businessId === tenantId && c.phone === customerPhone);
           if (!customer) {
             customer = { id: customerId, businessId: tenantId, name: customerName, phone: customerPhone, createdAt: nowIso };
             db.customers.push(customer);
           }
-
-          // Assign an eligible staff member (engine honors staff hours, services,
-          // timeOff). Falls back to the first staff member when none configured.
-          const staffList = db.staffMembers.filter(s => s.businessId === tenantId);
-          const staff = findEligibleStaff(business, staffList, service, date, startTime, endTime);
 
           const newAppointment = {
             id: appointmentId,
@@ -547,13 +552,29 @@ export async function executeAgentTool(
         const bufferAfter = Math.max(0, (svc as any).bufferMinutesAfter || 0);
         const blockEnd = bufferAfter > 0 ? addMinutes(newEndTime, bufferAfter) : newEndTime;
 
+        // Same staff rule as booking: if the business has staff members, the new
+        // slot must be covered by at least one (only when the service is known).
+        if (service) {
+          const staffList = db.staffMembers.filter(s => s.businessId === tenantId);
+          const staffForSlot = findEligibleStaff(business, staffList, service, newDate, newTime, newEndTime);
+          if (staffList.length > 0 && !staffForSlot) {
+            return { success: false, error: 'No staff member is available at that time. Please choose another slot using check_availability.' };
+          }
+        }
+
         // Transactional overlap check (excluding the appointment being moved).
+        // Mirrors the booking overlap rule: each existing appointment also
+        // extends by its own service buffer, so a reschedule cannot land in
+        // another appointment's turnaround window.
         const rescheduleTxn = db.sqlite.transaction(() => {
           const others = db.appointments.filter(
             a => a.businessId === tenantId && a.date === newDate && a.status !== 'CANCELLED' && a.id !== app.id
           );
           for (const a of others) {
-            if (intervalsOverlap(newTime, blockEnd, a.startTime, a.endTime)) {
+            const existingService = business.services.find(s => s.id === a.serviceId);
+            const existingBuffer = Math.max(0, existingService?.bufferMinutesAfter || 0);
+            const aBlockEnd = existingBuffer > 0 ? addMinutes(a.endTime, existingBuffer) : a.endTime;
+            if (intervalsOverlap(newTime, blockEnd, a.startTime, aBlockEnd)) {
               return { ok: false as const, error: `The time ${newTime}-${newEndTime} on ${newDate} overlaps an existing appointment (${a.startTime}-${a.endTime}).` };
             }
           }

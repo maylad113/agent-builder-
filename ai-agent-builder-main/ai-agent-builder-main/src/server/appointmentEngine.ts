@@ -55,6 +55,40 @@ export function dayOfWeekForDate(dateStr: string, timezone?: string): string {
   return DAY_NAMES[d.getUTCDay()];
 }
 
+/**
+ * Interpret a business wall-clock (dateStr + timeStr) as an absolute instant in
+ * the BUSINESS timezone (not the server's). Notice/advance comparisons must be
+ * measured in the business's own clock: with a UTC server and an Asia/Tehran
+ * business, `new Date('2026-01-05T14:00:00')` lands 3.5h after the real slot
+ * instant, so a same-day booking with far less than the required notice would
+ * be accepted. The offset is probed at local noon of the target date, which
+ * avoids DST-transition ambiguity (transitions happen overnight).
+ * Falls back to server-local parsing when no timezone is given.
+ */
+export function zonedSlotInstant(dateStr: string, timeStr: string, timezone?: string): Date {
+  if (!timezone) return new Date(`${dateStr}T${timeStr}:00`);
+  try {
+    const probe = new Date(`${dateStr}T12:00:00`);
+    const fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone, hourCycle: 'h23',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
+    const p: Record<string, string> = {};
+    for (const part of fmt.formatToParts(probe)) p[part.type] = part.value;
+    const offsetMs = Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day), Number(p.hour), Number(p.minute), Number(p.second)) - probe.getTime();
+    const [h, m] = timeStr.split(':').map(n => parseInt(n, 10) || 0);
+    return new Date(Date.UTC(
+      parseInt(dateStr.slice(0, 4), 10),
+      parseInt(dateStr.slice(5, 7), 10) - 1,
+      parseInt(dateStr.slice(8, 10), 10),
+      h, m
+    ) - offsetMs);
+  } catch {
+    return new Date(`${dateStr}T${timeStr}:00`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Booking-notice policy parsing. The business stores human-readable policy
 // strings (e.g. "Appointments can be booked up to 14 days in advance"). We
@@ -135,9 +169,20 @@ export function findEligibleStaff(
            timeToMinutes(endTime) <= timeToMinutes(sw.closeTime);
   });
   if (withHours) return withHours;
-  // Fall back: any eligible staff member whose timeOff does not block the day.
-  const fallback = eligible.find(s => !(s.timeOff || []).some(t => t.date === dateStr));
-  return fallback || (eligible[0] || null);
+  // Fall back ONLY to staff with no working-hours schedule configured (their
+  // coverage defaults to the business hours). Never fall back to a staff member
+  // whose schedule explicitly excludes this slot — that would book a time no
+  // one is scheduled to work.
+  const fallback = eligible.find(s => {
+    if ((s.timeOff || []).some(t => t.date === dateStr)) return false;
+    const schedule = s.workingHours || [];
+    if (schedule.length === 0) return true; // no schedule → business hours apply
+    const sw = schedule.find(h => h.day === dayName);
+    if (!sw || !sw.isOpen) return false;    // has a schedule but not this day / closed
+    return timeToMinutes(startTime) >= timeToMinutes(sw.openTime) &&
+           timeToMinutes(endTime) <= timeToMinutes(sw.closeTime);
+  });
+  return fallback || null;
 }
 
 /**
@@ -167,9 +212,10 @@ export function validateSlot(
     return { ok: false, error: `Requested time ${startTime}-${endTime} is outside opening hours (${dayHours.openTime}-${dayHours.closeTime}) on ${dayName}.`, endTime };
   }
 
-  // Booking notice / advance rules.
+  // Booking notice / advance rules — measured in the BUSINESS timezone so the
+  // comparison is honest for businesses whose clock differs from the server's.
   const notice = parseBookingNotice(business.policies);
-  const slotLocal = new Date(`${dateStr}T${startTime}:00`);
+  const slotLocal = zonedSlotInstant(dateStr, startTime, business.timezone);
   const diffMs = slotLocal.getTime() - now.getTime();
   const diffMin = diffMs / 60000;
   if (diffMin < notice.minimumNoticeMinutes) {
@@ -216,8 +262,8 @@ export function generateAvailableSlots(
     const end = minutesToTime(t + duration);
     const blockEnd = minutesToTime(t + duration + bufferAfter);
 
-    // Honor minimum notice: skip slots that are too soon.
-    const slotLocal = new Date(`${dateStr}T${start}:00`);
+    // Honor minimum notice: skip slots that are too soon (business-timezone clock).
+    const slotLocal = zonedSlotInstant(dateStr, start, business.timezone);
     if (slotLocal.getTime() < minSlotLocalMs) continue;
 
     // If the business has staff members, require at least one who can cover

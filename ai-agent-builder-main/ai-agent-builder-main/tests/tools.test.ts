@@ -22,6 +22,8 @@ delete process.env.GEMINI_API_KEY;
 // Seeding runs against it, so all assertions go through the same instance.
 const { db } = await import('../src/server/db');
 const { executeAgentTool, agentToolDeclarations } = await import('../src/server/tools');
+const { dayOfWeekForDate } = await import('../src/server/appointmentEngine');
+import type { BusinessHours } from '../src/types';
 
 const TENANT = 'biz-tonys-barber';
 const SVC_HAIRCUT = 'srv-1'; // 30 min, 09:00-20:00 weekdays in seed
@@ -255,5 +257,164 @@ describe('tool permission gate: an agent cannot run a non-enabled tool', () => {
     expect(activeNames).not.toContain('book_appointment');
     expect(activeNames).not.toContain('create_order');
     expect(activeNames).not.toContain('transfer_to_human');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Appointment lifecycle: staff schedules, cancellation frees the slot,
+// reschedule applies the same rules as booking. Uses a dedicated business
+// with per-staff working hours (Amy 09-12, Pam 13-17) and a 15-min buffer on
+// the "Style" service.
+// ---------------------------------------------------------------------------
+describe('appointment lifecycle: staff coverage, cancel-frees-slot, reschedule rules', () => {
+  const SCHEDULED_BIZ = 'biz-staff-schedule';
+  const STAFF_AM = 'sch-staff-am';
+  const STAFF_PM = 'sch-staff-pm';
+  // The next Monday, so staff schedules (monday entry) apply and the date is
+  // always in the future (no notice-policy interference: policies are empty).
+  const MON = (() => {
+    const d = new Date();
+    const add = (8 - d.getDay()) % 7 || 7;
+    d.setDate(d.getDate() + add);
+    return d.toISOString().split('T')[0];
+  })();
+  const mondayName = dayOfWeekForDate(MON, 'Asia/Tehran'); // 'monday'
+  const ctx = { tenantId: SCHEDULED_BIZ };
+
+  beforeAll(() => {
+    const week: Array<BusinessHours['day']> = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
+    db.businesses.push({
+      id: SCHEDULED_BIZ, name: 'Staffed Salon', type: 'salon',
+      description: '', location: 'Downtown',
+      language: 'en', currency: 'USD', timezone: 'Asia/Tehran',
+      hours: week.map(day => ({
+        day, isOpen: day !== 'sunday', openTime: '09:00', closeTime: '18:00'
+      })),
+      services: [
+        { id: 'svc-cut', name: 'Cut', price: 20, durationMinutes: 30, description: '' },
+        { id: 'svc-style', name: 'Style', price: 25, durationMinutes: 30, description: '', bufferMinutesAfter: 15 }
+      ],
+      faqs: [], policies: { cancellation: '', refund: '', bookingNotice: '' },
+      communicationStyle: '', status: 'ACTIVE', createdAt: '', updatedAt: ''
+    });
+    db.staffMembers.push(
+      { id: STAFF_AM, businessId: SCHEDULED_BIZ, name: 'Amy', role: 'stylist',
+        servicesHandled: ['svc-cut', 'svc-style'],
+        workingHours: [{ day: mondayName as BusinessHours['day'], isOpen: true, openTime: '09:00', closeTime: '12:00' }] },
+      { id: STAFF_PM, businessId: SCHEDULED_BIZ, name: 'Pam', role: 'stylist',
+        servicesHandled: ['svc-cut', 'svc-style'],
+        workingHours: [{ day: mondayName as BusinessHours['day'], isOpen: true, openTime: '13:00', closeTime: '17:00' }] }
+    );
+  });
+
+  it('check_availability excludes slots no staff member is scheduled to work', async () => {
+    const r = await executeAgentTool('check_availability', {
+      serviceId: 'Cut', date: MON
+    }, ctx);
+    expect(r.success).toBe(true);
+    expect(r.data.availableSlots).toContain('11:00');   // Amy covers
+    expect(r.data.availableSlots).not.toContain('17:30'); // inside business hours but no staff
+  });
+
+  it('books and assigns the eligible staff member whose hours cover the slot', async () => {
+    const r = await executeAgentTool('book_appointment', {
+      customerName: 'Alice Staff', customerPhone: '+19990000001',
+      serviceIdOrName: 'Cut', date: MON, startTime: '10:00'
+    }, ctx);
+    expect(r.success).toBe(true);
+    const appt = db.appointments.find(a => a.id === r.data.appointmentId)!;
+    expect(appt.staffMemberId).toBe(STAFF_AM);
+  });
+
+  it('rejects a booking at a time no staff member is scheduled (even inside business hours)', async () => {
+    const r = await executeAgentTool('book_appointment', {
+      customerName: 'Late Staff', customerPhone: '+19990000002',
+      serviceIdOrName: 'Cut', date: MON, startTime: '17:30'
+    }, ctx);
+    expect(r.success).toBe(false);
+    expect(String(r.error)).toMatch(/staff/i);
+    // No appointment row was created.
+    const rows = db.appointments.filter(a => a.businessId === SCHEDULED_BIZ && a.date === MON && a.startTime === '17:30');
+    expect(rows).toHaveLength(0);
+  });
+
+  it('reschedules to a valid slot and updates date/time/status', async () => {
+    const book = await executeAgentTool('book_appointment', {
+      customerName: 'Move Me', customerPhone: '+19990000005',
+      serviceIdOrName: 'Cut', date: MON, startTime: '11:30' // Amy covers 09-12
+    }, ctx);
+    expect(book.success).toBe(true);
+    const apptId = book.data.appointmentId;
+
+    const r = await executeAgentTool('reschedule_appointment', {
+      appointmentId: apptId, newDate: MON, newTime: '16:00' // Pam covers 13-17
+    }, ctx);
+    expect(r.success).toBe(true);
+    const moved = db.appointments.find(a => a.id === apptId)!;
+    expect(moved.date).toBe(MON);
+    expect(moved.startTime).toBe('16:00');
+    expect(moved.endTime).toBe('16:30');
+    expect(moved.status).toBe('RESCHEDULED');
+  });
+
+  it('reschedule rejects a slot inside another appointment\'s buffer window', async () => {
+    // Appt A: "Style" at 13:00 (13:00-13:30) with a 15-min buffer → blocks 13:00-13:45.
+    const a = await executeAgentTool('book_appointment', {
+      customerName: 'Buffer A', customerPhone: '+19990000006',
+      serviceIdOrName: 'Style', date: MON, startTime: '13:00'
+    }, ctx);
+    expect(a.success).toBe(true);
+    const apptA = db.appointments.find(x => x.id === a.data.appointmentId)!;
+    expect(apptA.staffMemberId).toBe(STAFF_PM);
+
+    // Appt B: "Cut" at 14:00, then try to move it into A's buffer window (13:15).
+    const b = await executeAgentTool('book_appointment', {
+      customerName: 'Buffer B', customerPhone: '+19990000007',
+      serviceIdOrName: 'Cut', date: MON, startTime: '14:00'
+    }, ctx);
+    expect(b.success).toBe(true);
+
+    const r = await executeAgentTool('reschedule_appointment', {
+      appointmentId: b.data.appointmentId, newDate: MON, newTime: '13:15'
+    }, ctx);
+    expect(r.success).toBe(false);
+    expect(String(r.error)).toMatch(/overlap/i);
+    // B is unchanged.
+    const unchanged = db.appointments.find(x => x.id === b.data.appointmentId)!;
+    expect(unchanged.startTime).toBe('14:00');
+  });
+
+  it('cancelling an appointment frees the slot for re-booking', async () => {
+    // Book 15:00 (Pam covers), then cancel it, then re-book the SAME slot.
+    const book = await executeAgentTool('book_appointment', {
+      customerName: 'Cancel Me', customerPhone: '+19990000003',
+      serviceIdOrName: 'Cut', date: MON, startTime: '15:00'
+    }, ctx);
+    expect(book.success).toBe(true);
+    const apptId = book.data.appointmentId;
+
+    const cancel = await executeAgentTool('cancel_appointment', {
+      appointmentId: apptId
+    }, ctx);
+    expect(cancel.success).toBe(true);
+    const cancelled = db.appointments.find(a => a.id === apptId)!;
+    expect(cancelled.status).toBe('CANCELLED');
+
+    const rebook = await executeAgentTool('book_appointment', {
+      customerName: 'Rebooked', customerPhone: '+19990000004',
+      serviceIdOrName: 'Cut', date: MON, startTime: '15:00'
+    }, ctx);
+    expect(rebook.success).toBe(true);
+    expect(rebook.data.appointmentId).not.toBe(apptId);
+  });
+
+  it('reschedule rejects a new time no staff member is scheduled to work', async () => {
+    const appt = db.appointments.find(a => a.businessId === SCHEDULED_BIZ && a.startTime === '16:00');
+    expect(appt).toBeTruthy();
+    const r = await executeAgentTool('reschedule_appointment', {
+      appointmentId: appt!.id, newDate: MON, newTime: '17:30'
+    }, ctx);
+    expect(r.success).toBe(false);
+    expect(String(r.error)).toMatch(/staff/i);
   });
 });
