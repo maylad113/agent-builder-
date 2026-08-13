@@ -6,6 +6,7 @@ import http from 'http';
 import { router as apiRouter } from './src/server/routes';
 import { webhookRouter } from './src/server/webhooks';
 import { requestId, rateLimit, secureHeaders, RATE_LIMITS } from './src/server/security';
+import { validateProductionConfig } from './src/server/auth';
 import { db } from './src/server/db';
 
 // Resolve the project root in both run modes:
@@ -19,6 +20,12 @@ const projectRoot = IS_CJS ? path.join(__dirname, '..') : serverDir;
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
+
+  // Eagerly validate production-only security config (audit P2.7). In
+  // production this throws before the server boots if SESSION_SECRET is missing
+  // or shorter than 32 chars; in dev/test it is a no-op so the app still runs
+  // without any environment configuration.
+  validateProductionConfig();
 
   // Initialize the persistent database (migrations + embeddings table + seed
   // demo data) before mounting routes. On PostgreSQL this runs real async

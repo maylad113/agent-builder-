@@ -32,3 +32,18 @@ export function verifyPassword(password: string, stored: string): boolean {
   });
   return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
 }
+
+/**
+ * A lazily-computed scrypt hash used as a CONSTANT dummy for unknown-user login
+ * attempts (audit P2.6). Running verifyPassword against this fixed hash keeps
+ * the CPU cost of a "user not found" response identical to a wrong-password
+ * response, so an attacker cannot enumerate accounts by timing. Computed once
+ * (first unknown-user login pays the one-time scrypt cost) with the same
+ * N/r/p as production hashes.
+ */
+let _dummyHash: string | null = null;
+export function getDummyPasswordHash(): string {
+  if (_dummyHash) return _dummyHash;
+  _dummyHash = hashPassword('dummy-unknown-user-password');
+  return _dummyHash;
+}

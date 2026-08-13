@@ -225,11 +225,18 @@ interface RateLimitOptions {
   max: number;
   /** Optional key prefix to namespace different routes. */
   prefix?: string;
+  /** Optional function deriving a composite key from the request. When set,
+   *  the bucket key is `prefix:keyFn(req)` instead of `prefix:ip`. Used by the
+   *  public widget to rate-limit per-tenant-per-IP (audit P2.8): one abusive
+   *  customer hitting Business A must not exhaust the IP budget for Business B
+   *  on the same NAT IP, and one tenant being hammered must not starve others. */
+  keyFn?: (req: Request) => string;
 }
 
 export function rateLimit(opts: RateLimitOptions) {
   const max = opts.max;
   const prefix = opts.prefix ? opts.prefix + ':' : '';
+  const keyFn = opts.keyFn;
   return (req: Request, res: Response, next: NextFunction): void => {
     // Skip rate limiting in test mode so the suite can drive many requests.
     // Tests that WANT to exercise the limiter opt in with RATE_LIMIT_TEST=1.
@@ -238,7 +245,21 @@ export function rateLimit(opts: RateLimitOptions) {
     // make expiry tests fast). Ignored when unset/NaN.
     const windowMs = Number(process.env.RATE_LIMIT_WINDOW_MS) || opts.windowMs;
     const ip = (req.ip || req.socket?.remoteAddress || 'unknown').replace(/^::ffff:/, '');
-    const key = `${prefix}${ip}`;
+    let bucketKey: string;
+    if (keyFn) {
+      // Derive the composite key, but always fold the client IP in so a single
+      // keyFn collision (e.g. same tenantId from many IPs) cannot become an
+      // unprotected unlimited bucket, and so the per-IP abuse ceiling still holds.
+      let derived = '';
+      try { derived = String(keyFn(req) ?? ''); } catch { derived = ''; }
+      // Bound the derived segment to avoid unbounded key growth from a
+      // malformed/oversized tenantId in the body.
+      if (derived.length > 128) derived = derived.slice(0, 128);
+      bucketKey = derived ? `${prefix}${derived}:${ip}` : `${prefix}${ip}`;
+    } else {
+      bucketKey = `${prefix}${ip}`;
+    }
+    const key = bucketKey;
     const now = Date.now();
     const { count, windowStart } = store.incr(key, windowMs, now);
     if (count > max) {

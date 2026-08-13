@@ -3,6 +3,7 @@ import { db } from './db';
 import { agentToolDeclarations, executeAgentTool } from './tools';
 import { retrieveRelevant } from './embeddings';
 import { ChannelType, ToolCallRecord } from '../types';
+import { safeError } from './logSanitizer';
 
 let aiClient: GoogleGenAI | null = null;
 
@@ -440,7 +441,7 @@ CRITICAL MANDATES:
   } catch (err: any) {
     // Log the real error internally with the execution id for support; never
     // expose the provider's error message/stack to the customer.
-    console.error(`[runtime] ${executionId} Gemini error:`, err?.message || err);
+    safeError(`[runtime] ${executionId} Gemini error:`, err?.message || err);
     runtimeError = err?.message || 'AI Provider Error';
     // Honest fallback: report the outage, never claim any action succeeded.
     // Internal error details stay server-side (and in debug for internal callers).
@@ -623,7 +624,7 @@ Return ONLY a JSON object (no markdown, no prose, no code fences) with exactly t
       return sanitizeGeneratedConfig(parsed, businessInput);
     }
   } catch (err: any) {
-    console.error('Auto Agent Gen Error:', err);
+    safeError('Auto Agent Gen Error:', err);
   }
 
   // Honest fallback (no key / model error / invalid JSON): reflects ONLY the

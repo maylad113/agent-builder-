@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { db } from './db';
 import { processAgentMessage, generateSuggestedAgentConfig } from './agentRuntime';
-import { executeAgentTool } from './tools';
+import { executeAgentTool, ALL_TOOL_NAMES } from './tools';
 import {
   createInitialDraft, createDraftFrom, editDraft, publishVersion,
   rollbackToVersion, archiveVersion, moveToTesting, listVersions,
@@ -10,13 +10,14 @@ import {
 import { indexChunk, removeEmbedding } from './embeddings';
 import { assertActivatable, readinessSnapshot } from './readiness';
 import { rateLimit, RATE_LIMITS } from './security';
+import { safeError } from './logSanitizer';
 import {
   getProvider, runValidation, storeCredentials, getCredentials, clearCredentials,
   sanitizeIntegrationForClient
 } from './integrations';
 import { widgetCorsHeaders } from './widgetSecurity';
 import { Business, Agent, AgentStatus, KnowledgeChunk, Product, Appointment, Order, User, Conversation, AgentVersion } from '../types';
-import { verifyPassword } from './passwords';
+import { verifyPassword, getDummyPasswordHash } from './passwords';
 import {
   requireAuth,
   requireRole,
@@ -100,6 +101,11 @@ router.post('/auth/login', rateLimit({ ...RATE_LIMITS.auth, max: 10, prefix: 'lo
   }
   const user = await db.users.find(u => u.email.toLowerCase() === String(email).toLowerCase());
   if (!user) {
+    // Timing-safe dummy verification (audit P2.6): an unknown user still pays
+    // the scrypt cost against a fixed dummy hash, so a "user not found"
+    // response is indistinguishable by timing from a "wrong password"
+    // response. Without this an attacker could enumerate valid emails.
+    verifyPassword(String(password), getDummyPasswordHash());
     return res.status(401).json({ error: 'Invalid email or password.' });
   }
   if (!verifyPassword(String(password), user.passwordHash)) {
@@ -845,7 +851,7 @@ router.options('/runtime/chat', asyncHandler(async (req: Request, res: Response)
 //    DRAFT/TESTING/READY agents before deploying). Passing agentId requires a
 //    valid session AND tenant access to that agent. Debug is included only for
 //    authenticated sessions scoped to the tenant being chatted with.
-router.post('/runtime/chat', rateLimit({ ...RATE_LIMITS.public, prefix: 'chat' }), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/runtime/chat', rateLimit({ ...RATE_LIMITS.public, prefix: 'chat', keyFn: (req) => String(req.body?.tenantId ?? '') }), async (req: Request, res: Response, next: NextFunction) => {
   // Per-business origin enforcement (P1.2): the widget may only POST from an
   // origin the business explicitly allow-listed. This prevents cross-tenant
   // impersonation and arbitrary-origin abuse. Tenancy is still enforced by
@@ -937,7 +943,7 @@ router.post('/runtime/chat', rateLimit({ ...RATE_LIMITS.public, prefix: 'chat' }
     const msg = err?.message || '';
     const isConfigError = /No agent configured|Business not found|No published version|not ACTIVE/i.test(msg);
     const status = isConfigError ? 503 : 500;
-    console.error(`[runtime/chat] ${msg || 'Agent runtime processing failed'}`);
+    safeError(`[runtime/chat] ${msg || 'Agent runtime processing failed'}`);
     res.status(status).json({
       error: 'Agent runtime processing failed',
       fallbackMessage: "I am having trouble processing your request right now. I will connect you with a team member."
@@ -1062,11 +1068,24 @@ router.delete(
 router.get('/appointments', requireAuth, requireTenantScope, asyncHandler(async (req: Request, res: Response) => {
   const { date, status } = req.query;
   const businessId = res.locals.businessId as string | null;
-  let apps = businessId ? await db.appointments.filter(a => a.businessId === businessId) : await db.appointments.toJSON();
-
+  if (businessId) {
+    // DB-side pagination (audit P2.9): build a parameterized WHERE so we never
+    // materialize the whole appointments table into memory.
+    const where: string[] = ['business_id = ?'];
+    const params: any[] = [businessId];
+    if (date) { where.push('date = ?'); params.push(String(date)); }
+    if (status) { where.push('status = ?'); params.push(String(status)); }
+    const limit = Math.min(Math.max(1, parseInt(String(req.query.limit ?? ''), 10) || PAGINATION_DEFAULT), PAGINATION_MAX);
+    const offset = Math.max(0, parseInt(String(req.query.cursor ?? ''), 10) || 0);
+    const { rows, total } = await db.appointments.paginateWhere(where.join(' AND '), params, { orderBy: 'date', limit, offset });
+    res.setHeader('X-Total-Count', String(total));
+    if (offset + limit < total) res.setHeader('X-Next-Cursor', String(offset + limit));
+    return res.json(rows);
+  }
+  // Platform-owner (no tenant scope): fall back to legacy full-list pagination.
+  let apps = await db.appointments.toJSON();
   if (date) apps = apps.filter(a => a.date === date);
   if (status) apps = apps.filter(a => a.status === status);
-
   res.json(paginate(apps, req, res));
 }));
 
@@ -1078,6 +1097,9 @@ router.post('/appointments', requireAuth, requireTenantScope, asyncHandler(async
   // Delegate to the same transactional booking engine the agent runtime uses,
   // so the REST API and the AI tool share ONE source of truth for overlap
   // prevention, service-duration end times, and business-hours validation.
+  // This is a TRUSTED server-side caller (already authenticated + tenant-
+  // scoped), so it passes the full enabled-tool set to the authorization gate
+  // (the gate never defaults to permitting — audit P1.1).
   const result = await executeAgentTool('book_appointment', {
     serviceIdOrName: serviceId,
     customerName,
@@ -1085,7 +1107,7 @@ router.post('/appointments', requireAuth, requireTenantScope, asyncHandler(async
     date,
     startTime,
     notes
-  }, { tenantId: businessId, channel: 'web_chat' });
+  }, { tenantId: businessId, channel: 'web_chat', toolsEnabled: ALL_TOOL_NAMES });
 
   if (!result.success) {
     return res.status(409).json({ error: result.error });
@@ -1173,7 +1195,16 @@ router.post('/products', requireAuth, requireTenantScope, asyncHandler(async (re
 
 router.get('/orders', requireAuth, requireTenantScope, asyncHandler(async (req: Request, res: Response) => {
   const businessId = res.locals.businessId as string | null;
-  const orders = businessId ? await db.orders.filter(o => o.businessId === businessId) : await db.orders.toJSON();
+  if (businessId) {
+    // DB-side pagination (audit P2.9).
+    const limit = Math.min(Math.max(1, parseInt(String(req.query.limit ?? ''), 10) || PAGINATION_DEFAULT), PAGINATION_MAX);
+    const offset = Math.max(0, parseInt(String(req.query.cursor ?? ''), 10) || 0);
+    const { rows, total } = await db.orders.paginateWhere('business_id = ?', [businessId], { orderBy: 'created_at', desc: true, limit, offset });
+    res.setHeader('X-Total-Count', String(total));
+    if (offset + limit < total) res.setHeader('X-Next-Cursor', String(offset + limit));
+    return res.json(rows);
+  }
+  const orders = await db.orders.toJSON();
   res.json(paginate(orders, req, res));
 }));
 
@@ -1183,7 +1214,16 @@ router.get('/orders', requireAuth, requireTenantScope, asyncHandler(async (req: 
 
 router.get('/conversations', requireAuth, requireTenantScope, asyncHandler(async (req: Request, res: Response) => {
   const businessId = res.locals.businessId as string | null;
-  const convs = businessId ? await db.conversations.filter(c => c.businessId === businessId) : await db.conversations.toJSON();
+  if (businessId) {
+    // DB-side pagination (audit P2.9): avoid loading all conversations.
+    const limit = Math.min(Math.max(1, parseInt(String(req.query.limit ?? ''), 10) || PAGINATION_DEFAULT), PAGINATION_MAX);
+    const offset = Math.max(0, parseInt(String(req.query.cursor ?? ''), 10) || 0);
+    const { rows, total } = await db.conversations.paginateWhere('business_id = ?', [businessId], { orderBy: 'last_message_at', desc: true, limit, offset });
+    res.setHeader('X-Total-Count', String(total));
+    if (offset + limit < total) res.setHeader('X-Next-Cursor', String(offset + limit));
+    return res.json(rows);
+  }
+  const convs = await db.conversations.toJSON();
   res.json(paginate(convs, req, res));
 }));
 
@@ -1393,7 +1433,28 @@ router.post(
     if (!credentials || typeof credentials !== 'object' || Array.isArray(credentials)) {
       return res.status(400).json({ error: 'credentials object is required.' });
     }
-    storeCredentials(integ.id, credentials);
+    // Audit P2.11: validate each credential value BEFORE storing. Reject empty
+    // strings and bound length so a giant value can't blow up storage/logs, and
+    // so a stray empty form field doesn't mark the integration "configured".
+    const MAX_CRED_LEN = 4096;
+    const clean: Record<string, string> = {};
+    for (const [k, v] of Object.entries(credentials)) {
+      if (typeof v !== 'string') {
+        return res.status(400).json({ error: `Credential "${k}" must be a string.` });
+      }
+      const trimmed = v.trim();
+      if (!trimmed) {
+        return res.status(400).json({ error: `Credential "${k}" must not be empty.` });
+      }
+      if (trimmed.length > MAX_CRED_LEN) {
+        return res.status(400).json({ error: `Credential "${k}" exceeds the maximum length of ${MAX_CRED_LEN} characters.` });
+      }
+      clean[k] = trimmed;
+    }
+    if (Object.keys(clean).length === 0) {
+      return res.status(400).json({ error: 'At least one credential value is required.' });
+    }
+    storeCredentials(integ.id, clean);
     integ.credentialsSet = true;
     integ.state = 'CONFIGURING';
     integ.lastError = undefined;

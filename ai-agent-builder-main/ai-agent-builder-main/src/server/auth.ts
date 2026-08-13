@@ -38,12 +38,36 @@ export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 function getSecret(): string {
   const secret = process.env.SESSION_SECRET;
-  if (secret) return secret;
+  if (secret) {
+    // Audit P2.7: a weak/short secret makes the session HMAC forgeable. Require
+    // >= 32 characters of entropy in production (the dev fallback below is only
+    // used outside production).
+    if (process.env.NODE_ENV === 'production' && secret.length < 32) {
+      throw new Error('SESSION_SECRET must be at least 32 characters long in production.');
+    }
+    return secret;
+  }
   if (process.env.NODE_ENV === 'production') {
     throw new Error('SESSION_SECRET environment variable must be set in production.');
   }
   // Development fallback — never logged, never sent to the frontend.
   return 'dev-session-secret-change-me-in-production';
+}
+
+/**
+ * Eagerly validate the session secret at server startup (audit P2.7). Throwing
+ * here prevents the server from booting with a weak/missing production secret,
+ * rather than failing lazily on the first login attempt. No-op outside prod.
+ */
+export function validateProductionConfig(): void {
+  if (process.env.NODE_ENV !== 'production') return;
+  const secret = process.env.SESSION_SECRET;
+  if (!secret) {
+    throw new Error('SESSION_SECRET environment variable must be set in production.');
+  }
+  if (secret.length < 32) {
+    throw new Error('SESSION_SECRET must be at least 32 characters long in production.');
+  }
 }
 
 function sign(value: string): string {

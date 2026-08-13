@@ -67,7 +67,13 @@ export class SqliteClient implements DbClient {
   private _txTail: Promise<unknown> = Promise.resolve();
 
   async query(sql: string, params: any[] = []): Promise<QueryResult> {
-    const stmt = this.sqlite.prepare(sql);
+    // SQLite does not understand `FOR UPDATE` (it is a syntax error), but the
+    // locking semantics it expresses are a no-op here anyway: writes already
+    // serialize on the per-connection mutex. Strip a trailing FOR UPDATE
+    // clause so application code can use the same portable SQL on both
+    // dialects (Postgres honors it for row-level locking; SQLite ignores it).
+    const portable = stripForUpdate(sql);
+    const stmt = this.sqlite.prepare(portable);
     // SELECT vs INSERT/UPDATE/DELETE: better-sqlite3 exposes .all()/.run().
     // We detect by trying .all() first when the statement returns rows.
     const info = stmt.reader ? stmt.all(...params) : stmt.run(...params) as any;
@@ -79,11 +85,11 @@ export class SqliteClient implements DbClient {
 
   async exec(sql: string, params: any[] = []): Promise<QueryResult> {
     if (params.length) {
-      const stmt = this.sqlite.prepare(sql);
+      const stmt = this.sqlite.prepare(stripForUpdate(sql));
       const r = stmt.run(...params) as { changes: number };
       return { rows: [], changes: r.changes };
     }
-    this.sqlite.exec(sql);
+    this.sqlite.exec(stripForUpdate(sql));
     return { rows: [], changes: 0 };
   }
 
@@ -273,6 +279,17 @@ export class PostgresClient implements DbClient {
   async close(): Promise<void> {
     if (this.pool) await this.pool.end();
   }
+}
+
+/** Remove a trailing `FOR UPDATE` clause from a single SQL statement. SQLite
+ *  treats FOR UPDATE as a syntax error; Postgres honors it for row locking.
+ *  Only a trailing (possibly `NOWAIT`/`SKIP LOCKED`-suffixed) FOR UPDATE is
+ *  stripped, so it never touches string literals. */
+export function stripForUpdate(sql: string): string {
+  // Quick exit — no need to scan the common case.
+  if (!/for update/i.test(sql)) return sql;
+  // Strip a trailing FOR UPDATE [NOWAIT|SKIP LOCKED] (case-insensitive).
+  return sql.replace(/\s+for\s+update(?:\s+(?:nowait|skip\s+locked))?$/i, '');
 }
 
 /** Split a SQL script into individual statements on top-level `;`, respecting

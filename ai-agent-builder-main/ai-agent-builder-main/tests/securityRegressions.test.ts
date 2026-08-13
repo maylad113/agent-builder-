@@ -24,6 +24,7 @@ process.env.DB_PATH = path.join(tmpDir, 'sec.db');
 
 const { router } = await import('../src/server/routes');
 const { db } = await import('../src/server/db');
+const { rateLimit, setRateLimitStore, MemoryRateLimitStore } = await import('../src/server/security');
 
 function makeApp() {
   const app = express();
@@ -215,10 +216,11 @@ describe('tool permission enforcement (defense-in-depth)', () => {
       serviceId: 'svc-haircut', date: '2025-01-15', time: '10:00'
     }, {
       tenantId: 'biz-tonys-barber',
+      toolsEnabled: ['check_business_hours'],
       allowedToolNames: ['check_business_hours', 'get_business_information']
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain('not permitted');
+    expect(result.error).toContain('not enabled');
   });
 
   it('executes a permitted tool normally', async () => {
@@ -228,6 +230,7 @@ describe('tool permission enforcement (defense-in-depth)', () => {
     expect(biz).toBeTruthy();
     const result = await executeAgentTool('check_business_hours', {}, {
       tenantId: 'biz-tonys-barber',
+      toolsEnabled: ['check_business_hours'],
       allowedToolNames: ['check_business_hours']
     });
     expect(result.success).toBe(true);
@@ -238,9 +241,156 @@ describe('tool permission enforcement (defense-in-depth)', () => {
     const { executeAgentTool } = await import('../src/server/tools');
     const result = await executeAgentTool('check_business_hours', {}, {
       tenantId: 'biz-does-not-exist',
+      toolsEnabled: ['check_business_hours'],
       allowedToolNames: ['check_business_hours']
     });
     expect(result.success).toBe(false);
     expect(result.error).toContain('Unauthorized');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2.11 — integration credential input validation (audit hardening).
+// Submitting credentials to an integration must reject:
+//   - non-string values
+//   - empty / whitespace-only values
+//   - oversize values (storage/log-blowup prevention)
+// A valid submission still stores and flips the integration to CONFIGURING.
+// Uses the seeded demo integration `integ-1` (google_calendar) on
+// biz-tonys-barber, owned by the platform owner.
+// ---------------------------------------------------------------------------
+describe('P2.11 integration credential validation', () => {
+  it('rejects a non-string credential value', async () => {
+    const r = await owner.post('/api/integrations/integ-1/credentials')
+      .send({ credentials: { client_secret: 12345 } });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/must be a string/i);
+  });
+
+  it('rejects an empty / whitespace credential value', async () => {
+    const r = await owner.post('/api/integrations/integ-1/credentials')
+      .send({ credentials: { client_secret: '   ' } });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/must not be empty/i);
+  });
+
+  it('rejects an oversize credential value', async () => {
+    const r = await owner.post('/api/integrations/integ-1/credentials')
+      .send({ credentials: { client_secret: 'x'.repeat(5000) } });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/maximum length/i);
+  });
+
+  it('rejects when credentials is not an object', async () => {
+    const r = await owner.post('/api/integrations/integ-1/credentials')
+      .send({ credentials: 'not-an-object' });
+    expect(r.status).toBe(400);
+  });
+
+  it('stores valid credentials and flips the integration to CONFIGURING', async () => {
+    const r = await owner.post('/api/integrations/integ-1/credentials')
+      .send({ credentials: { client_id: 'abc', client_secret: 'shh' } });
+    expect(r.status).toBe(200);
+    expect(r.body.state).toBe('CONFIGURING');
+    // Credentials themselves must NEVER be echoed back to the client.
+    expect(JSON.stringify(r.body)).not.toContain('shh');
+    // Re-fetch the integration list (sanitized) and confirm the persisted state.
+    const list = await owner.get('/api/integrations?businessId=biz-tonys-barber');
+    const integ = list.body.find((i: any) => i.id === 'integ-1');
+    expect(integ.state).toBe('CONFIGURING');
+    expect(integ.credentialsSet).toBe(true);
+    expect(JSON.stringify(integ)).not.toContain('shh');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2.8 — per-tenant widget rate limit (audit hardening).
+// The public /runtime/chat limiter must key on (tenantId, ip) so that hammering
+// Business A does not exhaust the IP budget for Business B on the same NAT IP.
+// We exercise the limiter directly with RATE_LIMIT_TEST=1 and a tiny window.
+// ---------------------------------------------------------------------------
+describe('P2.8 per-tenant widget rate limit', () => {
+
+  function makeKeyedLimiter() {
+    return rateLimit({
+      windowMs: 60_000, max: 2, prefix: 'chat',
+      keyFn: (req: any) => String(req.body?.tenantId ?? '')
+    });
+  }
+
+  function fakeReq(tenantId: string, ip = '1.2.3.4') {
+    const req: any = { body: { tenantId }, ip, socket: { remoteAddress: ip } };
+    return req;
+  }
+  function fakeRes() {
+    const headers: Record<string, string> = {};
+    let status = 200;
+    let body: any = null;
+    return {
+      setHeader(k: string, v: string) { headers[k] = v; },
+      status(s: number) { status = s; return this; },
+      json(b: any) { body = b; return this; },
+      get state() { return status; },
+      get body() { return body; },
+      get headers() { return headers; }
+    } as any;
+  }
+
+  beforeAll(() => {
+    process.env.NODE_ENV = 'test';
+    process.env.RATE_LIMIT_TEST = '1';
+    setRateLimitStore(new MemoryRateLimitStore());
+  });
+  afterAll(() => { delete process.env.RATE_LIMIT_TEST; });
+
+  it('limits per (tenantId, ip): tenant B keeps its budget after tenant A is throttled', () => {
+    const limiter = makeKeyedLimiter();
+    const ip = '203.0.113.7';
+    // Exhaust tenant A's budget (max=2).
+    for (let i = 0; i < 2; i++) {
+      const res = fakeRes();
+      limiter(fakeReq('biz-A', ip), res, () => {});
+      expect(res.state).toBe(200);
+    }
+    // 3rd request for tenant A from the same IP -> 429.
+    const resA = fakeRes();
+    limiter(fakeReq('biz-A', ip), resA, () => {});
+    expect(resA.state).toBe(429);
+
+    // Same IP, but tenant B, must still be allowed (separate bucket).
+    const resB = fakeRes();
+    limiter(fakeReq('biz-B', ip), resB, () => {});
+    expect(resB.state).toBe(200);
+  });
+
+  it('a missing tenantId falls back to per-IP keying (still bounded)', () => {
+    const limiter = makeKeyedLimiter();
+    const ip = '198.51.100.9';
+    for (let i = 0; i < 2; i++) {
+      const res = fakeRes();
+      limiter(fakeReq('', ip), res, () => {});
+      expect(res.state).toBe(200);
+    }
+    const res = fakeRes();
+    limiter(fakeReq('', ip), res, () => {});
+    expect(res.state).toBe(429);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2.9 — DB-side pagination returns the right page + total without loading
+// the whole table (white-box: paginateWhere returns {rows, total}).
+// ---------------------------------------------------------------------------
+describe('P2.9 DB-side pagination helper', () => {
+  it('returns a bounded page and an accurate total for a tenant query', async () => {
+    const { rows, total } = await db.appointments.paginateWhere(
+      'business_id = ?',
+      [bizBId],
+      { orderBy: 'date', limit: 1, offset: 0 }
+    );
+    expect(Array.isArray(rows)).toBe(true);
+    expect(rows.length).toBeLessThanOrEqual(1);
+    expect(typeof total).toBe('number');
+    expect(total).toBeGreaterThanOrEqual(1);
   });
 });

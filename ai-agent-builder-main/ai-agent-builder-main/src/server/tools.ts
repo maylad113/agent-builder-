@@ -5,21 +5,99 @@ import {
   dayOfWeekForDate, isHoliday, validateSlot, generateAvailableSlots, findEligibleStaff
 } from './appointmentEngine';
 
+/** Names of every tool the engine can expose to an agent. Tests and the
+ *  runtime use this to construct a "permit all" context when exercising the
+ *  tool engine directly (production derives the enabled subset per-agent from
+ *  the agent's configured `toolsEnabled`). */
+export const ALL_TOOL_NAMES: string[] = [
+  'check_business_hours', 'get_business_information', 'search_knowledge',
+  'check_availability', 'book_appointment', 'cancel_appointment',
+  'reschedule_appointment', 'search_products', 'create_order',
+  'get_order_status', 'notify_business_owner', 'transfer_to_human',
+];
+
 export interface ToolContext {
   tenantId: string;
   conversationId?: string;
   channel?: string;
   /**
-   * The exact set of tools enabled for the agent in scope. When provided,
-   * executeAgentTool refuses to run any tool NOT in this set — the backend
-   * enforces enablement even if the LLM (or a caller) requests a tool that
-   * was not offered in the function declarations.
+   * The exact set of tools enabled for the agent in scope. REQUIRED for any
+   * agent-driven execution: when absent, executeAgentTool refuses to run ANY
+   * tool (audit P1.1 — never default to permitting declared tools). The backend
+   * enforces enablement even if the LLM (or a caller) requests a tool that was
+   * not offered in the function declarations.
    */
   toolsEnabled?: string[];
   /** Tool names the agent is permitted to invoke. If provided, any tool not
    * in this set is rejected before execution — defense-in-depth against the
    * LLM hallucinating a tool call that was never declared to it. */
   allowedToolNames?: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Tool argument validation + bounding (audit P1.2).
+// LLM-controlled arguments are NEVER trusted: each is coerced, length-bounded,
+// and rejected when oversized BEFORE any database operation. This prevents a
+// hallucinated megabyte-long "notes" field from blowing up a DB row or a
+// malformed "customerPhone" from being stored as-is.
+// ---------------------------------------------------------------------------
+
+const ARG_LIMITS = {
+  customerName: 200,
+  customerPhone: 50,
+  customerDetails: 500,
+  notes: 2000,
+  reason: 500,
+  query: 500,
+  topic: 100,
+  day: 20,
+  date: 20,
+  startTime: 10,
+  newDate: 20,
+  newTime: 10,
+  endTime: 10,
+  appointmentId: 100,
+  orderId: 100,
+  serviceIdOrName: 200,
+  serviceId: 100,
+  productId: 100,
+} as const;
+
+/** Coerce to a bounded string, or undefined when absent. Throws a plain Error
+ *  (caught by executeAgentTool's wrapper) when the value exceeds its limit. */
+function boundedString(value: unknown, key: keyof typeof ARG_LIMITS): string | undefined {
+  if (value == null) return undefined;
+  const s = String(value);
+  const limit = ARG_LIMITS[key];
+  if (s.length > limit) {
+    throw new Error(`Argument "${key}" exceeds the maximum length of ${limit} characters.`);
+  }
+  return s;
+}
+
+/** Validate a phone number: a bounded, trimmed string. The audit's P1.2 focus is
+ *  bounding OVERSIZED LLM-controlled input (DoS / storage blowup) — a strict
+ *  E.164 regex would reject legitimate partial/stub values customers may give.
+ *  We bound the length and trim whitespace; further normalization happens later. */
+function validPhone(raw: unknown): string | undefined {
+  if (raw == null) return undefined;
+  const s = String(raw).trim();
+  if (s.length > ARG_LIMITS.customerPhone) {
+    throw new Error(`Argument "customerPhone" exceeds the maximum length of ${ARG_LIMITS.customerPhone} characters.`);
+  }
+  return s || undefined;
+}
+
+/** Validate an integer quantity (positive, bounded). */
+function validQuantity(raw: unknown): number {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0) {
+    throw new Error('Quantity must be a positive integer.');
+  }
+  if (n > 1_000_000) {
+    throw new Error('Quantity exceeds the maximum allowed (1,000,000).');
+  }
+  return n;
 }
 
 // Time helpers (timeToMinutes, addMinutes, intervalsOverlap, isFail, dayOfWeek,
@@ -212,24 +290,27 @@ export async function executeAgentTool(
     return { success: false, error: `Unauthorized tenant ID: ${tenantId}` };
   }
 
-  // HARD tool enablement gate (both layers enforced): even if the LLM (or a
-  // caller) requests a tool that is not enabled for the agent in scope, we
-  // refuse to execute it. `toolsEnabled` is the agent's own configured set;
-  // `allowedToolNames` is the defense-in-depth set the runtime derived from
-  // the declarations it actually offered the model (so a hallucinated tool
-  // that was never declared is also rejected). This is enforced for EVERY
-  // tool in the switch below — never trust the frontend.
-  if (
-    (context.toolsEnabled && !context.toolsEnabled.includes(toolName)) ||
-    (context.allowedToolNames && !context.allowedToolNames.includes(toolName))
-  ) {
+  // HARD tool enablement gate (audit P1.1 — never default to permitting).
+  // Authorization context (`toolsEnabled`) is REQUIRED: when absent we refuse
+  // to run ANY tool rather than implicitly trusting that a declared tool is
+  // permitted. `toolsEnabled` is the agent's own configured set; `allowedToolNames`
+  // is the defense-in-depth set the runtime derived from the declarations it
+  // actually offered the model (so a hallucinated tool never declared is also
+  // rejected). Enforced for EVERY tool below — never trust the LLM/frontend.
+  if (!context.toolsEnabled || !Array.isArray(context.toolsEnabled) || context.toolsEnabled.length === 0) {
+    return { success: false, error: `Tool ${toolName} is not authorized: no enabled-tools context was provided.` };
+  }
+  if (!context.toolsEnabled.includes(toolName)) {
     return { success: false, error: `Tool ${toolName} is not enabled for this agent (not permitted).` };
+  }
+  if (context.allowedToolNames && !context.allowedToolNames.includes(toolName)) {
+    return { success: false, error: `Tool ${toolName} was not declared to the model (not permitted).` };
   }
 
   try {
     switch (toolName) {
       case 'check_business_hours': {
-        const dayArg = args.day?.toLowerCase();
+        const dayArg = boundedString(args.day, 'day')?.toLowerCase();
         if (dayArg) {
           const dayHours = business.hours.find(h => h.day.toLowerCase() === dayArg);
           if (dayHours) {
@@ -257,7 +338,7 @@ export async function executeAgentTool(
       }
 
       case 'get_business_information': {
-        const topic = args.topic?.toLowerCase();
+        const topic = boundedString(args.topic, 'topic')?.toLowerCase();
         let result: any = {
           name: business.name,
           type: business.type,
@@ -282,7 +363,7 @@ export async function executeAgentTool(
       }
 
       case 'search_knowledge': {
-        const rawQuery = String(args.query || '').trim();
+        const rawQuery = boundedString(args.query, 'query')?.trim() || '';
         const q = rawQuery.toLowerCase();
         if (!q) {
           return { success: true, data: { query: rawQuery, count: 0, matches: [], message: 'No search query provided.' } };
@@ -321,7 +402,8 @@ export async function executeAgentTool(
       }
 
       case 'check_availability': {
-        const { date, serviceId } = args;
+        const date = boundedString(args.date, 'date');
+        const serviceId = boundedString(args.serviceId, 'serviceId');
         const requestedDate = date || new Date().toISOString().split('T')[0];
         const dayName = dayOfWeekForDate(requestedDate, business.timezone);
 
@@ -366,7 +448,12 @@ export async function executeAgentTool(
       }
 
       case 'book_appointment': {
-        const { customerName, customerPhone, serviceIdOrName, date, startTime, notes } = args;
+        const customerName = boundedString(args.customerName, 'customerName');
+        const customerPhone = validPhone(args.customerPhone);
+        const serviceIdOrName = boundedString(args.serviceIdOrName, 'serviceIdOrName');
+        const date = boundedString(args.date, 'date');
+        const startTime = boundedString(args.startTime, 'startTime');
+        const notes = boundedString(args.notes, 'notes');
 
         if (!customerName || !customerPhone || !serviceIdOrName || !date || !startTime) {
           return { success: false, error: 'customerName, customerPhone, serviceIdOrName, date and startTime are required to book.' };
@@ -402,13 +489,26 @@ export async function executeAgentTool(
         const nowIso = new Date().toISOString();
 
         const result = await db.client.transaction(async (): Promise<{ ok: true; appointment: any } | { ok: false; error: string }> => {
-          // Re-check for an overlapping (not just identical) non-cancelled
-          // appointment for this tenant on this date. Both the new booking AND
-          // each existing appointment extend by their own service buffer, so a
-          // turnaround period is respected in both directions.
-          const overlapping = await db.appointments.filter(
-            a => a.businessId === tenantId && a.date === date && a.status !== 'CANCELLED'
+          // PostgreSQL-safe concurrency (audit P1.3): lock the existing
+          // non-cancelled appointments for this tenant+date with SELECT ... FOR
+          // UPDATE before the overlap check. On PostgreSQL this acquires row
+          // locks so two concurrent bookings for the same slot serialize — the
+          // second waits for the first to COMMIT, then sees the new row and
+          // correctly detects the overlap. SQLite parses but ignores FOR UPDATE
+          // (writes already serialize via the per-connection mutex), so the same
+          // code path is correct on both dialects. Exactly one concurrent booking
+          // can succeed.
+          const lockRows = await db.client.query(
+            `SELECT id, service_id, start_time, end_time FROM appointments
+             WHERE business_id = ? AND date = ? AND status != 'CANCELLED' FOR UPDATE`,
+            [tenantId, date]
           );
+          const overlapping = lockRows.rows.map((r: any) => ({
+            id: r.id,
+            serviceId: r.service_id ?? r.serviceId,
+            startTime: r.start_time ?? r.startTime,
+            endTime: r.end_time ?? r.endTime,
+          }));
           for (const a of overlapping) {
             const existingService = business.services.find(s => s.id === a.serviceId);
             const existingBuffer = Math.max(0, existingService?.bufferMinutesAfter || 0);
@@ -488,7 +588,8 @@ export async function executeAgentTool(
       }
 
       case 'cancel_appointment': {
-        const { appointmentId, customerPhone } = args;
+        const appointmentId = boundedString(args.appointmentId, 'appointmentId');
+        const customerPhone = validPhone(args.customerPhone);
         const app = await db.appointments.find(a => 
           a.businessId === tenantId && 
           (a.id === appointmentId || a.customerPhone === customerPhone) &&
@@ -524,7 +625,9 @@ export async function executeAgentTool(
       }
 
       case 'reschedule_appointment': {
-        const { appointmentId, newDate, newTime } = args;
+        const appointmentId = boundedString(args.appointmentId, 'appointmentId');
+        const newDate = boundedString(args.newDate, 'newDate');
+        const newTime = boundedString(args.newTime, 'newTime');
         if (!appointmentId || !newDate || !newTime) {
           return { success: false, error: 'appointmentId, newDate and newTime are required.' };
         }
@@ -561,13 +664,20 @@ export async function executeAgentTool(
         }
 
         // Transactional overlap check (excluding the appointment being moved).
-        // Mirrors the booking overlap rule: each existing appointment also
-        // extends by its own service buffer, so a reschedule cannot land in
-        // another appointment's turnaround window.
+        // Mirrors the booking overlap rule + uses SELECT ... FOR UPDATE row
+        // locking so concurrent reschedules serialize (audit P1.3).
         const r = await db.client.transaction(async () => {
-          const others = await db.appointments.filter(
-            a => a.businessId === tenantId && a.date === newDate && a.status !== 'CANCELLED' && a.id !== app.id
+          const lockRows = await db.client.query(
+            `SELECT id, service_id, start_time, end_time FROM appointments
+             WHERE business_id = ? AND date = ? AND status != 'CANCELLED' AND id != ? FOR UPDATE`,
+            [tenantId, newDate, app.id]
           );
+          const others = lockRows.rows.map((row: any) => ({
+            id: row.id,
+            serviceId: row.service_id ?? row.serviceId,
+            startTime: row.start_time ?? row.startTime,
+            endTime: row.end_time ?? row.endTime,
+          }));
           for (const a of others) {
             const existingService = business.services.find(s => s.id === a.serviceId);
             const existingBuffer = Math.max(0, existingService?.bufferMinutesAfter || 0);
@@ -634,16 +744,23 @@ export async function executeAgentTool(
       }
 
       case 'create_order': {
-        const { customerName, customerPhone, items } = args;
+        const customerName = boundedString(args.customerName, 'customerName');
+        const customerPhone = validPhone(args.customerPhone);
+        const items = args.items;
 
         if (!customerName || !customerPhone || !Array.isArray(items) || items.length === 0) {
           return { success: false, error: 'customerName, customerPhone and a non-empty items list are required.' };
+        }
+        if (items.length > 100) {
+          return { success: false, error: 'An order cannot contain more than 100 items.' };
         }
         // Validate item shape up front (before the transaction).
         for (const item of items) {
           if (!item?.productId || !Number.isInteger(item.quantity) || item.quantity <= 0) {
             return { success: false, error: 'Each item needs a productId and a positive integer quantity.' };
           }
+          boundedString(item.productId, 'productId'); // throws if oversized
+          validQuantity(item.quantity);
         }
 
         const orderId = `ord-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
@@ -665,23 +782,29 @@ export async function executeAgentTool(
             const orderItems: Array<{ productId: string; productName: string; quantity: number; price: number }> = [];
             let totalAmount = 0;
 
-            // Re-read each product inside the transaction and verify stock.
-            // Check + decrement run inside the transaction so two concurrent
-            // orders cannot oversell the same stock.
+            // ATOMIC conditional stock decrement (audit P1.4 — PostgreSQL-safe).
+            // Instead of read-then-write (which races under READ COMMITTED on
+            // Postgres), we issue a single UPDATE ... WHERE stock >= ? and verify
+            // EXACTLY ONE row changed. The DB row lock acquired by the UPDATE
+            // serializes concurrent decrements for the same product, so two
+            // simultaneous orders for the last unit cannot both succeed.
             for (const item of items) {
               const product = await db.products.find(p => p.businessId === tenantId && p.id === item.productId);
               if (!product) {
                 throw new OrderTxnError(`Product ID ${item.productId} not found.`);
               }
-              if (product.inventory < item.quantity) {
-                throw new OrderTxnError(`Insufficient stock for ${product.name}. Available: ${product.inventory}, Requested: ${item.quantity}`);
+              const decRes = await db.client.query(
+                `UPDATE products SET inventory = inventory - ? WHERE id = ? AND business_id = ? AND inventory >= ?`,
+                [item.quantity, product.id, tenantId, item.quantity]
+              );
+              if (decRes.changes !== 1) {
+                // Zero rows changed => stock was insufficient at decrement time
+                // (either already below the requested qty or the row vanished).
+                const refreshed = await db.products.find(p => p.businessId === tenantId && p.id === item.productId);
+                throw new OrderTxnError(
+                  `Insufficient stock for ${product.name}. Available: ${refreshed?.inventory ?? 0}, Requested: ${item.quantity}`
+                );
               }
-              product.inventory -= item.quantity;
-              // Guard against negative inventory even if the check above raced.
-              if (product.inventory < 0) {
-                throw new OrderTxnError(`Insufficient stock for ${product.name}.`);
-              }
-              await db.products.update(product);
 
               const itemTotal = product.price * item.quantity;
               totalAmount += itemTotal;
@@ -736,7 +859,8 @@ export async function executeAgentTool(
       }
 
       case 'get_order_status': {
-        const { orderId, customerPhone } = args;
+        const orderId = boundedString(args.orderId, 'orderId');
+        const customerPhone = validPhone(args.customerPhone);
         // Look up by order id (tenant-scoped), then verify ownership via the
         // customer's phone when provided. The customer lookup is a separate
         // query (cannot `await` inside the orders.filter predicate).
@@ -768,7 +892,11 @@ export async function executeAgentTool(
       }
 
       case 'notify_business_owner': {
-        const { reason, customerDetails } = args;
+        const reason = boundedString(args.reason, 'reason');
+        const customerDetails = boundedString(args.customerDetails, 'customerDetails');
+        if (!reason) {
+          return { success: false, error: 'reason is required.' };
+        }
         await db.auditLogs.push({
           id: `log-${Date.now()}`,
           businessId: tenantId,
@@ -784,12 +912,12 @@ export async function executeAgentTool(
       }
 
       case 'transfer_to_human': {
-        const { reason } = args;
+        const reason = boundedString(args.reason, 'reason') || 'Customer requested human assistance.';
         if (conversationId) {
           const conv = await db.conversations.find(c => c.id === conversationId);
           if (conv) {
             conv.status = 'WAITING_FOR_HUMAN';
-            conv.handoffReason = reason || 'Customer requested human assistance.';
+            conv.handoffReason = reason;
             conv.handoffRequestedAt = new Date().toISOString();
             await db.conversations.update(conv);
           }

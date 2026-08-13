@@ -21,7 +21,7 @@ delete process.env.GEMINI_API_KEY;
 // The singleton `db` (used by executeAgentTool) reads DB_PATH at import time.
 // Seeding runs against it, so all assertions go through the same instance.
 const { db } = await import('../src/server/db');
-const { executeAgentTool, agentToolDeclarations } = await import('../src/server/tools');
+const { executeAgentTool, agentToolDeclarations, ALL_TOOL_NAMES } = await import('../src/server/tools');
 const { dayOfWeekForDate } = await import('../src/server/appointmentEngine');
 import type { BusinessHours } from '../src/types';
 
@@ -72,7 +72,7 @@ describe('book_appointment: honest failure + duration + business hours', () => {
       serviceIdOrName: 'Nonexistent Service',
       date: BOOK_DATE,
       startTime: '14:00'
-    }, { tenantId: TENANT });
+    }, { tenantId: TENANT, toolsEnabled: ALL_TOOL_NAMES });
     expect(r.success).toBe(false);
     expect(r.error).toContain('not found');
     // Nothing was booked.
@@ -88,7 +88,7 @@ describe('book_appointment: honest failure + duration + business hours', () => {
       serviceIdOrName: 'Haircut',
       date: BOOK_DATE,
       startTime: '07:00' // opens at 09:00
-    }, { tenantId: TENANT });
+    }, { tenantId: TENANT, toolsEnabled: ALL_TOOL_NAMES });
     expect(r.success).toBe(false);
     expect(r.error).toMatch(/outside opening hours|closed/i);
   });
@@ -100,7 +100,7 @@ describe('book_appointment: honest failure + duration + business hours', () => {
       serviceIdOrName: 'Haircut',
       date: SUNDAY_DATE, // Sunday (closed in seed)
       startTime: '12:00'
-    }, { tenantId: TENANT });
+    }, { tenantId: TENANT, toolsEnabled: ALL_TOOL_NAMES });
     expect(r.success).toBe(false);
     expect(r.error).toMatch(/closed/i);
   });
@@ -112,7 +112,7 @@ describe('book_appointment: honest failure + duration + business hours', () => {
       serviceIdOrName: 'Haircut', // 30 min
       date: BOOK_DATE,
       startTime: '14:00'
-    }, { tenantId: TENANT });
+    }, { tenantId: TENANT, toolsEnabled: ALL_TOOL_NAMES });
     expect(r.success).toBe(true);
     expect(r.data.time).toBe('14:00 - 14:30'); // 30-min service
     const created = await await db.appointments.find(a => a.id === r.data.appointmentId);
@@ -134,11 +134,11 @@ describe('book_appointment: concurrent overlap prevention (#5)', () => {
       executeAgentTool('book_appointment', {
         customerName: 'Concurrent A', customerPhone: '+10000000010',
         serviceIdOrName: svc, date, startTime
-      }, { tenantId: TENANT }),
+      }, { tenantId: TENANT, toolsEnabled: ALL_TOOL_NAMES }),
       executeAgentTool('book_appointment', {
         customerName: 'Concurrent B', customerPhone: '+10000000011',
         serviceIdOrName: svc, date, startTime
-      }, { tenantId: TENANT })
+      }, { tenantId: TENANT, toolsEnabled: ALL_TOOL_NAMES })
     ]);
 
     const successes = [r1, r2].filter(r => r.success).length;
@@ -159,14 +159,14 @@ describe('book_appointment: concurrent overlap prevention (#5)', () => {
     const r1 = await executeAgentTool('book_appointment', {
       customerName: 'Overlap1', customerPhone: '+10000000020',
       serviceIdOrName: 'Haircut', date, startTime: '15:00'
-    }, { tenantId: TENANT });
+    }, { tenantId: TENANT, toolsEnabled: ALL_TOOL_NAMES });
     expect(r1.success).toBe(true);
 
     // Second booking 15:15-15:45 overlaps the first.
     const r2 = await executeAgentTool('book_appointment', {
       customerName: 'Overlap2', customerPhone: '+10000000021',
       serviceIdOrName: 'Haircut', date, startTime: '15:15'
-    }, { tenantId: TENANT });
+    }, { tenantId: TENANT, toolsEnabled: ALL_TOOL_NAMES });
     expect(r2.success).toBe(false);
     expect(r2.error).toMatch(/overlap/i);
   });
@@ -176,11 +176,11 @@ describe('book_appointment: concurrent overlap prevention (#5)', () => {
     const r1 = await executeAgentTool('book_appointment', {
       customerName: 'Back1', customerPhone: '+10000000030',
       serviceIdOrName: 'Haircut', date, startTime: '16:00' // 16:00-16:30
-    }, { tenantId: TENANT });
+    }, { tenantId: TENANT, toolsEnabled: ALL_TOOL_NAMES });
     const r2 = await executeAgentTool('book_appointment', {
       customerName: 'Back2', customerPhone: '+10000000031',
       serviceIdOrName: 'Haircut', date, startTime: '16:30' // 16:30-17:00 (adjacent)
-    }, { tenantId: TENANT });
+    }, { tenantId: TENANT, toolsEnabled: ALL_TOOL_NAMES });
     expect(r1.success).toBe(true);
     expect(r2.success).toBe(true);
   });
@@ -208,11 +208,11 @@ describe('create_order: concurrency + inventory (#6, #12)', () => {
       executeAgentTool('create_order', {
         customerName: 'Buyer A', customerPhone: '+10000000100',
         items: [{ productId, quantity: 1 }]
-      }, { tenantId: TENANT }),
+      }, { tenantId: TENANT, toolsEnabled: ALL_TOOL_NAMES }),
       executeAgentTool('create_order', {
         customerName: 'Buyer B', customerPhone: '+10000000101',
         items: [{ productId, quantity: 1 }]
-      }, { tenantId: TENANT })
+      }, { tenantId: TENANT, toolsEnabled: ALL_TOOL_NAMES })
     ]);
 
     const successes = [o1, o2].filter(r => r.success).length;
@@ -239,7 +239,7 @@ describe('create_order: concurrency + inventory (#6, #12)', () => {
     const r = await executeAgentTool('create_order', {
       customerName: 'Greedy', customerPhone: '+10000000102',
       items: [{ productId, quantity: 5 }]
-    }, { tenantId: TENANT });
+    }, { tenantId: TENANT, toolsEnabled: ALL_TOOL_NAMES });
     expect(r.success).toBe(false);
     expect(r.error).toMatch(/insufficient stock/i);
     // Stock unchanged.
@@ -248,7 +248,23 @@ describe('create_order: concurrency + inventory (#6, #12)', () => {
 });
 
 describe('tool permission gate: an agent cannot run a non-enabled tool', () => {
-  it('executeAgentTool still executes any tool when called directly (server trusts itself), but the runtime only passes enabled declarations', () => {
+  it('executeAgentTool rejects ANY tool when no enabled-tools context is provided (audit P1.1)', async () => {
+    // No toolsEnabled => authorization context missing => never default to permit.
+    const r = await executeAgentTool('check_business_hours', {}, { tenantId: 'biz-tonys-barber' });
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/not authorized|no enabled-tools context/i);
+  });
+
+  it('executeAgentTool rejects a tool that is NOT in the provided enabled set', async () => {
+    const r = await executeAgentTool('book_appointment', {
+      customerName: 'X', customerPhone: '+10000000000',
+      serviceIdOrName: 'Haircut', date: BOOK_DATE, startTime: '14:00'
+    }, { tenantId: 'biz-tonys-barber', toolsEnabled: ['check_business_hours'] });
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/not enabled/i);
+  });
+
+  it('the runtime filters agentToolDeclarations by toolsEnabled BEFORE handing them to the model', () => {
     // The permission model: the AI runtime filters agentToolDeclarations by
     // structuredConfig.toolsEnabled BEFORE handing them to the model, so the
     // model can never even request a disabled tool. Verify the filter logic:
@@ -282,7 +298,7 @@ describe('appointment lifecycle: staff coverage, cancel-frees-slot, reschedule r
     return d.toISOString().split('T')[0];
   })();
   const mondayName = dayOfWeekForDate(MON, 'Asia/Tehran'); // 'monday'
-  const ctx = { tenantId: SCHEDULED_BIZ };
+  const ctx = { tenantId: SCHEDULED_BIZ, toolsEnabled: ALL_TOOL_NAMES };
 
   beforeAll(async () => {
     const week: Array<BusinessHours['day']> = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'];

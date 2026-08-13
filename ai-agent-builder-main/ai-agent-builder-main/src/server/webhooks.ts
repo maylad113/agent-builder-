@@ -4,6 +4,7 @@ import { db } from './db';
 import { processAgentMessage } from './agentRuntime';
 import { getCredentials } from './integrations';
 import { rateLimit, RATE_LIMITS } from './security';
+import { safeError } from './logSanitizer';
 
 /**
  * Phase 14/15: External channel webhooks (Meta/Instagram + Twilio/SMS).
@@ -38,24 +39,58 @@ export const webhookRouter = Router();
 webhookRouter.use(rateLimit({ ...RATE_LIMITS.webhooks, prefix: 'webhook' }));
 
 // ---------------------------------------------------------------------------
-// Idempotency: track processed inbound message ids for a short retention window.
-// In-memory is acceptable for single-instance dev; a multi-instance deployment
-// would back this with a shared cache (Redis). Entries expire after MAX_AGE_MS.
+// Idempotency: persist processed inbound message ids in the database so a
+// duplicate delivery after a server restart is STILL deduplicated (audit P1.5).
+// The in-memory Map (used pre-audit) reset on every restart, so a provider
+// retrying delivery of an event seen before the restart could create a second
+// booking/reply. The `processed_webhooks` table is self-provisioned (idempotent)
+// so the check works regardless of migration ordering. On PostgreSQL this is a
+// real upsert; on SQLite INSERT OR IGNORE atomically deduplicates.
 // ---------------------------------------------------------------------------
-const MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
-const processedIds = new Map<string, number>(); // id -> first-seen epoch ms
+const MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours (covers provider retry windows)
 
-function isDuplicate(id: string): boolean {
+function ensureProcessedWebhooksTable(): void {
+  const sqlite = db.sqlite;
+  if (!sqlite) return; // Postgres dialect: table created by migration
+  sqlite.exec(
+    `CREATE TABLE IF NOT EXISTS processed_webhooks (
+       id TEXT PRIMARY KEY,
+       created_at INTEGER NOT NULL
+     );
+     CREATE INDEX IF NOT EXISTS idx_processed_webhooks_created_at
+       ON processed_webhooks(created_at);`
+  );
+}
+
+async function isDuplicate(id: string): Promise<boolean> {
+  ensureProcessedWebhooksTable();
   const now = Date.now();
-  // Expire old entries opportunistically.
-  if (processedIds.size > 5000) {
-    for (const [k, ts] of processedIds) {
-      if (now - ts > MAX_AGE_MS) processedIds.delete(k);
-    }
+  // SQLite uses the self-provisioned processed_webhooks(id, created_at) table.
+  // PostgreSQL has the richer webhook_processed_events(source, event_id) table
+  // (created in migrations/pg/001) — use it directly. Both paths atomically
+  // dedupe: SQLite via INSERT OR IGNORE, PG via ON CONFLICT DO NOTHING.
+  let res;
+  if (db.client.dialect === 'sqlite') {
+    res = await db.client.exec(
+      'INSERT OR IGNORE INTO processed_webhooks (id, created_at) VALUES (?, ?)',
+      [id, now]
+    );
+  } else {
+    // source is a fixed namespace; event_id is the provider message/call id.
+    res = await db.client.exec(
+      'INSERT INTO webhook_processed_events (source, event_id, business_id, processed_at) VALUES (?, ?, ?, ?) ON CONFLICT (source, event_id) DO NOTHING',
+      ['inbound', id, null, new Date().toISOString()]
+    );
   }
-  if (processedIds.has(id)) return true;
-  processedIds.set(id, now);
-  return false;
+  // Opportunistic, bounded cleanup of ancient entries (best-effort, never throws).
+  try {
+    if (db.client.dialect === 'sqlite') {
+      await db.client.exec('DELETE FROM processed_webhooks WHERE created_at < ?', [now - MAX_AGE_MS]);
+    } else {
+      await db.client.exec("DELETE FROM webhook_processed_events WHERE processed_at < ?", [new Date(now - MAX_AGE_MS).toISOString()]);
+    }
+  } catch { /* ignore cleanup errors */ }
+  return res.changes === 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -111,7 +146,7 @@ async function sendMetaReply(creds: Record<string, string>, pageScopedUserId: st
     });
   } catch (err) {
     // Network/provider failure must not crash the webhook; it is logged.
-    console.error('[webhook:meta] reply failed:', err);
+    safeError('[webhook:meta] reply failed:', err);
   }
 }
 
@@ -180,7 +215,7 @@ webhookRouter.post('/meta', rawBodyParser, async (req: Request, res: Response) =
       if (!senderId || !recipientId) continue;
 
       // Idempotency: a re-delivered webhook must not produce a duplicate reply.
-      if (isDuplicate(messageId)) continue;
+      if (await isDuplicate(messageId)) continue;
 
       // Resolve the business from the page id the message was sent TO.
       const resolved = await resolveBusinessByMetaPageId(recipientId);
@@ -198,7 +233,7 @@ webhookRouter.post('/meta', rawBodyParser, async (req: Request, res: Response) =
         const reply = result.reply || 'Sorry, I could not process that.';
         await sendMetaReply(creds, senderId, reply);
       } catch (err) {
-        console.error('[webhook:meta] runtime error:', err);
+        safeError('[webhook:meta] runtime error:', err);
       }
     }
   }
@@ -267,7 +302,7 @@ async function sendTwilioSms(creds: Record<string, string>, fromNumber: string, 
       body: form.toString(),
     });
   } catch (err) {
-    console.error('[webhook:twilio] sms send failed:', err);
+    safeError('[webhook:twilio] sms send failed:', err);
   }
 }
 
@@ -317,7 +352,7 @@ webhookRouter.post('/twilio', twilioFormParser, async (req: Request, res: Respon
   // --- Inbound SMS reply path ---
   if (messageSid && params.Body) {
     // Idempotency on the provider message id.
-    if (isDuplicate(messageSid)) return res.status(200).type('text/xml').send('<Response/>');
+    if (await isDuplicate(messageSid)) return res.status(200).type('text/xml').send('<Response/>');
 
     const resolved = await resolveBusinessByPhoneNumber(toNumber);
     if (!resolved) return res.status(200).type('text/xml').send('<Response/>');
@@ -344,7 +379,7 @@ webhookRouter.post('/twilio', twilioFormParser, async (req: Request, res: Respon
       const reply = result.reply || 'Sorry, I could not process that.';
       await sendTwilioSms(creds, toNumber, fromNumber, reply);
     } catch (err) {
-      console.error('[webhook:twilio] sms runtime error:', err);
+      safeError('[webhook:twilio] sms runtime error:', err);
     }
     return res.status(200).type('text/xml').send('<Response/>');
   }
@@ -352,7 +387,7 @@ webhookRouter.post('/twilio', twilioFormParser, async (req: Request, res: Respon
   // --- Voice call status path (missed-call AI receptionist) ---
   if (callStatus) {
     const callSid = params.CallSid;
-    if (callSid && isDuplicate(`call:${callSid}`)) {
+    if (callSid && await isDuplicate(`call:${callSid}`)) {
       return res.status(200).type('text/xml').send('<Response/>');
     }
     // Missed call = no-answer / failed / busy while ringing the business.
@@ -397,7 +432,7 @@ webhookRouter.post('/twilio', twilioFormParser, async (req: Request, res: Respon
       const reply = result.reply || followUp;
       await sendTwilioSms(creds, toNumber, fromNumber, reply);
     } catch (err) {
-      console.error('[webhook:twilio] missed-call follow-up error:', err);
+      safeError('[webhook:twilio] missed-call follow-up error:', err);
       // Even if the AI fails, send the static template so the customer isn't
       // left with silence — the agent will engage on their next reply.
       await sendTwilioSms(creds, toNumber, fromNumber, followUp);

@@ -21,9 +21,9 @@ process.env.NODE_ENV = 'test';
 delete process.env.GEMINI_API_KEY;
 
 const { db } = await import('../src/server/db');
-const { executeAgentTool } = await import('../src/server/tools');
+const { executeAgentTool, ALL_TOOL_NAMES } = await import('../src/server/tools');
 
-const ctx = { tenantId: 'biz-tonys-barber', conversationId: 'conv-conc', channel: 'web_chat' };
+const ctx = { tenantId: 'biz-tonys-barber', conversationId: 'conv-conc', channel: 'web_chat', toolsEnabled: ALL_TOOL_NAMES };
 
 beforeAll(async () => {
   // The Tony seed business ships with a 30-min "Haircut" service (srv-1),

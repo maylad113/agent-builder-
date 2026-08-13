@@ -56,7 +56,7 @@ describe('human handoff lifecycle', () => {
 
     // Simulate the AI escalating via the tool engine (same path the runtime uses).
     const res = await executeAgentTool('transfer_to_human', { reason: 'Angry customer, refund dispute' }, {
-      tenantId: 'biz-tonys-barber', conversationId: convId
+      tenantId: 'biz-tonys-barber', conversationId: convId, toolsEnabled: ['transfer_to_human']
     });
     expect(res.success).toBe(true);
 
@@ -74,7 +74,7 @@ describe('human handoff lifecycle', () => {
     const convId = start.body.conversationId;
 
     await executeAgentTool('transfer_to_human', { reason: 'needs human' }, {
-      tenantId: 'biz-tonys-barber', conversationId: convId
+      tenantId: 'biz-tonys-barber', conversationId: convId, toolsEnabled: ['transfer_to_human']
     });
 
     // Owner takes over.

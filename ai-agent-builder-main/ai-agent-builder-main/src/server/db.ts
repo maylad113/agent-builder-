@@ -426,6 +426,22 @@ class Collection<T extends { id: string }> {
     const rows = await this.filterWhere(where, params, { limit: 1 });
     return rows[0];
   }
+
+  /** DB-side pagination for a tenant-scoped query (audit P2.9). Returns the page
+   *  and total count in ONE structure so routes can set X-Total-Count without
+   *  materializing the whole table. Avoids the legacy in-memory `paginate`
+   *  slice over `filter()` (which loaded every row). */
+  async paginateWhere(
+    where: string,
+    params: any[],
+    opts: { orderBy?: string; desc?: boolean; limit: number; offset: number }
+  ): Promise<{ rows: T[]; total: number }> {
+    const [rows, total] = await Promise.all([
+      this.filterWhere(where, params, { orderBy: opts.orderBy, desc: opts.desc, limit: opts.limit, offset: opts.offset }),
+      this.countWhere(where, params),
+    ]);
+    return { rows, total };
+  }
 }
 
 function safeJsonParse(s: string): any {
