@@ -1,25 +1,28 @@
-# Dependencies are installed to /opt/agentforge via --prefix (see /home/team/shared/skills
-# if you need to reinstall). Never commit node_modules or the symlink.
-node_modules
+# Dependencies
+node_modules/
 
 # Build output
 dist/
+*.cjs.map
 
-# Local SQLite database (lives at ./data/agentforge.db; small, persists on disk)
-data/
+# Environment / secrets — never commit real credentials
+.env
+.env.*
+!.env.example
+
+# Local databases / runtime data
 *.db
 *.db-journal
-*.db-wal
-*.db-shm
+*.sqlite
+*.sqlite-journal
+data/
 
-# Logs & misc
+# Logs
 *.log
+npm-debug.log*
+
+# Editor / OS
+.vscode/
+.idea/
 .DS_Store
-
-# Build artifacts / archives
-*.zip
 ai-agent-builder.zip
-
-# Temporary conversion helper scripts (one-off, not source)
-_convert_routes.py
-_convert_*.py
