@@ -1,4 +1,12 @@
 import { IntegrationConfig, IntegrationProviderType, IntegrationState } from '../types';
+import { db } from './db';
+import {
+  encryptCredentials,
+  decryptCredentials,
+  currentKeyId,
+  hasEncryptionKey,
+  CredentialEncryptionError
+} from './credentialCrypto';
 
 /**
  * Integration provider abstraction (Phase 11 / P1.1).
@@ -50,34 +58,137 @@ export interface IntegrationProvider {
 }
 
 // ---------------------------------------------------------------------------
-// Credential storage — server-side only. NEVER serialized to the client.
-// In production this would be encrypted at rest; here we keep an in-process
-// map keyed by integration id so credentials never reach the DB JSON or API
-// responses. (The DB row stores only non-secret configData + state.)
+// Credential storage — server-side only, ENCRYPTED AT REST.
+//
+// Credentials are encrypted (AES-256-GCM, random IV per operation) and
+// persisted to the `integration_credentials` table, scoped by tenant
+// (business_id). They survive server restarts. The encryption key is resolved
+// from environment configuration (INTEGRATION_ENCRYPTION_KEY or SESSION_SECRET)
+// and is NEVER stored in the database. If no key is configured, storage REFUSES
+// to run (throws) — credentials are never persisted in plaintext.
+//
+// These functions NEVER return credentials to API responses. `getCredentials`
+// is called only by trusted server-side integration code (the validate route +
+// webhooks). `sanitizeIntegrationForClient` strips everything sensitive from
+// the IntegrationConfig before it crosses the trust boundary to the client.
+//
+// Tenant isolation: every read/write is filtered by business_id, so even if an
+// integration id were to leak across tenants, the query cannot return another
+// tenant's credentials. A UNIQUE constraint on integration_id prevents
+// duplicate credential records.
 // ---------------------------------------------------------------------------
 
-const credentialStore = new Map<string, Record<string, string>>();
-
-export function storeCredentials(integrationId: string, creds: Record<string, string>): void {
-  // Never persist secrets to disk in this prototype; they live in process
-  // memory. A production deployment would encrypt-at-rest (KMS/SQLCipher).
-  credentialStore.set(integrationId, { ...creds });
+function newId(): string {
+  return `cred-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-export function getCredentials(integrationId: string): Record<string, string> | undefined {
-  return credentialStore.get(integrationId);
+/**
+ * Persist (encrypted) credentials for an integration. Upserts on integration_id
+ * (one record per integration). Throws CredentialEncryptionError if no
+ * encryption key is configured — never stores plaintext.
+ */
+export async function storeCredentials(
+  integrationId: string,
+  businessId: string,
+  provider: string,
+  creds: Record<string, string>
+): Promise<void> {
+  if (!hasEncryptionKey()) {
+    throw new CredentialEncryptionError(
+      'Integration credential encryption key is not configured. Credentials will NOT be stored.'
+    );
+  }
+  const envelope = encryptCredentials(creds); // throws if no key / never plaintext
+  const now = new Date().toISOString();
+  const client = db.client;
+  if (!client) throw new Error('Database client is not initialized.');
+  // Upsert: insert or replace the single credential row for this integration.
+  // UNIQUE(integration_id) guarantees no duplicate records.
+  if (client.dialect === 'sqlite') {
+    await client.exec(
+      `INSERT INTO integration_credentials
+         (id, integration_id, business_id, provider, encrypted_creds, key_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(integration_id) DO UPDATE SET
+         encrypted_creds = excluded.encrypted_creds,
+         business_id = excluded.business_id,
+         provider = excluded.provider,
+         key_id = excluded.key_id,
+         updated_at = excluded.updated_at`,
+      [newId(), integrationId, businessId, provider, envelope, currentKeyId(), now, now]
+    );
+  } else {
+    // PostgreSQL: INSERT ... ON CONFLICT (integration_id) DO UPDATE.
+    await client.exec(
+      `INSERT INTO integration_credentials
+         (id, integration_id, business_id, provider, encrypted_creds, key_id, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (integration_id) DO UPDATE SET
+         encrypted_creds = EXCLUDED.encrypted_creds,
+         business_id = EXCLUDED.business_id,
+         provider = EXCLUDED.provider,
+         key_id = EXCLUDED.key_id,
+         updated_at = EXCLUDED.updated_at`,
+      [newId(), integrationId, businessId, provider, envelope, currentKeyId(), now, now]
+    );
+  }
 }
 
-export function clearCredentials(integrationId: string): void {
-  credentialStore.delete(integrationId);
+/**
+ * Retrieve + decrypt credentials for an integration. Tenant-scoped: the query
+ * requires BOTH integration_id AND business_id to match, so a caller authorized
+ * for tenant A cannot read tenant B's credentials. Returns undefined when no
+ * record exists. Decryption happens only here, inside trusted server code.
+ */
+export async function getCredentials(
+  integrationId: string,
+  businessId: string
+): Promise<Record<string, string> | undefined> {
+  const client = db.client;
+  if (!client) return undefined;
+  const res = await client.query(
+    `SELECT encrypted_creds FROM integration_credentials
+     WHERE integration_id = ? AND business_id = ?`,
+    [integrationId, businessId]
+  );
+  const row = res.rows[0];
+  if (!row || !row.encrypted_creds) return undefined;
+  try {
+    return decryptCredentials(row.encrypted_creds);
+  } catch {
+    // Tampered row / rotated key / corrupt envelope. Do NOT leak details.
+    return undefined;
+  }
 }
 
-/** Strip secrets from an IntegrationConfig before returning it to the client. */
+/** Delete stored credentials for an integration (tenant-scoped). */
+export async function clearCredentials(integrationId: string, businessId: string): Promise<void> {
+  const client = db.client;
+  if (!client) return;
+  await client.exec(
+    `DELETE FROM integration_credentials WHERE integration_id = ? AND business_id = ?`,
+    [integrationId, businessId]
+  );
+}
+
+/** Strip secrets from an IntegrationConfig before returning it to the client.
+ *  Credentials are NEVER carried on IntegrationConfig (they live in a separate
+ *  encrypted table), so this primarily ensures configData holds only non-secret
+ *  fields and no credential keys are ever echoed. */
 export function sanitizeIntegrationForClient(integ: IntegrationConfig): IntegrationConfig {
-  return {
-    ...integ,
-    configData: integ.configData ? { ...integ.configData } : undefined,
-  };
+  const { ...rest } = integ;
+  // configData holds only non-secret provider config (calendar id, from-phone).
+  // Credentials are never placed here; defensively strip any key that looks
+  // like a secret in case a provider ever returned one in meta.
+  const configData = integ.configData ? { ...integ.configData } : undefined;
+  if (configData) {
+    for (const k of Object.keys(configData)) {
+      if (/token|secret|password|api[-_]?key|auth/i.test(k)) {
+        delete configData[k];
+      }
+    }
+  }
+  return { ...rest, configData };
 }
 
 // ---------------------------------------------------------------------------

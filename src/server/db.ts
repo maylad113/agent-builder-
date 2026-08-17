@@ -17,12 +17,19 @@ import {
   AgentTemplate,
   UsageRecord,
   AuditLog,
+  EvalRunResult,
+  CorrectionResult,
   StaffMember,
   User,
-  Session
+  Session,
+  TelemetryEvent
 } from '../types';
 import { hashPassword } from './passwords';
 import { initEmbeddingsTable } from './embeddings';
+import { embeddingProviderAvailable } from './llmProvider';
+import { initEvaluationTable } from './evaluation';
+import { initCorrectionTable } from './correction';
+import { initTelemetryTable } from './telemetry';
 import { DbClient, SqliteClient, PostgresClient } from './dbClient';
 
 /**
@@ -144,6 +151,21 @@ const TABLES: Record<string, TableConfig> = {
     table: 'audit_logs',
     jsonColumns: [],
     booleanColumns: []
+  },
+  evaluationResults: {
+    table: 'evaluation_results',
+    jsonColumns: ['scenarioResults'],
+    booleanColumns: ['overallPassed']
+  },
+  correctionRuns: {
+    table: 'correction_runs',
+    jsonColumns: ['attempts'],
+    booleanColumns: ['resolved', 'humanReviewRequired', 'finalEvaluationPassed']
+  },
+  telemetry: {
+    table: 'telemetry_events',
+    jsonColumns: ['metadata'],
+    booleanColumns: ['isPublished', 'success']
   },
   users: {
     table: 'users',
@@ -490,6 +512,9 @@ export class AppDatabase {
   public templates!: Collection<AgentTemplate>;
   public usageRecords!: Collection<UsageRecord>;
   public auditLogs!: Collection<AuditLog>;
+  public evaluationResults!: Collection<EvalRunResult>;
+  public correctionRuns!: Collection<CorrectionResult>;
+  public telemetry!: Collection<TelemetryEvent>;
   public users!: Collection<User>;
   public sessions!: Collection<Session>;
 
@@ -541,6 +566,9 @@ export class AppDatabase {
     this.templates = new Collection<AgentTemplate>(this.client, TABLES.templates);
     this.usageRecords = new Collection<UsageRecord>(this.client, TABLES.usageRecords);
     this.auditLogs = new Collection<AuditLog>(this.client, TABLES.auditLogs);
+    this.evaluationResults = new Collection<EvalRunResult>(this.client, TABLES.evaluationResults);
+    this.correctionRuns = new Collection<CorrectionResult>(this.client, TABLES.correctionRuns);
+    this.telemetry = new Collection<TelemetryEvent>(this.client, TABLES.telemetry);
     this.users = new Collection<User>(this.client, TABLES.users);
     this.sessions = new Collection<Session>(this.client, TABLES.sessions);
   }
@@ -560,6 +588,9 @@ export class AppDatabase {
       await runPostgresMigrations(this.client, this.migrationsDir);
     }
     await initEmbeddingsTable(this.client);
+    await initEvaluationTable(this.client);
+    await initCorrectionTable(this.client);
+    await initTelemetryTable(this.client);
 
     if (shouldSeed) {
       await this.seed();
@@ -567,9 +598,12 @@ export class AppDatabase {
     }
 
     // Best-effort background indexing of seeded knowledge when an embedding
-    // key is configured. Fire-and-forget: failures are non-fatal (keyword
+    // provider is available (free-first: a local Ollama embedding model OR a
+    // configured Gemini key). Fire-and-forget: failures are non-fatal (keyword
     // fallback remains) and we must not block startup for optional providers.
-    if (process.env.GEMINI_API_KEY) {
+    // `embeddingProviderAvailable()` avoids hammering a dead daemon when no
+    // provider is intended (plain machine with no key and no Ollama config).
+    if (embeddingProviderAvailable()) {
       import('./embeddings').then(async ({ indexChunk }) => {
         try {
           const chunks = await this.knowledgeChunks.toJSON();

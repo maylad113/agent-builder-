@@ -5,7 +5,7 @@ import { executeAgentTool, ALL_TOOL_NAMES } from './tools';
 import {
   createInitialDraft, createDraftFrom, editDraft, publishVersion,
   rollbackToVersion, archiveVersion, moveToTesting, listVersions,
-  getPublishedVersion, getVersionForSim
+  getPublishedVersion, getVersionForSim, versionBelongsToAgent
 } from './agentVersions';
 import { indexChunk, removeEmbedding } from './embeddings';
 import { assertActivatable, readinessSnapshot } from './readiness';
@@ -16,7 +16,11 @@ import {
   sanitizeIntegrationForClient
 } from './integrations';
 import { widgetCorsHeaders } from './widgetSecurity';
-import { Business, Agent, AgentStatus, KnowledgeChunk, Product, Appointment, Order, User, Conversation, AgentVersion } from '../types';
+import { SUPPORTED_LLM_PROVIDERS, resolveProviderAndModel } from './llmProvider';
+import { runEvaluation, getLatestEvaluation, listEvaluationsForAgent } from './evaluation';
+import { runSelfCorrection, listCorrectionsForAgent } from './correction';
+import { listTelemetryEvents, computeMetrics, listConversationsFromTelemetry, getConversationTimeline } from './telemetry';
+import { Business, Agent, AgentStatus, KnowledgeChunk, Product, Appointment, Order, User, Conversation, AgentVersion, EvalScenario, TrustedKnowledgeSource } from '../types';
 import { verifyPassword, getDummyPasswordHash } from './passwords';
 import {
   requireAuth,
@@ -500,8 +504,8 @@ router.post('/agents', requireAuth, requireTenantScope, asyncHandler(async (req:
     description,
     systemPrompt,
     structuredConfig,
-    llmProvider = 'gemini',
-    model = 'gemini-3.6-flash',
+    llmProvider,
+    model,
     status = 'READY'
   } = req.body;
   const businessId = res.locals.businessId as string | null;
@@ -512,6 +516,19 @@ router.post('/agents', requireAuth, requireTenantScope, asyncHandler(async (req:
   if (!AGENT_STATUSES.includes(status)) {
     return res.status(400).json({ error: `Invalid status. Must be one of: ${AGENT_STATUSES.join(', ')}.` });
   }
+  // Validate + default the LLM provider/model (free-first: default to ollama
+  // when GEMINI_API_KEY is absent so a fresh install works without a paid API;
+  // an explicitly-requested provider is honored if supported).
+  const requestedProvider = llmProvider as Agent['llmProvider'] | undefined;
+  if (requestedProvider && !SUPPORTED_LLM_PROVIDERS.includes(requestedProvider)) {
+    return res.status(400).json({
+      error: `Unsupported llmProvider. Supported: ${SUPPORTED_LLM_PROVIDERS.join(', ')}.`
+    });
+  }
+  const { provider: resolvedProvider, model: resolvedModel } = resolveProviderAndModel({
+    llmProvider: requestedProvider,
+    model
+  });
 
   const newAgent: Agent = {
     id: `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -532,8 +549,8 @@ router.post('/agents', requireAuth, requireTenantScope, asyncHandler(async (req:
       refundRules: 'Non-refundable',
       toolsEnabled: ['check_business_hours', 'get_business_information', 'check_availability', 'book_appointment', 'search_knowledge', 'transfer_to_human']
     },
-    llmProvider,
-    model,
+    llmProvider: resolvedProvider.type,
+    model: resolvedModel,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
   };
@@ -723,12 +740,14 @@ router.post(
     // its initial draft), fall back to the latest version of any status so the
     // user can still iterate before the first publish.
     const { fromVersionId, changeNote } = req.body;
+    // Resolve the source version, scoped to THIS agent (IDOR guard: a caller
+    // authorized for this agent must not draft from another agent's version).
     const sourceId = fromVersionId
       || (await getPublishedVersion(req.params.id))?.id
       || (await listVersions(req.params.id))[0]?.id;
     if (!sourceId) return res.status(400).json({ error: 'No source version to draft from.' });
     try {
-      const draft = await createDraftFrom(sourceId, changeNote);
+      const draft = await createDraftFrom(sourceId, changeNote, req.params.id);
       res.status(201).json(draft);
     } catch (e: any) {
       res.status(400).json({ error: e.message });
@@ -742,7 +761,7 @@ router.put(
   requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
   asyncHandler(async (req: Request, res: Response) => {
     try {
-      const updated = await editDraft(req.params.versionId, req.body);
+      const updated = await editDraft(req.params.versionId, req.body, req.params.id);
       res.json(updated);
     } catch (e: any) {
       res.status(400).json({ error: e.message });
@@ -756,7 +775,7 @@ router.post(
   requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
   asyncHandler(async (req: Request, res: Response) => {
     try {
-      const pub = await publishVersion(req.params.versionId);
+      const pub = await publishVersion(req.params.versionId, req.params.id);
       await db.auditLogs.push({
         id: `log-${Date.now()}`,
         businessId: (res.locals.resource as Agent).businessId,
@@ -778,7 +797,7 @@ router.post(
   requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
   asyncHandler(async (req: Request, res: Response) => {
     try {
-      res.json(await moveToTesting(req.params.versionId));
+      res.json(await moveToTesting(req.params.versionId, req.params.id));
     } catch (e: any) {
       res.status(400).json({ error: e.message });
     }
@@ -791,7 +810,7 @@ router.post(
   requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
   asyncHandler(async (req: Request, res: Response) => {
     try {
-      const pub = await rollbackToVersion(req.params.versionId);
+      const pub = await rollbackToVersion(req.params.versionId, req.params.id);
       res.json(pub);
     } catch (e: any) {
       res.status(400).json({ error: e.message });
@@ -805,12 +824,220 @@ router.post(
   requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
   asyncHandler(async (req: Request, res: Response) => {
     try {
-      res.json(await archiveVersion(req.params.versionId));
+      res.json(await archiveVersion(req.params.versionId, req.params.id));
     } catch (e: any) {
       res.status(400).json({ error: e.message });
     }
   }
 ));
+
+// =========================================
+// 2b. AGENT EVALUATION
+// =========================================
+// Run a set of test scenarios against the REAL agent runtime (simulator mode
+// against the DRAFT/TESTING version — never a PUBLISHED version) and persist
+// the scored, failure-classified result. Critical failures block publication
+// (enforced in publishVersion via assertPublishClear).
+
+router.post(
+  '/agents/:id/versions/:versionId/evaluate',
+  requireAuth,
+  requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
+  asyncHandler(async (req: Request, res: Response) => {
+    const agent = res.locals.resource as Agent;
+    const { scenarios } = req.body as { scenarios: EvalScenario[] };
+    if (!Array.isArray(scenarios) || scenarios.length === 0) {
+      return res.status(400).json({ error: 'A non-empty scenarios array is required.' });
+    }
+    // Basic scenario validation (data integrity for the persisted run).
+    for (const s of scenarios) {
+      if (!s.id || !s.name || !s.userMessage || !s.dimension) {
+        return res.status(400).json({ error: 'Each scenario needs id, name, userMessage, dimension.' });
+      }
+    }
+    // Verify the target version belongs to THIS agent (IDOR guard: the path's
+    // :id is tenant-verified by requireResourceAccess, but :versionId is not —
+    // a foreign version would otherwise be recorded on this agent's eval run).
+    if (!(await versionBelongsToAgent(req.params.versionId, agent.id))) {
+      return res.status(404).json({ error: 'Version not found.' });
+    }
+    try {
+      const result = await runEvaluation({
+        businessId: agent.businessId,
+        agentId: agent.id,
+        versionId: req.params.versionId,
+        scenarios
+      });
+      res.status(200).json(result);
+    } catch (e: any) {
+      safeError('[routes] evaluation failed:', e?.message || e);
+      res.status(500).json({ error: 'Evaluation failed.' });
+    }
+  }
+));
+
+router.get(
+  '/agents/:id/versions/:versionId/evaluations',
+  requireAuth,
+  requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
+  asyncHandler(async (req: Request, res: Response) => {
+    const agent = res.locals.resource as Agent;
+    const latest = await getLatestEvaluation(agent.businessId, req.params.versionId);
+    res.json({ latest });
+  }
+));
+
+router.get(
+  '/agents/:id/evaluations',
+  requireAuth,
+  requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
+  asyncHandler(async (req: Request, res: Response) => {
+    const agent = res.locals.resource as Agent;
+    const runs = await listEvaluationsForAgent(agent.businessId, agent.id);
+    res.json(runs);
+  }
+));
+
+// =========================================
+// 2c. AGENT SELF-CORRECTION LOOP
+// =========================================
+// GENERATE -> EVALUATE -> CLASSIFY FAILURE -> CORRECT -> RE-EVALUATE -> PASS /
+// HUMAN REVIEW. Runs against a DRAFT/TESTING version and only ever produces a
+// NEW draft; published versions are never mutated. Safety failures always
+// escalate to human review. The existing evaluation publish gate is NOT
+// bypassed: a corrected draft must still pass evaluation to be publishable.
+
+router.post(
+  '/agents/:id/versions/:versionId/correct',
+  requireAuth,
+  requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
+  asyncHandler(async (req: Request, res: Response) => {
+    const agent = res.locals.resource as Agent;
+    const { scenarios, trustedKnowledgeSources, maxAttempts } = req.body as {
+      scenarios: EvalScenario[];
+      trustedKnowledgeSources?: TrustedKnowledgeSource[];
+      maxAttempts?: number;
+    };
+    if (!Array.isArray(scenarios) || scenarios.length === 0) {
+      return res.status(400).json({ error: 'A non-empty scenarios array is required.' });
+    }
+    try {
+      const result = await runSelfCorrection({
+        businessId: agent.businessId,
+        agentId: agent.id,
+        versionId: req.params.versionId,
+        scenarios,
+        trustedKnowledgeSources,
+        maxAttempts
+      });
+      res.status(200).json(result);
+    } catch (e: any) {
+      // Version-not-found / published-version errors surface as 400.
+      res.status(400).json({ error: e.message || 'Self-correction failed.' });
+    }
+  }
+));
+
+router.get(
+  '/agents/:id/corrections',
+  requireAuth,
+  requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
+  asyncHandler(async (req: Request, res: Response) => {
+    const agent = res.locals.resource as Agent;
+    const runs = await listCorrectionsForAgent(agent.businessId, agent.id);
+    res.json(runs);
+  }
+));
+
+// =========================================
+// MONITORING / TELEMETRY (tenant-scoped)
+// All routes are auth + resource-access guarded. The business scope is derived
+// server-side from the authenticated agent's businessId — never from the
+// client. No write endpoints exist (telemetry is server-side recorded only).
+// =========================================
+
+router.get(
+  '/agents/:id/telemetry',
+  requireAuth,
+  requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
+  asyncHandler(async (req: Request, res: Response) => {
+    const agent = res.locals.resource as Agent;
+    const { versionId, from, to, isPublished, limit } = req.query as any;
+    const events = await listTelemetryEvents({
+      businessId: agent.businessId,
+      agentId: agent.id,
+      versionId: versionId || undefined,
+      from: from || undefined,
+      to: to || undefined,
+      isPublished: isPublished === 'true' ? true : isPublished === 'false' ? false : undefined,
+      limit: limit ? Number(limit) : undefined
+    });
+    res.json(events);
+  }
+));
+
+router.get(
+  '/agents/:id/metrics',
+  requireAuth,
+  requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
+  asyncHandler(async (req: Request, res: Response) => {
+    const agent = res.locals.resource as Agent;
+    const { versionId, from, to, isPublished } = req.query as any;
+    const metrics = await computeMetrics({
+      businessId: agent.businessId,
+      agentId: agent.id,
+      versionId: versionId || undefined,
+      from: from || undefined,
+      to: to || undefined,
+      isPublished: isPublished === 'true' ? true : isPublished === 'false' ? false : undefined
+    });
+    res.json(metrics);
+  }
+));
+
+// =========================================
+// 2b. PER-CONVERSATION DRILL-DOWN
+// =========================================
+// List conversations (with telemetry activity) for the agent's tenant. Derived
+// from telemetry events grouped by conversationId + the conversation row. The
+// agent resource is the tenant anchor: requireResourceAccess loads the agent,
+// verifies its businessId is the caller's tenant, then every conversation
+// lookup is scoped to that same businessId. A business owner can never list or
+// open another tenant's conversations — server-side authorization is
+// authoritative; the frontend only renders what the API returns.
+router.get(
+  '/agents/:id/conversations',
+  requireAuth,
+  requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
+  asyncHandler(async (req: Request, res: Response) => {
+    const agent = res.locals.resource as Agent;
+    const { isPublished, from, to, limit } = req.query as any;
+    const summaries = await listConversationsFromTelemetry({
+      businessId: agent.businessId,
+      agentId: agent.id,
+      isPublished: isPublished === 'true' ? true : isPublished === 'false' ? false : undefined,
+      from: from || undefined,
+      to: to || undefined,
+      limit: limit ? Number(limit) : undefined
+    });
+    res.json(summaries);
+  }
+));
+
+// Single conversation timeline. Tenant-scoped: getConversationTimeline requires
+// BOTH conversationId AND businessId match (the agent's tenant). A cross-tenant
+// or non-existent id returns null -> 404 (no existence leak).
+router.get(
+  '/agents/:id/conversations/:conversationId',
+  requireAuth,
+  requireResourceAccess(req => db.agents.find(a => a.id === req.params.id)),
+  asyncHandler(async (req: Request, res: Response) => {
+    const agent = res.locals.resource as Agent;
+    const timeline = await getConversationTimeline(agent.businessId, req.params.conversationId);
+    if (!timeline) return res.status(404).json({ error: 'Conversation not found.' });
+    res.json(timeline);
+  })
+);
 
 // =========================================
 // 3. RUNTIME CHAT & SIMULATOR
@@ -1454,7 +1681,14 @@ router.post(
     if (Object.keys(clean).length === 0) {
       return res.status(400).json({ error: 'At least one credential value is required.' });
     }
-    storeCredentials(integ.id, clean);
+    // Persist credentials encrypted at rest (fails safe — never stores plaintext —
+    // if no encryption key is configured). The error message never reveals the
+    // key state to the client beyond a generic storage-unavailable notice.
+    try {
+      await storeCredentials(integ.id, integ.businessId, integ.provider, clean);
+    } catch {
+      return res.status(503).json({ error: 'Credential storage is not available. Contact your administrator.' });
+    }
     integ.credentialsSet = true;
     integ.state = 'CONFIGURING';
     integ.lastError = undefined;
@@ -1485,7 +1719,7 @@ router.post(
   asyncHandler(async (req: Request, res: Response) => {
     const integ = res.locals.resource as any;
     const provider = getProvider(integ.provider);
-    const credentials = getCredentials(integ.id) || {};
+    const credentials = (await getCredentials(integ.id, integ.businessId)) || {};
     if (!integ.credentialsSet && Object.keys(credentials).length === 0) {
       return res.status(400).json({ error: 'No credentials stored. Submit credentials first.' });
     }
@@ -1519,7 +1753,7 @@ router.post(
   requireResourceAccess(req => db.integrations.find(i => i.id === req.params.id)),
   asyncHandler(async (req: Request, res: Response) => {
     const integ = res.locals.resource as any;
-    clearCredentials(integ.id);
+    await clearCredentials(integ.id, integ.businessId);
     integ.credentialsSet = false;
     integ.state = 'DISCONNECTED';
     integ.statusMessage = 'Disconnected by operator.';

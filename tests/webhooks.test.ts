@@ -26,6 +26,9 @@ process.env.META_APP_SECRET = APP_SECRET;
 process.env.META_VERIFY_TOKEN = VERIFY_TOKEN;
 process.env.TWILIO_AUTH_TOKEN = TWILIO_AUTH;
 process.env.TWILIO_ACCOUNT_SID = TWILIO_SID;
+// Credential encryption requires a key (INTEGRATION_ENCRYPTION_KEY or
+// SESSION_SECRET). Tests use a fixed secret so encryption is real.
+process.env.SESSION_SECRET = 'test-webhook-credential-encryption-secret';
 
 import os from 'os'; import path from 'path'; import fs from 'fs';
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wh-'));
@@ -92,7 +95,7 @@ async function seedTwilioIntegration(): Promise<void> {
       id: integId, businessId: bizId, provider: 'twilio_sms', state: 'CONNECTED',
       statusMessage: 'ok', credentialsSet: true, configData: { phoneNumber: TWILIO_NUMBER },
     } as any);
-    storeCredentials(integId, { TWILIO_ACCOUNT_SID: TWILIO_SID, TWILIO_AUTH_TOKEN: TWILIO_AUTH, TWILIO_PHONE_NUMBER: TWILIO_NUMBER });
+    await storeCredentials(integId, bizId, 'twilio_sms', { TWILIO_ACCOUNT_SID: TWILIO_SID, TWILIO_AUTH_TOKEN: TWILIO_AUTH, TWILIO_PHONE_NUMBER: TWILIO_NUMBER });
   }
 }
 

@@ -1,5 +1,6 @@
 import { db } from './db';
 import { Agent, AgentVersion, AgentVersionStatus, StructuredAgentConfig } from '../types';
+import { recordVersionPublished } from './telemetry';
 
 /**
  * Agent versioning service.
@@ -56,9 +57,33 @@ export async function createInitialDraft(agent: Agent): Promise<AgentVersion> {
   return v;
 }
 
-/** Create a new DRAFT from an existing version (defaults to the published one). */
-export async function createDraftFrom(sourceVersionId: string, changeNote?: string): Promise<AgentVersion> {
-  const source = await db.agentVersions.find(v => v.id === sourceVersionId);
+/** Verify a version belongs to `expectedAgentId` and return it, else throw a
+ *  not-found error (never leaks whether the version exists for another agent).
+ *  This closes the IDOR in the version mutation routes: a caller authorized
+ *  for agent A could previously supply agent A's id in the path but a version
+ *  owned by agent B in `:versionId`, and the mutation would act on B's version.
+ *  Requiring the version's agentId to match the path's agent id (whose tenant
+ *  ownership `requireResourceAccess` already verified) closes the hole. */
+async function requireVersionForAgent(versionId: string, expectedAgentId: string): Promise<AgentVersion> {
+  const v = await db.agentVersions.find(x => x.id === versionId && x.agentId === expectedAgentId);
+  if (!v) throw new Error('Version not found.');
+  return v;
+}
+
+/** Whether a version belongs to the given agent (no existence leak: returns
+ *  false for both "not found" and "belongs to another agent"). */
+export async function versionBelongsToAgent(versionId: string, agentId: string): Promise<boolean> {
+  const v = await db.agentVersions.find(x => x.id === versionId && x.agentId === agentId);
+  return !!v;
+}
+
+/** Create a new DRAFT from an existing version (defaults to the published one).
+ *  `expectedAgentId` (when provided) enforces that the source version belongs
+ *  to that agent — the IDOR guard for the `POST /agents/:id/versions` route. */
+export async function createDraftFrom(sourceVersionId: string, changeNote?: string, expectedAgentId?: string): Promise<AgentVersion> {
+  const source = expectedAgentId
+    ? await requireVersionForAgent(sourceVersionId, expectedAgentId)
+    : await db.agentVersions.find(v => v.id === sourceVersionId);
   if (!source) throw new Error('Source version not found.');
 
   const num = await nextVersionNumber(source.agentId);
@@ -78,9 +103,13 @@ export async function createDraftFrom(sourceVersionId: string, changeNote?: stri
   return draft;
 }
 
-/** Edit a DRAFT version's config. Refuses to touch non-draft versions. */
-export async function editDraft(versionId: string, patch: Partial<Pick<AgentVersion, 'systemPrompt' | 'structuredConfig' | 'model' | 'changeNote'>>): Promise<AgentVersion> {
-  const v = await db.agentVersions.find(x => x.id === versionId);
+/** Edit a DRAFT version's config. Refuses to touch non-draft versions.
+ *  `expectedAgentId` (when provided) enforces the version belongs to that
+ *  agent — the IDOR guard for `PUT /agents/:id/versions/:versionId`. */
+export async function editDraft(versionId: string, patch: Partial<Pick<AgentVersion, 'systemPrompt' | 'structuredConfig' | 'model' | 'changeNote'>>, expectedAgentId?: string): Promise<AgentVersion> {
+  const v = expectedAgentId
+    ? await requireVersionForAgent(versionId, expectedAgentId)
+    : await db.agentVersions.find(x => x.id === versionId);
   if (!v) throw new Error('Version not found.');
   if (v.status !== 'DRAFT') {
     throw new Error(`Cannot edit a ${v.status} version. Create a new draft from it instead.`);
@@ -97,13 +126,26 @@ export async function editDraft(versionId: string, patch: Partial<Pick<AgentVers
  * Promote a DRAFT (or TESTING) version to PUBLISHED. Atomic: archives the
  * previous PUBLISHED version and copies the config onto the agent row so the
  * runtime serves it immediately. Returns the published version.
+ *
+ * Publish gate: when an evaluation run exists for this version with critical
+ * failures, publication is blocked (the agent is not good enough to go live).
+ * A missing evaluation does not block (nothing to evaluate yet). The gate is
+ * enforced server-side — the frontend cannot bypass it.
  */
-export async function publishVersion(versionId: string): Promise<AgentVersion> {
-  const v = await db.agentVersions.find(x => x.id === versionId);
+export async function publishVersion(versionId: string, expectedAgentId?: string): Promise<AgentVersion> {
+  const v = expectedAgentId
+    ? await requireVersionForAgent(versionId, expectedAgentId)
+    : await db.agentVersions.find(x => x.id === versionId);
   if (!v) throw new Error('Version not found.');
   if (v.status !== 'DRAFT' && v.status !== 'TESTING') {
     throw new Error(`Only DRAFT or TESTING versions can be published (this is ${v.status}).`);
   }
+
+  // Evaluation publish gate (defensive: a version with unresolved critical
+  // evaluation failures must not go live). Skipped only when no evaluation
+  // has been recorded for the version.
+  const { assertPublishClear } = await import('./evaluation');
+  await assertPublishClear(v.businessId, v.id);
 
   const nowIso = new Date().toISOString();
   // Single transaction: archive prior published + mark this published + sync agent.
@@ -129,13 +171,21 @@ export async function publishVersion(versionId: string): Promise<AgentVersion> {
     }
   });
 
+  // Telemetry: version published (after the transaction commits).
+  await recordVersionPublished({
+    businessId: v.businessId, agentId: v.agentId, versionId: v.id,
+    versionNumber: v.versionNumber
+  });
   return v;
 }
 
 /** Roll back to a previously published/archived version by creating a new
- * PUBLISHED version with that config. (Keeps history intact.) */
-export async function rollbackToVersion(versionId: string): Promise<AgentVersion> {
-  const target = await db.agentVersions.find(x => x.id === versionId);
+ * PUBLISHED version with that config. (Keeps history intact.)
+ *  `expectedAgentId` enforces the target version belongs to that agent (IDOR guard). */
+export async function rollbackToVersion(versionId: string, expectedAgentId?: string): Promise<AgentVersion> {
+  const target = expectedAgentId
+    ? await requireVersionForAgent(versionId, expectedAgentId)
+    : await db.agentVersions.find(x => x.id === versionId);
   if (!target) throw new Error('Version not found.');
 
   const num = await nextVersionNumber(target.agentId);
@@ -156,9 +206,12 @@ export async function rollbackToVersion(versionId: string): Promise<AgentVersion
   return publishVersion(reissue.id);
 }
 
-/** Archive a version (only DRAFT/TESTING may be archived). */
-export async function archiveVersion(versionId: string): Promise<AgentVersion> {
-  const v = await db.agentVersions.find(x => x.id === versionId);
+/** Archive a version (only DRAFT/TESTING may be archived).
+ *  `expectedAgentId` enforces the version belongs to that agent (IDOR guard). */
+export async function archiveVersion(versionId: string, expectedAgentId?: string): Promise<AgentVersion> {
+  const v = expectedAgentId
+    ? await requireVersionForAgent(versionId, expectedAgentId)
+    : await db.agentVersions.find(x => x.id === versionId);
   if (!v) throw new Error('Version not found.');
   if (v.status === 'PUBLISHED') throw new Error('Cannot archive the currently published version.');
   v.status = 'ARCHIVED';
@@ -166,9 +219,12 @@ export async function archiveVersion(versionId: string): Promise<AgentVersion> {
   return v;
 }
 
-/** Move a DRAFT to TESTING (for simulator staging). */
-export async function moveToTesting(versionId: string): Promise<AgentVersion> {
-  const v = await db.agentVersions.find(x => x.id === versionId);
+/** Move a DRAFT to TESTING (for simulator staging).
+ *  `expectedAgentId` enforces the version belongs to that agent (IDOR guard). */
+export async function moveToTesting(versionId: string, expectedAgentId?: string): Promise<AgentVersion> {
+  const v = expectedAgentId
+    ? await requireVersionForAgent(versionId, expectedAgentId)
+    : await db.agentVersions.find(x => x.id === versionId);
   if (!v) throw new Error('Version not found.');
   if (v.status !== 'DRAFT') throw new Error('Only DRAFT versions can move to TESTING.');
   v.status = 'TESTING';

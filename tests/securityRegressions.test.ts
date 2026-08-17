@@ -21,6 +21,9 @@ delete process.env.GEMINI_API_KEY;
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentforge-sec-'));
 process.env.DB_PATH = path.join(tmpDir, 'sec.db');
+// Credential encryption requires a key (INTEGRATION_ENCRYPTION_KEY or
+// SESSION_SECRET); without it storage refuses (never stores plaintext).
+process.env.SESSION_SECRET = 'test-security-regressions-credential-key';
 
 const { router } = await import('../src/server/routes');
 const { db } = await import('../src/server/db');

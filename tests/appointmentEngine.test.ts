@@ -148,23 +148,26 @@ describe('validateSlot', () => {
     expect(r.error).toMatch(/in advance/i);
   });
   it('enforces minimum-notice policy', () => {
-    // Use a business with 24h hours so the only failing rule is minimum notice.
+    // Use a business open 24h EVERY day (incl. Sunday) so the only failing
+    // rule is the minimum-notice policy, and the slot's date never needs the
+    // Sunday-skip shift (which would otherwise move the instant ~24h ahead).
     const b = makeBusiness({
-      hours: ['monday','tuesday','wednesday','thursday','friday','saturday'].map(day => ({
+      hours: ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'].map(day => ({
         day: day as any, isOpen: true, openTime: '00:00', closeTime: '23:59'
-      })).concat([{ day: 'sunday' as any, isOpen: false, openTime: '00:00', closeTime: '23:59' }]),
+      })),
       policies: { cancellation: 'at least 2 hours before', refund: '', bookingNotice: '' }
     });
-    // Pick a near-term open day and a time ~30 min from now (within 24h hours).
-    const soon = new Date(Date.now() + 30 * 60000); // 30 min from now
-    let dateStr = soon.toISOString().split('T')[0];
-    // If that date is Sunday, push to the next open day.
-    while (new Date(`${dateStr}T00:00:00Z`).getUTCDay() === 0) {
-      soon.setDate(soon.getDate() + 1);
-      dateStr = soon.toISOString().split('T')[0];
-    }
-    const timeStr = `${soon.getHours().toString().padStart(2,'0')}:${soon.getMinutes().toString().padStart(2,'0')}`;
-    const r = validateSlot(b, svc(), dateStr, timeStr, new Date());
+    // A slot ~30 min from now is well under the 120-min minimum notice, so the
+    // policy must reject it. Construct the wall-clock in the BUSINESS timezone
+    // (Asia/Tehran, UTC+3:30) so the comparison is honest regardless of the
+    // server's own timezone (the production notice check is timezone-aware).
+    const now = new Date();
+    const slotInstant = new Date(now.getTime() + 30 * 60000);
+    const tehranOffsetMin = 210; // Asia/Tehran = UTC+3:30 year-round
+    const tehranWall = new Date(slotInstant.getTime() + tehranOffsetMin * 60000);
+    const dateStr = tehranWall.toISOString().split('T')[0];
+    const timeStr = `${tehranWall.getUTCHours().toString().padStart(2,'0')}:${tehranWall.getUTCMinutes().toString().padStart(2,'0')}`;
+    const r = validateSlot(b, svc(), dateStr, timeStr, now);
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/too soon|in advance/i);
   });

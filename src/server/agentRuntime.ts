@@ -1,29 +1,16 @@
-import { GoogleGenAI, GenerateContentParameters, Part } from '@google/genai';
+import { Part } from '@google/genai';
 import { db } from './db';
 import { agentToolDeclarations, executeAgentTool } from './tools';
 import { retrieveRelevant } from './embeddings';
+import { resolveProviderAndModel, toLlmToolDeclarations } from './llmProvider';
 import { ChannelType, ToolCallRecord } from '../types';
 import { safeError } from './logSanitizer';
-
-let aiClient: GoogleGenAI | null = null;
-
-function getGeminiClient(): GoogleGenAI {
-  if (!aiClient) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      throw new Error('GEMINI_API_KEY environment variable is missing.');
-    }
-    aiClient = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build'
-        }
-      }
-    });
-  }
-  return aiClient;
-}
+import {
+  recordCustomerMessage,
+  recordAgentResponse,
+  recordToolExecution,
+  recordHumanHandoff
+} from './telemetry';
 
 export interface RuntimeDebugInfo {
   systemPrompt: string;
@@ -205,6 +192,10 @@ export async function processAgentMessage(params: {
   let effectiveSystemPrompt = agent.systemPrompt;
   let effectiveConfig = agent.structuredConfig;
   let effectiveModel = agent.model;
+  // Version the runtime is running against (for telemetry + observability). For
+  // the simulator this is the explicit DRAFT/TESTING version; for production it
+  // is the PUBLISHED version. Unset for the early no-published-version fallback.
+  let effectiveVersionId: string | undefined = params.versionId;
   if (params.versionId) {
     const { getVersionForSim } = await import('./agentVersions');
     const resolved = await getVersionForSim(agent.id, params.versionId);
@@ -230,6 +221,7 @@ export async function processAgentMessage(params: {
     effectiveSystemPrompt = pub.systemPrompt;
     effectiveConfig = pub.structuredConfig;
     effectiveModel = pub.model;
+    effectiveVersionId = pub.id;
   }
 
   // 3. Resolve or Create Conversation (TENANT-SCOPED: a customer can never
@@ -285,6 +277,13 @@ export async function processAgentMessage(params: {
     timestamp: new Date().toISOString()
   });
 
+  // Telemetry: customer message (metadata + safe summary only; no full content).
+  await recordCustomerMessage({
+    businessId: tenantId, agentId: agent.id, versionId: effectiveVersionId,
+    conversationId: conversation.id, channel, isPublished: !simulator,
+    messageLength: userMessage.length, messagePreview: userMessage
+  });
+
   // 4. Retrieve RAG Knowledge Chunks
   const retrievedKnowledge = await retrieveKnowledgeChunks(tenantId, userMessage);
 
@@ -337,37 +336,63 @@ CRITICAL MANDATES:
   let finalReply = '';
   let runtimeError: string | undefined;
 
-  // Real token usage from the provider's usageMetadata, accumulated across
-  // the tool loop (Phase 19). Hoisted outside try so the catch block and the
-  // usage recording block can read them.
+  // Real token usage from the provider, accumulated across the tool loop
+  // (Phase 19). Hoisted outside try so the catch block and the usage
+  // recording block can read them.
   let providerInputTokens = 0;
   let providerOutputTokens = 0;
-  const providerModel = effectiveModel || 'gemini-3.6-flash';
+
+  // Resolve the LLM provider adapter for THIS agent (free-first: ollama when no
+  // Gemini key, etc.). The runtime never imports a vendor SDK directly — see
+  // src/server/llmProvider.ts. Provider/model come from the effective config
+  // (published version in production, draft in the simulator).
+  const { provider: llmProvider, model: providerModel } = resolveProviderAndModel({
+    llmProvider: agent.llmProvider,
+    model: effectiveModel
+  });
 
   try {
-    const ai = getGeminiClient();
+    // If the provider is not usable (no key / daemon down), fail honestly
+    // rather than calling out to a dead backend.
+    if (!llmProvider.isConfigured()) {
+      throw new Error(`AI provider "${llmProvider.type}" is not configured.`);
+    }
 
-    // Call Gemini Model
-    const reqParameters: GenerateContentParameters = {
+    const temperature = structured.personality.tone === 'energetic' ? 0.7 : 0.2;
+    const activeToolDecls = toLlmToolDeclarations(activeTools);
+
+    let response = await llmProvider.generate({
       model: providerModel,
-      contents: contents as any,
-      config: {
-        systemInstruction: fullSystemPrompt,
-        temperature: structured.personality.tone === 'energetic' ? 0.7 : 0.2,
-        tools: activeTools.length > 0 ? [{ functionDeclarations: activeTools }] : undefined
-      }
-    };
+      systemPrompt: fullSystemPrompt,
+      messages: contents.map(c => ({
+        role: (c.role === 'model' ? 'assistant' : 'user') as 'assistant' | 'user',
+        text: (c.parts.find(p => 'text' in p && typeof (p as any).text === 'string') as any)?.text,
+        // Reconstruct assistant tool-call turns / user tool-result turns so the
+        // provider loop can replay them (the Gemini path built these inline; the
+        // normalized provider expects the structured shapes below).
+        toolCalls: c.parts
+          .filter(p => 'functionCall' in p)
+          .map(p => {
+            const fc = (p as any).functionCall;
+            return { name: fc.name, args: (fc.args as Record<string, any>) || {} };
+          }),
+        toolResults: c.parts
+          .filter(p => 'functionResponse' in p)
+          .map(p => {
+            const fr = (p as any).functionResponse;
+            return { name: fr.name, response: fr.response as Record<string, any> };
+          })
+      })),
+      tools: activeToolDecls,
+      temperature
+    });
 
-    let response = await ai.models.generateContent(reqParameters);
+    if (response.error) throw new Error(response.error);
 
     const accumulateUsage = (r: typeof response) => {
-      const um = r?.usageMetadata;
-      if (um) {
-        // promptTokenCount accumulates full context on each turn; we take the
-        // final turn's prompt count plus the sum of generated candidate tokens
-        // across all turns to approximate total input/output usage.
-        providerInputTokens = um.promptTokenCount ?? providerInputTokens;
-        providerOutputTokens += um.candidatesTokenCount ?? 0;
+      if (r.usage) {
+        providerInputTokens = r.usage.inputTokens || providerInputTokens;
+        providerOutputTokens += r.usage.outputTokens || 0;
       }
     };
     accumulateUsage(response);
@@ -382,7 +407,7 @@ CRITICAL MANDATES:
 
       for (const call of functionCalls) {
         const toolName = call.name;
-        const args = (call.args as Record<string, any>) || {};
+        const args = call.args || {};
 
         // Execute Tool safely on backend with tenant isolation + hard
         // enablement enforcement. BOTH the agent's toolsEnabled set (the
@@ -407,6 +432,14 @@ CRITICAL MANDATES:
         };
         toolCallRecords.push(rec);
 
+        // Telemetry: tool execution (tool name + success only; never args).
+        await recordToolExecution({
+          businessId: tenantId, agentId: agent.id, versionId: effectiveVersionId,
+          conversationId: conversation.id, channel, isPublished: !simulator,
+          toolName, success: !!result.success,
+          errorSummary: result.success ? undefined : (result.error || 'tool failed')
+        });
+
         functionResponseParts.push({
           functionResponse: {
             name: toolName,
@@ -415,25 +448,40 @@ CRITICAL MANDATES:
         });
       }
 
-      // Feed function call result back into contents history
-      const prevCandidateContent = response.candidates?.[0]?.content;
-      if (prevCandidateContent) {
-        (contents as any).push(prevCandidateContent);
-      }
+      // Feed the assistant's tool-call turn + the tool results back into history.
+      (contents as any).push({
+        role: 'model',
+        parts: functionCalls.map(call => ({ functionCall: { name: call.name, args: call.args } }))
+      });
       (contents as any).push({
         role: 'user',
         parts: functionResponseParts
       });
 
-      // Call Gemini again with function results
-      response = await ai.models.generateContent({
+      // Call the provider again with the function results.
+      response = await llmProvider.generate({
         model: providerModel,
-        contents: contents as any,
-        config: {
-          systemInstruction: fullSystemPrompt,
-          tools: activeTools.length > 0 ? [{ functionDeclarations: activeTools }] : undefined
-        }
+        systemPrompt: fullSystemPrompt,
+        messages: contents.map(c => ({
+          role: (c.role === 'model' ? 'assistant' : 'user') as 'assistant' | 'user',
+          text: (c.parts.find(p => 'text' in p && typeof (p as any).text === 'string') as any)?.text,
+          toolCalls: c.parts
+            .filter(p => 'functionCall' in p)
+            .map(p => {
+              const fc = (p as any).functionCall;
+              return { name: fc.name, args: (fc.args as Record<string, any>) || {} };
+            }),
+          toolResults: c.parts
+            .filter(p => 'functionResponse' in p)
+            .map(p => {
+              const fr = (p as any).functionResponse;
+              return { name: fr.name, response: fr.response as Record<string, any> };
+            })
+        })),
+        tools: activeToolDecls,
+        temperature
       });
+      if (response.error) throw new Error(response.error);
       accumulateUsage(response);
     }
 
@@ -441,7 +489,7 @@ CRITICAL MANDATES:
   } catch (err: any) {
     // Log the real error internally with the execution id for support; never
     // expose the provider's error message/stack to the customer.
-    safeError(`[runtime] ${executionId} Gemini error:`, err?.message || err);
+    safeError(`[runtime] ${executionId} ${llmProvider.type} error:`, err?.message || err);
     runtimeError = err?.message || 'AI Provider Error';
     // Honest fallback: report the outage, never claim any action succeeded.
     // Internal error details stay server-side (and in debug for internal callers).
@@ -509,6 +557,28 @@ CRITICAL MANDATES:
   if (!usage.model) usage.model = usedModel;
   await db.usageRecords.update(usage);
 
+  // Telemetry: agent response (latency, provider/model, tokens, success). Only
+  // the main executed path records this — the early no-agent / no-published
+  // fallbacks return before reaching here, so metrics reflect real activity.
+  const handoffOccurred = conversation.status === 'WAITING_FOR_HUMAN';
+  await recordAgentResponse({
+    businessId: tenantId, agentId: agent.id, versionId: effectiveVersionId,
+    conversationId: conversation.id, channel, provider: llmProvider.type,
+    model: providerModel, isPublished: !simulator, latencyMs,
+    success: !runtimeError, status: conversation.status,
+    inputTokens: usedInputTokens || undefined,
+    outputTokens: usedOutputTokens || undefined,
+    tokensUsed: tokensUsed, replyPreview: finalReply,
+    toolCallCount: toolCallRecords.length
+  });
+  if (handoffOccurred) {
+    await recordHumanHandoff({
+      businessId: tenantId, agentId: agent.id, versionId: effectiveVersionId,
+      conversationId: conversation.id, channel, isPublished: !simulator,
+      reason: runtimeError ? 'provider error escalated to human' : 'agent escalated to human'
+    });
+  }
+
   const debug: RuntimeDebugInfo | null = params.includeDebug
     ? {
         systemPrompt: fullSystemPrompt,
@@ -516,7 +586,7 @@ CRITICAL MANDATES:
         toolCalls: toolCallRecords,
         latencyMs,
         tokensUsed,
-        model: agent.model || 'gemini-3.6-flash',
+        model: providerModel,
         executionId,
         ...(runtimeError ? { error: runtimeError } : {})
       }
@@ -559,7 +629,8 @@ export async function generateSuggestedAgentConfig(businessInput: {
   }
 
   try {
-    const ai = getGeminiClient();
+    const { provider, model } = resolveProviderAndModel(null);
+    if (!provider.isConfigured()) throw new Error('AI provider not configured');
 
     const prompt = `You are an expert AI Agent Architect designing the configuration for a new AI receptionist agent.
 
@@ -609,13 +680,13 @@ Return ONLY a JSON object (no markdown, no prose, no code fences) with exactly t
   "needsInput": [{ "field": "prices", "label": "Exact prices for each service" }]
 }`;
 
-    const res = await ai.models.generateContent({
-      model: 'gemini-3.6-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json'
-      }
+    const res = await provider.generate({
+      model,
+      systemPrompt: 'You are an expert AI Agent Architect. Return only the JSON object requested.',
+      messages: [{ role: 'user', text: prompt }],
+      tools: []
     });
+    if (res.error) throw new Error(res.error);
 
     if (res.text) {
       // Robust parsing: tolerate markdown code fences and stray prose, then

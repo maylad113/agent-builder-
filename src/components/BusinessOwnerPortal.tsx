@@ -5,6 +5,8 @@ import { AgentSimulator } from './AgentSimulator';
 import { WebsiteChatWidgetDemo } from './WebsiteChatWidgetDemo';
 import { ConversationsView } from './ConversationsView';
 import { ChannelsAndIntegrations } from './ChannelsAndIntegrations';
+import { FactoryControlCenter } from './FactoryControlCenter';
+import { MonitoringView } from './MonitoringView';
 import { 
   Bot, 
   MessageSquare, 
@@ -21,7 +23,9 @@ import {
   Trash2,
   Sliders,
   DollarSign,
-  Scissors
+  Scissors,
+  FlaskConical,
+  Activity
 } from 'lucide-react';
 
 interface BusinessOwnerPortalProps {
@@ -49,7 +53,7 @@ export const BusinessOwnerPortal: React.FC<BusinessOwnerPortalProps> = ({
   onToggleAgentStatus,
   onRefreshData
 }) => {
-  const [activeTab, setActiveTab] = useState<'overview' | 'agent' | 'conversations' | 'appointments' | 'products' | 'knowledge' | 'channels' | 'simulator' | 'widget'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'agent' | 'control' | 'monitoring' | 'conversations' | 'appointments' | 'products' | 'knowledge' | 'channels' | 'simulator' | 'widget'>('overview');
 
   // New Knowledge Chunk State
   const [newKbTitle, setNewKbTitle] = useState('');
@@ -150,6 +154,26 @@ export const BusinessOwnerPortal: React.FC<BusinessOwnerPortalProps> = ({
         >
           <Bot className="w-4 h-4" />
           <span>AI Agent Builder</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab('control')}
+          className={`pb-3 border-b-2 transition-colors flex items-center space-x-1.5 whitespace-nowrap ${
+            activeTab === 'control' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-800'
+          }`}
+        >
+          <FlaskConical className="w-4 h-4 text-indigo-600" />
+          <span>Factory Control Center</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab('monitoring')}
+          className={`pb-3 border-b-2 transition-colors flex items-center space-x-1.5 whitespace-nowrap ${
+            activeTab === 'monitoring' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-800'
+          }`}
+        >
+          <Activity className="w-4 h-4 text-emerald-600" />
+          <span>Monitoring</span>
         </button>
 
         <button
@@ -266,6 +290,16 @@ export const BusinessOwnerPortal: React.FC<BusinessOwnerPortalProps> = ({
           onUpdateAgent={onUpdateAgent}
           onToggleStatus={onToggleAgentStatus}
         />
+      )}
+
+      {/* Tab: Factory Control Center — evaluate / correct / publish lifecycle */}
+      {activeTab === 'control' && agent && (
+        <FactoryControlCenter agent={agent} onRefreshAgent={onRefreshData} />
+      )}
+
+      {/* Tab: Monitoring — real telemetry / observability */}
+      {activeTab === 'monitoring' && agent && (
+        <MonitoringView agent={agent} />
       )}
 
       {/* Tab: Agent Simulator */}

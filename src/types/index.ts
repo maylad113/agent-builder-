@@ -135,7 +135,12 @@ export interface Agent {
   pausedFrom?: AgentStatus;
   systemPrompt: string;
   structuredConfig: StructuredAgentConfig;
-  llmProvider: 'gemini' | 'openai' | 'anthropic';
+  /** AI provider backing this agent. The platform is free-first: `ollama`
+   *  runs a local/open-source model with no paid API; `gemini` is an optional
+   *  cloud provider. The runtime resolves a provider adapter from this field
+   *  (see src/server/llmProvider.ts) and degrades gracefully when a provider's
+   *  credentials/daemon are unavailable. */
+  llmProvider: 'gemini' | 'ollama';
   model: string;
   createdAt: string;
   updatedAt: string;
@@ -356,4 +361,248 @@ export interface AuditLog {
   action: string;
   details: string;
   timestamp: string;
+}
+
+// ---------------------------------------------------------------------------
+// Agent evaluation engine
+// ---------------------------------------------------------------------------
+
+/** Structured failure categories (never free-form) used by the evaluator. */
+export type FailureCategory =
+  | 'MISSING_KNOWLEDGE'
+  | 'BAD_INSTRUCTION'
+  | 'BAD_TOOL_SELECTION'
+  | 'BAD_TOOL_ARGUMENT'
+  | 'MISSING_TOOL'
+  | 'MISSING_INTEGRATION'
+  | 'GROUNDING_FAILURE'
+  | 'BUSINESS_RULE_FAILURE'
+  | 'SAFETY_FAILURE'
+  | 'HANDOFF_FAILURE'
+  | 'OTHER';
+
+/** Evaluation dimensions the engine covers. */
+export type EvalDimension =
+  | 'factual_knowledge'
+  | 'hallucination'
+  | 'tool_selection'
+  | 'tool_argument'
+  | 'business_rule'
+  | 'appointment'
+  | 'handoff'
+  | 'safety'
+  | 'prompt_injection'
+  | 'unknown_handling';
+
+export type EvalSeverity = 'critical' | 'warning';
+
+/**
+ * A test scenario executed against the REAL agent runtime. Data-driven so it
+ * can be persisted and replayed. Deterministic assertions drive scoring; an
+ * optional LLM judge (through the provider abstraction) may add a fuzzy
+ * signal but never overrides a critical deterministic failure.
+ */
+export interface EvalScenario {
+  id: string;
+  name: string;
+  /** The customer message sent to the runtime. */
+  userMessage: string;
+  /** Dimension this scenario primarily exercises. */
+  dimension: EvalDimension;
+  severity: EvalSeverity;
+  description?: string;
+  /** Tool names that MUST be invoked (each must appear in the captured tool calls). */
+  expectedToolCalls?: string[];
+  /** Tool names that MUST NOT be invoked. */
+  forbiddenTools?: string[];
+  /** Verify a tool was called with args containing these key/value pairs. */
+  expectedToolArgs?: { tool: string; argsContain: Record<string, any> };
+  /** When true, the run must escalate (WAITING_FOR_HUMAN or transfer_to_human). */
+  expectHandoff?: boolean;
+  /** Substrings the reply MUST contain (else grounding/knowledge failure). */
+  mustContain?: string[];
+  /** Substrings the reply MUST NOT contain (fabricated facts / leaked data). */
+  mustNotContain?: string[];
+}
+
+export interface EvalCheckResult {
+  dimension: EvalDimension;
+  passed: boolean;
+  detail: string;
+  category: FailureCategory;
+}
+
+export interface EvalScenarioResult {
+  scenarioId: string;
+  scenarioName: string;
+  dimension: EvalDimension;
+  severity: EvalSeverity;
+  passed: boolean;
+  checks: EvalCheckResult[];
+  failureCategories: FailureCategory[];
+  /** Captured agent reply. */
+  reply: string;
+  /** Captured tool calls (name + args + success). */
+  toolCalls: { toolName: string; args: Record<string, any>; success: boolean }[];
+  conversationId: string;
+  executionId: string;
+  status: string;
+  latencyMs: number;
+  /** Present when the runtime/ provider itself errored (graceful, non-fatal to the engine). */
+  error?: string;
+}
+
+export interface EvalRunResult {
+  id: string;
+  businessId: string;
+  agentId: string;
+  /** Version evaluated (DRAFT/TESTING). Never a PUBLISHED version. */
+  versionId: string;
+  timestamp: string;
+  overallPassed: boolean;
+  totalScenarios: number;
+  passedScenarios: number;
+  criticalFailures: number;
+  /** Provider adapter used (free-first: 'ollama' when no Gemini key). */
+  providerUsed: string;
+  scenarioResults: EvalScenarioResult[];
+}
+
+// ---------------------------------------------------------------------------
+// Agent self-correction loop
+// ---------------------------------------------------------------------------
+
+/** The kind of targeted correction the engine can apply. Safety controls are
+ *  NEVER weakened automatically — a SAFETY_FAILURE only ever produces a
+ *  PROPOSE_HUMAN_REVIEW proposal. */
+export type CorrectionActionType =
+  | 'ENABLE_TOOL'
+  | 'ADD_KNOWLEDGE_FROM_SOURCE'
+  | 'STRENGTHEN_GROUNDING_INSTRUCTIONS'
+  | 'CORRECT_TOOL_ARGUMENT_INSTRUCTIONS'
+  | 'CORRECT_BUSINESS_RULE_INSTRUCTIONS'
+  | 'CORRECT_HANDOFF_INSTRUCTIONS'
+  | 'PROPOSE_HUMAN_REVIEW';
+
+/** A proposed (and, when safe, applied) correction for one failure category.
+ *  Every correction is auditable: it carries the reason and the affected
+ *  scenario ids. `humanReviewRequired` gates auto-application. */
+export interface CorrectionProposal {
+  category: FailureCategory;
+  actionType: CorrectionActionType;
+  reason: string;
+  humanReviewRequired: boolean;
+  targetScenarioIds: string[];
+  /** Action-specific payload, e.g. the tool name to enable or the trusted
+   *  knowledge source to add. Never carries fabricated facts. */
+  details?: {
+    toolName?: string;
+    knowledgeTitle?: string;
+    knowledgeContent?: string;
+    knowledgeTags?: string[];
+    instructionAppend?: string;
+    ruleField?: 'bookingRules' | 'refundRules' | 'orderRules';
+  };
+}
+
+/** One iteration of the correction loop: the proposal considered, the version
+ *  it was applied to, the new draft it produced, and the re-evaluation. */
+export interface CorrectionAttempt {
+  attemptNumber: number;
+  proposal: CorrectionProposal;
+  appliedToVersionId: string;
+  resultingVersionId: string;
+  originalEvaluationId: string;
+  resultingEvaluationId: string;
+  status: 'APPLIED' | 'SKIPPED' | 'HUMAN_REVIEW';
+  timestamp: string;
+}
+
+/** The full result of a self-correction run, persisted for auditability. */
+export interface CorrectionResult {
+  id: string;
+  businessId: string;
+  agentId: string;
+  /** Version the loop started from (DRAFT/TESTING, never PUBLISHED). */
+  startVersionId: string;
+  /** Version the loop ended on (the last corrected draft, or the start
+   *  version when no correction was needed / possible). */
+  finalVersionId: string;
+  resolved: boolean;
+  /** True when the agent could not be auto-corrected and must be reviewed by
+   *  a human (safety failure, missing tool, no trusted knowledge source, or
+   *  max attempts exhausted without a pass). */
+  humanReviewRequired: boolean;
+  maxAttempts: number;
+  attempts: CorrectionAttempt[];
+  /** The final evaluation run id (null only if the very first evaluation
+   *  could not be produced). */
+  finalEvaluationId: string | null;
+  /** True iff finalEvaluationId corresponds to a passing run. */
+  finalEvaluationPassed: boolean;
+  reason: string;
+  timestamp: string;
+}
+
+/** A trustworthy knowledge source the owner maps to a specific scenario's
+ *  missing-knowledge requirement. The engine NEVER fabricates knowledge; it
+ *  only adds chunks whose content came from the owner. */
+export interface TrustedKnowledgeSource {
+  scenarioId: string;
+  title: string;
+  content: string;
+  tags?: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry / Observability
+//
+// Durable, tenant-scoped event records emitted from the REAL agent runtime,
+// tool execution, evaluation, correction, and publish paths. The LLM NEVER
+// writes or modifies telemetry — recording is server-side only at well-defined
+// seams. Records prefer metadata + safe summaries over raw conversation
+// content, and never carry secrets/credentials.
+// ---------------------------------------------------------------------------
+
+export type TelemetryEventType =
+  | 'CUSTOMER_MESSAGE'
+  | 'AGENT_RESPONSE'
+  | 'TOOL_EXECUTION'
+  | 'HUMAN_HANDOFF'
+  | 'EVALUATION_RUN'
+  | 'CORRECTION_ATTEMPT'
+  | 'VERSION_PUBLISHED';
+
+export interface TelemetryEvent {
+  id: string;
+  /** Tenant scope — EVERY record is business-scoped; never cross-tenant. */
+  businessId: string;
+  /** ISO timestamp of the event. */
+  timestamp: string;
+  eventType: TelemetryEventType;
+  agentId?: string;
+  /** Version the event pertains to (published version for prod, draft/test
+   *  version for simulator/eval/correct activity). */
+  versionId?: string;
+  conversationId?: string;
+  channel?: string;
+  /** LLM provider adapter used (e.g. 'ollama', 'google'). */
+  provider?: string;
+  model?: string;
+  /** True for REAL published-agent activity (production widget). False for
+   *  DRAFT/TESTING/simulator activity. The monitoring UI separates these. */
+  isPublished: boolean;
+  /** Tool name (TOOL_EXECUTION only). */
+  toolName?: string;
+  /** Success flag (TOOL_EXECUTION, AGENT_RESPONSE). */
+  success?: boolean;
+  latencyMs?: number;
+  /** Token usage when available (input/output/total). */
+  inputTokens?: number;
+  outputTokens?: number;
+  tokensUsed?: number;
+  /** Safe, non-sensitive summary or metadata (never secrets/raw PII). */
+  summary?: string;
+  /** Structured extra metadata (counts, categories, etc.). JSON-serialized. */
+  metadata?: Record<string, any>;
 }

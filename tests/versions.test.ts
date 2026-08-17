@@ -138,4 +138,76 @@ describe('agent versioning lifecycle', () => {
     const crossPub = await tonyAgent.post(`/api/agents/${agentB.body.id}/versions/anything/publish`);
     expect([403, 404]).toContain(crossPub.status);
   });
+
+  // IDOR regression (audit P0): the version mutation routes authorize the
+  // parent :id (agent) via requireResourceAccess, but the :versionId was NOT
+  // verified to belong to that agent. A tenant authorized for agent A could
+  // supply A's id in the path and B's version id in :versionId, and the
+  // mutation would act on B's version (publish/rollback/archive/edit B's config
+  // across the tenant boundary). Each mutation must now reject a foreign
+  // version id with 400/404 and leave B's version untouched.
+  it('rejects a foreign version id on every version mutation (IDOR guard)', async () => {
+    // Business B with its own agent + a DRAFT version to target.
+    const bizB = await platformAgent.post('/api/businesses').send({
+      name: 'IDOR Target Co', type: 'retail', services: [{ name: 'Consult', price: 100, durationMinutes: 30, description: 'x' }]
+    });
+    const agentB = await platformAgent.post('/api/agents').send({
+      businessId: bizB.body.id, name: 'Agent B IDOR'
+    });
+    // Agent B's initial draft (Platform owner creates it so it belongs to B).
+    const bVersions = await platformAgent.get(`/api/agents/${agentB.body.id}/versions`);
+    const bDraft = bVersions.body.find((v: any) => v.status === 'DRAFT') || bVersions.body[0];
+    expect(bDraft).toBeTruthy();
+    const bDraftPromptBefore = bDraft.systemPrompt;
+
+    // Tony is authorized for HIS agent (agent-tonys-1), but supplies B's version id.
+    const tonyAgentIdLocal = tonyAgentId;
+
+    // publish B's version via Tony's agent path -> must be rejected.
+    const pub = await tonyAgent.post(`/api/agents/${tonyAgentIdLocal}/versions/${bDraft.id}/publish`);
+    expect(pub.status).toBeGreaterThanOrEqual(400);
+    expect(pub.status).toBeLessThanOrEqual(404);
+
+    // rollback to B's version via Tony's agent path -> rejected.
+    const rb = await tonyAgent.post(`/api/agents/${tonyAgentIdLocal}/versions/${bDraft.id}/rollback`);
+    expect(rb.status).toBeGreaterThanOrEqual(400);
+    expect(rb.status).toBeLessThanOrEqual(404);
+
+    // archive B's version via Tony's agent path -> rejected.
+    const arch = await tonyAgent.post(`/api/agents/${tonyAgentIdLocal}/versions/${bDraft.id}/archive`);
+    expect(arch.status).toBeGreaterThanOrEqual(400);
+    expect(arch.status).toBeLessThanOrEqual(404);
+
+    // move B's version to TESTING via Tony's agent path -> rejected.
+    const test = await tonyAgent.post(`/api/agents/${tonyAgentIdLocal}/versions/${bDraft.id}/test`);
+    expect(test.status).toBeGreaterThanOrEqual(400);
+    expect(test.status).toBeLessThanOrEqual(404);
+
+    // edit B's draft via Tony's agent path -> rejected.
+    const edit = await tonyAgent.put(`/api/agents/${tonyAgentIdLocal}/versions/${bDraft.id}`).send({
+      systemPrompt: 'INJECTED BY TONY'
+    });
+    expect(edit.status).toBeGreaterThanOrEqual(400);
+    expect(edit.status).toBeLessThanOrEqual(404);
+
+    // create-draft FROM B's version via Tony's agent path -> rejected.
+    const draft = await tonyAgent.post(`/api/agents/${tonyAgentIdLocal}/versions`).send({
+      fromVersionId: bDraft.id
+    });
+    expect(draft.status).toBeGreaterThanOrEqual(400);
+
+    // evaluate B's version via Tony's agent path -> rejected (404).
+    const evalRes = await tonyAgent.post(`/api/agents/${tonyAgentIdLocal}/versions/${bDraft.id}/evaluate`).send({
+      scenarios: [{ id: 's1', name: 's1', userMessage: 'hi', dimension: 'helpfulness' }]
+    });
+    expect(evalRes.status).toBe(404);
+
+    // Invariant: B's version is UNCHANGED (no cross-tenant write occurred).
+    const bVersionsAfter = await platformAgent.get(`/api/agents/${agentB.body.id}/versions`);
+    const bDraftAfter = bVersionsAfter.body.find((v: any) => v.id === bDraft.id);
+    expect(bDraftAfter).toBeTruthy();
+    expect(bDraftAfter.status).toBe(bDraft.status);
+    expect(bDraftAfter.systemPrompt).toBe(bDraftPromptBefore);
+    expect(bDraftAfter.systemPrompt).not.toBe('INJECTED BY TONY');
+  });
 });

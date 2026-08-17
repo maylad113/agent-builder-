@@ -221,7 +221,7 @@ webhookRouter.post('/meta', rawBodyParser, async (req: Request, res: Response) =
       const resolved = await resolveBusinessByMetaPageId(recipientId);
       if (!resolved) continue; // no business owns this page -> drop silently
 
-      const creds = getCredentials(resolved.integrationId) || {};
+      const creds = (await getCredentials(resolved.integrationId, resolved.businessId)) || {};
       // Run the agent against the published version for that business.
       try {
         const result = await processAgentMessage({
@@ -367,7 +367,7 @@ webhookRouter.post('/twilio', twilioFormParser, async (req: Request, res: Respon
       return res.status(200).type('text/xml').send('<Response/>');
     }
 
-    const creds = getCredentials(resolved.integrationId) || {};
+    const creds = (await getCredentials(resolved.integrationId, resolved.businessId)) || {};
     try {
       const result = await processAgentMessage({
         tenantId: resolved.businessId,
@@ -418,7 +418,7 @@ webhookRouter.post('/twilio', twilioFormParser, async (req: Request, res: Respon
     // Trigger the missed-call follow-up via the agent (template-driven intro).
     const followUp = process.env.TWILIO_MISSED_CALL_TEMPLATE ||
       'Hi, we missed your call. How can I help you today? (Reply STOP to opt out)';
-    const creds = getCredentials(resolved.integrationId) || {};
+    const creds = (await getCredentials(resolved.integrationId, resolved.businessId)) || {};
     try {
       // Run the agent with the missed-call prompt so it can answer questions
       // and book an appointment if the customer replies, then send the intro.

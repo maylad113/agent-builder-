@@ -313,6 +313,77 @@ CREATE TABLE IF NOT EXISTS knowledge_embeddings (
   business_id  TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
   vector       JSONB NOT NULL,
   hash         TEXT NOT NULL,
+  model        TEXT NOT NULL DEFAULT 'gemini:text-embedding-004',
   updated_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_kb_embeddings_business ON knowledge_embeddings(business_id);
+
+-- Agent evaluation results (evaluation engine + failure classification). The
+-- per-scenario structured run is stored as JSONB; indexed columns support
+-- tenant-scoped listing and the publish gate (latest result per version).
+CREATE TABLE IF NOT EXISTS evaluation_results (
+  id              TEXT PRIMARY KEY,
+  business_id     TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  agent_id        TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  version_id      TEXT NOT NULL,
+  overall_passed  BOOLEAN NOT NULL,
+  critical_failures INTEGER NOT NULL DEFAULT 0,
+  total_scenarios INTEGER NOT NULL DEFAULT 0,
+  passed_scenarios INTEGER NOT NULL DEFAULT 0,
+  provider_used   TEXT,
+  scenario_results JSONB NOT NULL DEFAULT '[]'::jsonb,
+  timestamp       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_eval_results_business ON evaluation_results(business_id);
+CREATE INDEX IF NOT EXISTS idx_eval_results_version ON evaluation_results(version_id);
+CREATE INDEX IF NOT EXISTS idx_eval_results_agent ON evaluation_results(agent_id, timestamp);
+
+-- Self-correction loop audit records. Each row is one correction run; the
+-- per-attempt audit trail is stored as JSONB in `attempts`.
+CREATE TABLE IF NOT EXISTS correction_runs (
+  id                    TEXT PRIMARY KEY,
+  business_id           TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  agent_id              TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  start_version_id      TEXT NOT NULL,
+  final_version_id      TEXT NOT NULL,
+  resolved              BOOLEAN NOT NULL,
+  human_review_required BOOLEAN NOT NULL,
+  max_attempts          INTEGER NOT NULL,
+  attempts              JSONB NOT NULL DEFAULT '[]'::jsonb,
+  final_evaluation_id   TEXT,
+  final_evaluation_passed BOOLEAN NOT NULL DEFAULT FALSE,
+  reason                TEXT,
+  timestamp             TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_correction_runs_business ON correction_runs(business_id);
+CREATE INDEX IF NOT EXISTS idx_correction_runs_agent ON correction_runs(agent_id, timestamp);
+
+-- Usage Monitoring + Observability. Tenant-scoped event records from the real
+-- runtime/tool/evaluation/correction/publish paths. Metadata in JSONB; never
+-- secrets or tool args.
+CREATE TABLE IF NOT EXISTS telemetry_events (
+  id              TEXT PRIMARY KEY,
+  business_id     TEXT NOT NULL,
+  timestamp       TEXT NOT NULL,
+  event_type      TEXT NOT NULL,
+  agent_id        TEXT,
+  version_id      TEXT,
+  conversation_id TEXT,
+  channel         TEXT,
+  provider        TEXT,
+  model           TEXT,
+  is_published    BOOLEAN NOT NULL DEFAULT FALSE,
+  tool_name       TEXT,
+  success         BOOLEAN,
+  latency_ms      INTEGER,
+  input_tokens    INTEGER,
+  output_tokens   INTEGER,
+  tokens_used     INTEGER,
+  summary         TEXT,
+  metadata        JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_telemetry_business ON telemetry_events(business_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_telemetry_agent ON telemetry_events(agent_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_telemetry_version ON telemetry_events(version_id);
+CREATE INDEX IF NOT EXISTS idx_telemetry_type ON telemetry_events(business_id, event_type, timestamp);
+CREATE INDEX IF NOT EXISTS idx_telemetry_conversation ON telemetry_events(business_id, conversation_id, timestamp);

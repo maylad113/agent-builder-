@@ -10,6 +10,17 @@ dist/
 .env.*
 !.env.example
 
+# Defense-in-depth: generic secret/key filenames (exact basename or path).
+# These match only files named exactly so — they do NOT match legitimate
+# source like src/server/credentialCrypto.ts (basename != "credentials").
+*.pem
+*.key
+secrets
+credentials
+api_keys.txt
+encryption.key
+config/secrets.json
+
 # Local databases / runtime data
 *.db
 *.db-journal

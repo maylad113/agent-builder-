@@ -1,4 +1,4 @@
-import { GoogleGenAI } from '@google/genai';
+import { resolveEmbeddingProvider, embeddingProviderAvailable } from './llmProvider';
 import { KnowledgeChunk } from '../types';
 
 /**
@@ -9,31 +9,28 @@ import { KnowledgeChunk } from '../types';
  * (The project standardizes on better-sqlite3 for synchronous transactions;
  * pgvector is the documented upgrade path — see AGENTS.md.)
  *
- * Embeddings: Gemini `text-embedding-004` with outputDimensionality=256.
+ * Embeddings: provider-agnostic (see src/server/llmProvider.ts).
+ *  - FREE-FIRST: defaults to a local Ollama embedding model
+ *    (`nomic-embed-text`) when no paid Gemini key is set, so RAG works
+ *    without a paid API. Gemini `text-embedding-004` (256-dim) is used when
+ *    `GEMINI_API_KEY` is present.
+ *  - Each stored vector records the model that produced it. Retrieval only
+ *    compares vectors from the SAME model as the query embedding, so a
+ *    provider/model change never produces meaningless cross-model cosine
+ *    scores (no fabricated relevance).
  *  - Re-indexed when a chunk's content changes (content hash guard).
  *  - Tenant-scoped: every embedding carries a businessId and search is
  *    restricted to the caller's tenant.
- *  - Graceful fallback: when GEMINI_API_KEY is absent, semantic search
- *    degrades to the keyword method so the app never fails to start or answer.
+ *  - Graceful fallback: when no provider is available/reachable, semantic
+ *    search degrades to the keyword method so the app never fails to start or
+ *    answer. Embeddings/results are never fabricated.
  */
-
-const EMBED_MODEL = 'text-embedding-004';
-const DIM = 256;
 
 // Resolve the db lazily to avoid a circular import (db.ts imports this module
 // for initEmbeddingsTable; this module imports db.ts for chunk access).
 async function getDb() {
   const { db } = await import('./db');
   return db;
-}
-
-let aiClient: GoogleGenAI | null = null;
-function client(): GoogleGenAI | null {
-  if (!process.env.GEMINI_API_KEY) return null;
-  if (!aiClient) {
-    aiClient = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-  }
-  return aiClient;
 }
 
 function contentHash(s: string): string {
@@ -58,22 +55,14 @@ function cosine(a: number[], b: number[]): number {
   return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
 
-/** Embed a single string, returning a vector or null on failure/no key. */
-export async function embed(text: string): Promise<number[] | null> {
-  const ai = client();
-  if (!ai) return null;
-  const trimmed = text.slice(0, 8000);
-  try {
-    const res = await ai.models.embedContent({
-      model: EMBED_MODEL,
-      contents: trimmed,
-      config: { outputDimensionality: DIM }
-    });
-    const vec = res.embeddings?.[0]?.values;
-    return vec && vec.length ? vec : null;
-  } catch {
-    return null;
-  }
+/** Embed a single string via the resolved provider, returning the vector and
+ *  the model that produced it (or null when no provider is available/reachable).
+ *  The model is stored alongside the vector so retrieval can avoid cross-model
+ *  comparisons. Never throws. */
+export async function embed(text: string): Promise<{ vector: number[]; model: string } | null> {
+  if (!embeddingProviderAvailable()) return null;
+  const provider = resolveEmbeddingProvider();
+  return provider.embed(text);
 }
 
 export interface StoredEmbedding {
@@ -81,6 +70,9 @@ export interface StoredEmbedding {
   businessId: string;
   vector: number[];
   hash: string;
+  /** Model that produced `vector` (e.g. "gemini:text-embedding-004",
+   *  "ollama:nomic-embed-text"). Used to avoid cross-model cosine. */
+  model: string;
 }
 
 async function loadRow(r: any): Promise<StoredEmbedding | null> {
@@ -94,12 +86,20 @@ async function loadRow(r: any): Promise<StoredEmbedding | null> {
   } else {
     return null;
   }
-  return { chunkId: r.chunk_id, businessId: r.business_id, vector: vec, hash: r.hash };
+  return {
+    chunkId: r.chunk_id,
+    businessId: r.business_id,
+    vector: vec,
+    hash: r.hash,
+    // Pre-existing rows (created before the model column existed) default to
+    // the legacy Gemini model so they remain comparable to new Gemini vectors.
+    model: r.model || 'gemini:text-embedding-004'
+  };
 }
 
 async function allEmbeddings(): Promise<StoredEmbedding[]> {
   const db = await getDb();
-  const res = await db.client.query('SELECT chunk_id, business_id, vector, hash FROM knowledge_embeddings');
+  const res = await db.client.query('SELECT chunk_id, business_id, vector, hash, model FROM knowledge_embeddings');
   const out: StoredEmbedding[] = [];
   for (const r of res.rows) {
     const e = await loadRow(r);
@@ -108,22 +108,23 @@ async function allEmbeddings(): Promise<StoredEmbedding[]> {
   return out;
 }
 
-/** Index (or re-index) a chunk. Idempotent; only re-embeds when content changed. */
+/** Index (or re-index) a chunk. Idempotent; only re-embeds when content
+ *  changed. Records the embedding model so retrieval can match on it. */
 export async function indexChunk(chunk: KnowledgeChunk): Promise<void> {
   const db = await getDb();
   const hash = contentHash(chunk.title + '\n' + chunk.content);
-  const existingRes = await db.client.query('SELECT hash FROM knowledge_embeddings WHERE chunk_id = ?', [chunk.id]);
-  const existing = existingRes.rows[0] as { hash: string } | undefined;
+  const existingRes = await db.client.query('SELECT hash, model FROM knowledge_embeddings WHERE chunk_id = ?', [chunk.id]);
+  const existing = existingRes.rows[0] as { hash: string; model?: string } | undefined;
   if (existing && existing.hash === hash) return; // unchanged
 
-  const vec = await embed(`${chunk.title}\n${chunk.content}`);
-  if (!vec) return; // no key or failure — keyword fallback still works
+  const result = await embed(`${chunk.title}\n${chunk.content}`);
+  if (!result) return; // no provider / failure — keyword fallback still works
 
   await db.client.query(
-    `INSERT INTO knowledge_embeddings (chunk_id, business_id, vector, hash, updated_at)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(chunk_id) DO UPDATE SET vector=excluded.vector, hash=excluded.hash, updated_at=excluded.updated_at`,
-    [chunk.id, chunk.businessId, JSON.stringify(vec), hash, new Date().toISOString()]
+    `INSERT INTO knowledge_embeddings (chunk_id, business_id, vector, hash, model, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(chunk_id) DO UPDATE SET vector=excluded.vector, hash=excluded.hash, model=excluded.model, updated_at=excluded.updated_at`,
+    [chunk.id, chunk.businessId, JSON.stringify(result.vector), hash, result.model, new Date().toISOString()]
   );
 }
 
@@ -142,7 +143,9 @@ export interface RetrievalResult {
 /**
  * Semantic search for the top-K chunks relevant to `query`, scoped to the
  * tenant. Falls back to keyword matching when embeddings are unavailable
- * (no API key / nothing indexed yet).
+ * (no provider / nothing indexed yet) OR when the stored vectors were
+ * produced by a different model than the current query embedding (so a
+ * provider/model change never yields meaningless cross-model cosine scores).
  */
 export async function retrieveRelevant(
   businessId: string,
@@ -154,20 +157,29 @@ export async function retrieveRelevant(
   if (chunks.length === 0) return [];
 
   const stored = (await allEmbeddings()).filter(e => e.businessId === businessId);
-  // If we have embeddings for at least half the chunks AND an API key, do
-  // semantic search; otherwise degrade to keyword so partial indexes don't
-  // silently miss chunks.
-  const useSemantic = !!process.env.GEMINI_API_KEY && stored.length >= Math.ceil(chunks.length / 2);
+  // Only attempt semantic search when a provider is configured AND we have
+  // embeddings for at least half the chunks. Partial indexes would otherwise
+  // silently miss un-indexed chunks.
+  const useSemantic = embeddingProviderAvailable() && stored.length >= Math.ceil(chunks.length / 2);
 
   if (useSemantic) {
-    const qVec = await embed(query);
-    if (qVec) {
-      const scored = stored
-        .map(e => ({ chunk: chunks.find(c => c.id === e.chunkId), score: cosine(qVec, e.vector) }))
-        .filter((s): s is { chunk: KnowledgeChunk; score: number } => !!s.chunk)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, topK);
-      if (scored.length) return scored.map(s => ({ chunk: s.chunk, score: s.score, source: 'semantic' as const }));
+    const qResult = await embed(query);
+    if (qResult) {
+      // Only compare vectors produced by the SAME model as the query. Vectors
+      // from a previous provider/model are skipped (not silently scored).
+      const compatible = stored.filter(e => e.model === qResult.model);
+      if (compatible.length >= Math.ceil(chunks.length / 2)) {
+        const scored = compatible
+          .map(e => ({ chunk: chunks.find(c => c.id === e.chunkId), score: cosine(qResult.vector, e.vector) }))
+          .filter((s): s is { chunk: KnowledgeChunk; score: number } => !!s.chunk)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, topK);
+        if (scored.length) {
+          return scored.map(s => ({ chunk: s.chunk, score: s.score, source: 'semantic' as const }));
+        }
+      }
+      // Compatible vectors insufficient — fall through to keyword rather than
+      // returning a partial/skewed semantic result.
     }
   }
 
@@ -185,8 +197,10 @@ export async function retrieveRelevant(
 /** Create the embeddings table if it doesn't exist. Called by db.ts right
  *  after migrations run (avoids importing db back into this module). On
  *  PostgreSQL the migrations already create this table; the IF NOT EXISTS
- *  makes this idempotent for both drivers. */
-export async function initEmbeddingsTable(client: { execMany: (sql: string) => Promise<void>; dialect: 'sqlite' | 'postgres' }): Promise<void> {
+ *  makes this idempotent for both drivers. Also self-heals the `model` column
+ *  onto pre-existing tables (created before the provider abstraction) so
+ *  retrieval can match vectors by model without a separate migration. */
+export async function initEmbeddingsTable(client: { execMany: (sql: string) => Promise<void>; query: (sql: string, params?: any[]) => Promise<{ rows: any[] }>; dialect: 'sqlite' | 'postgres' }): Promise<void> {
   // The vector column is TEXT on SQLite (JSON string) and JSONB on PostgreSQL
   // (already declared in migrations/pg/001). This CREATE TABLE IF NOT EXISTS
   // is harmless when the table already exists.
@@ -196,9 +210,28 @@ export async function initEmbeddingsTable(client: { execMany: (sql: string) => P
        business_id TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
        vector       ${client.dialect === 'postgres' ? 'JSONB' : 'TEXT'} NOT NULL,
        hash        TEXT NOT NULL,
+       model       TEXT NOT NULL DEFAULT 'gemini:text-embedding-004',
        updated_at  TEXT NOT NULL
      )`
   );
   await client.execMany('CREATE INDEX IF NOT EXISTS idx_kb_embeddings_business ON knowledge_embeddings(business_id)');
+
+  // Self-heal: add the `model` column to tables created by older versions of
+  // this module (CREATE TABLE IF NOT EXISTS won't add a column to an existing
+  // table). Idempotent across restarts.
+  try {
+    if (client.dialect === 'postgres') {
+      await client.execMany(`ALTER TABLE knowledge_embeddings ADD COLUMN IF NOT EXISTS model TEXT NOT NULL DEFAULT 'gemini:text-embedding-004'`);
+    } else {
+      // SQLite has no ADD COLUMN IF NOT EXISTS; check the schema first.
+      const cols = await client.query(`PRAGMA table_info(knowledge_embeddings)`);
+      const hasModel = cols.rows.some((c: any) => c.name === 'model');
+      if (!hasModel) {
+        await client.execMany(`ALTER TABLE knowledge_embeddings ADD COLUMN model TEXT NOT NULL DEFAULT 'gemini:text-embedding-004'`);
+      }
+    }
+  } catch {
+    // Non-fatal: a concurrent add or unexpected state shouldn't break startup.
+  }
 }
 
