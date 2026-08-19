@@ -17,6 +17,11 @@ import {
 import { listJobs, getJob } from './factoryJobs';
 import { listDeliveries, getDelivery, acceptDelivery } from './deliveries';
 import { submitDesignToFactory } from './factorySubmitter';
+import {
+  runResearch,
+  getResearchReport,
+  listResearchForProspect
+} from './leadResearch';
 
 /**
  * Owner-gated orchestration API. EVERY route is requireAuth +
@@ -85,6 +90,35 @@ orchestrationRouter.patch('/prospects/:id', requireAuth, requireRole('PLATFORM_O
   } catch (e: any) {
     replyError(res, e);
   }
+}));
+
+// ---------------------------------------------------------------------------
+// Lead research (evidence/extraction layer — owner-gated; never a decision)
+// ---------------------------------------------------------------------------
+
+orchestrationRouter.post('/prospects/:id/research', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const report = await runResearch(String(req.params.id), {
+      idempotencyKey: req.body?.idempotencyKey,
+      inputText: req.body?.inputText,
+      inputSource: req.body?.inputSource
+    });
+    res.status(200).json(report);
+  } catch (e: any) {
+    replyError(res, e);
+  }
+}));
+
+orchestrationRouter.get('/prospects/:id/research', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  const prospect = await getProspect(String(req.params.id));
+  if (!prospect) return res.status(404).json({ error: 'Not found.' });
+  res.json(await listResearchForProspect(prospect.id));
+}));
+
+orchestrationRouter.get('/research/:id', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  const report = await getResearchReport(String(req.params.id));
+  if (!report) return res.status(404).json({ error: 'Not found.' });
+  res.json(report);
 }));
 
 // ---------------------------------------------------------------------------

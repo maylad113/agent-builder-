@@ -1,9 +1,10 @@
 /**
  * Orchestration table DDL (single source of truth) + self-heal init.
  *
- * The migration files (migrations/016_orchestration.sql for SQLite,
- * migrations/pg/017_orchestration.sql for PostgreSQL) embed the same
- * statements; this module's init function is the idempotent fallback the
+ * The migration files (migrations/016_orchestration.sql +
+ * 017_lead_research.sql for SQLite, migrations/pg/017_orchestration.sql +
+ * pg/018_lead_research.sql for PostgreSQL) embed the same statements; this
+ * module's init function is the idempotent fallback the
  * database bootstrap calls so fresh/existing databases of either dialect get
  * the tables even if migration numbering races (same pattern as
  * telemetry/evaluation/correction).
@@ -113,6 +114,26 @@ CREATE TABLE IF NOT EXISTS acceptances (
   CONSTRAINT acceptances_delivery_id UNIQUE (delivery_id)
 );
 CREATE INDEX IF NOT EXISTS idx_acceptances_business ON acceptances(business_id);
+
+CREATE TABLE IF NOT EXISTS lead_research_reports (
+  id                 TEXT PRIMARY KEY,
+  prospect_id        TEXT NOT NULL REFERENCES prospects(id),
+  status             TEXT NOT NULL,
+  input_source       TEXT,
+  input_text_excerpt TEXT,
+  report             TEXT,
+  llm_model          TEXT,
+  score              INTEGER,
+  score_band         TEXT,
+  score_reasons      TEXT,
+  error              TEXT,
+  idempotency_key    TEXT NOT NULL,
+  created_at         TEXT NOT NULL,
+  updated_at         TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_lead_research_idem ON lead_research_reports(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_lead_research_prospect ON lead_research_reports(prospect_id);
+CREATE INDEX IF NOT EXISTS idx_lead_research_status ON lead_research_reports(status);
 `;
 }
 

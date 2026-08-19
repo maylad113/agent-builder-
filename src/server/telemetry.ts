@@ -109,7 +109,10 @@ export async function recordOrchestrationEvent(params: {
     | 'FACTORY_JOB_STEP'
     | 'FACTORY_JOB_FAILED'
     | 'AGENT_DELIVERED'
-    | 'DELIVERY_ACCEPTED';
+    | 'DELIVERY_ACCEPTED'
+    | 'LEAD_RESEARCH_RUN'
+    | 'LEAD_RESEARCH_COMPLETED'
+    | 'LEAD_RESEARCH_FAILED';
   prospectId: string;
   businessId?: string;
   agentId?: string;
@@ -119,6 +122,7 @@ export async function recordOrchestrationEvent(params: {
     designId?: string;
     deliveryId?: string;
     acceptanceId?: string;
+    researchReportId?: string;
     step?: string;
   };
   summary?: string;

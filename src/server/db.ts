@@ -27,7 +27,8 @@ import {
   DesignProposal,
   FactoryJob,
   Delivery,
-  Acceptance
+  Acceptance,
+  LeadResearchReport
 } from '../types';
 import { hashPassword } from './passwords';
 import { initEmbeddingsTable } from './embeddings';
@@ -206,6 +207,11 @@ const TABLES: Record<string, TableConfig> = {
   acceptances: {
     table: 'acceptances',
     jsonColumns: ['metadata'],
+    booleanColumns: []
+  },
+  leadResearchReports: {
+    table: 'lead_research_reports',
+    jsonColumns: ['report', 'scoreReasons'],
     booleanColumns: []
   }
 };
@@ -553,6 +559,7 @@ export class AppDatabase {
   public factoryJobs!: Collection<FactoryJob>;
   public deliveries!: Collection<Delivery>;
   public acceptances!: Collection<Acceptance>;
+  public leadResearchReports!: Collection<LeadResearchReport>;
 
   constructor(opts: AppDatabaseOptions = {}) {
     // Select the driver. DATABASE_URL (postgres://...) -> PostgreSQL production
@@ -612,6 +619,7 @@ export class AppDatabase {
     this.factoryJobs = new Collection<FactoryJob>(this.client, TABLES.factoryJobs);
     this.deliveries = new Collection<Delivery>(this.client, TABLES.deliveries);
     this.acceptances = new Collection<Acceptance>(this.client, TABLES.acceptances);
+    this.leadResearchReports = new Collection<LeadResearchReport>(this.client, TABLES.leadResearchReports);
   }
 
   /** Run migrations, initialize the embeddings table, and seed demo data.

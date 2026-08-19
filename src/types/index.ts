@@ -581,7 +581,11 @@ export type TelemetryEventType =
   | 'FACTORY_JOB_STEP'
   | 'FACTORY_JOB_FAILED'
   | 'AGENT_DELIVERED'
-  | 'DELIVERY_ACCEPTED';
+  | 'DELIVERY_ACCEPTED'
+  // Lead research (evidence/extraction layer — never carries raw LLM prompts).
+  | 'LEAD_RESEARCH_RUN'
+  | 'LEAD_RESEARCH_COMPLETED'
+  | 'LEAD_RESEARCH_FAILED';
 
 export interface TelemetryEvent {
   id: string;
@@ -753,4 +757,59 @@ export interface Acceptance {
   acceptedAt: string;
   metadata?: Record<string, any>;
   createdAt: string;
+}
+
+// ============================================================================
+// Lead research reports (Phase C / Task 2)
+// ============================================================================
+
+export type LeadResearchStatus = 'COMPLETED' | 'FAILED';
+export type LeadResearchInputSource = 'manual' | 'business_provided';
+export type Verification = 'VERIFIED' | 'UNVERIFIED' | 'UNKNOWN';
+export type AppointmentFit = 'STRONG' | 'PARTIAL' | 'NONE' | 'UNKNOWN';
+
+export interface ResearchSignal {
+  key: string;
+  verification: Verification;
+  /** Deterministic provenance: the excerpt quoted from the source text, when
+   *  any. Only a verbatim substring of the input makes a signal VERIFIED. */
+  sourceExcerpt?: string;
+}
+
+export interface ResearchChannelSignal {
+  channel: string;
+  reachable: boolean;
+  verification: Verification;
+  sourceExcerpt?: string;
+}
+
+/** Structured research document (validated schema — never trust extra keys). */
+export interface ResearchReportDocument {
+  appointmentFit: AppointmentFit;
+  painSignals: ResearchSignal[];
+  digitalGaps: ResearchSignal[];
+  channels: ResearchChannelSignal[];
+  evidence: { url?: string; snippet?: string }[];
+  disqualifiers: ResearchSignal[];
+  caveats: string[];
+  summary?: string;
+}
+
+export interface LeadResearchReport {
+  id: string;
+  prospectId: string;
+  status: LeadResearchStatus;
+  inputSource: LeadResearchInputSource;
+  inputTextExcerpt: string;
+  report: ResearchReportDocument;
+  /** Model that produced the extraction (or 'fallback' when unavailable). */
+  llmModel: string;
+  /** Deterministic score snapshot (scorer remains the authority). */
+  score: number;
+  scoreBand: string;
+  scoreReasons: string[];
+  error?: string;
+  idempotencyKey: string;
+  createdAt: string;
+  updatedAt: string;
 }

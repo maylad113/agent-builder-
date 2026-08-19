@@ -206,14 +206,32 @@ pgDescribe('PostgreSQL transaction integrity (real PG)', () => {
   // Orchestration (Sales & Delivery) PG parity
   // -------------------------------------------------------------------------
 
-  it('orchestration tables exist after PG init (prospects/design/factory/deliveries/acceptances)', async () => {
+  it('orchestration tables exist after PG init (prospects/design/factory/deliveries/acceptances/lead_research_reports)', async () => {
     const res = await state.db.client.query(
-      `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('prospects','design_proposals','factory_jobs','deliveries','acceptances')`
+      `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('prospects','design_proposals','factory_jobs','deliveries','acceptances','lead_research_reports')`
     );
     const names = res.rows.map((r: any) => r.table_name);
-    for (const t of ['prospects', 'design_proposals', 'factory_jobs', 'deliveries', 'acceptances']) {
+    for (const t of ['prospects', 'design_proposals', 'factory_jobs', 'deliveries', 'acceptances', 'lead_research_reports']) {
       expect(names).toContain(t);
     }
+  });
+
+  it('lead research run persists on PG with JSON report round-trip + idempotency', async () => {
+    const { runResearch, listResearchForProspect } = await import('../src/server/orchestration/leadResearch');
+    const now = new Date().toISOString();
+    const prospect: any = { id: 'pro-pgtx-research', businessName: 'PG Research', status: 'NEW', createdAt: now, updatedAt: now };
+    await state.db.prospects.push(prospect);
+    // Fallback extraction (no LLM key/provider) — deterministic PG round-trip.
+    const a = await runResearch('pro-pgtx-research', { idempotencyKey: 'pgtx-research-1', inputText: 'Barbershop without online booking.' });
+    const b = await runResearch('pro-pgtx-research', { idempotencyKey: 'pgtx-research-1', inputText: 'Barbershop without online booking.' });
+    expect(b.id).toBe(a.id);
+    const all = await listResearchForProspect('pro-pgtx-research');
+    expect(all.length).toBe(1);
+    expect(all[0].status).toBe('COMPLETED');
+    expect(all[0].report.appointmentFit).toBe('UNKNOWN');
+    // JSON columns round-trip: report object + scoreReasons array persist via PG.
+    expect(typeof all[0].report).toBe('object');
+    expect(Array.isArray(all[0].scoreReasons)).toBe(true);
   });
 
   it('factory job idempotencyKey is UNIQUE on PG; markDeadLetter round-trips boolean', async () => {
