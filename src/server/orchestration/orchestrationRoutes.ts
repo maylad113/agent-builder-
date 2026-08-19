@@ -22,6 +22,13 @@ import {
   getResearchReport,
   listResearchForProspect
 } from './leadResearch';
+import {
+  runDiscovery,
+  listDiscoveryRuns,
+  getDiscoveryRun,
+  listResultsForRun
+} from './discoveryRuns';
+import { rateLimit, RATE_LIMITS } from '../security';
 
 /**
  * Owner-gated orchestration API. EVERY route is requireAuth +
@@ -90,6 +97,37 @@ orchestrationRouter.patch('/prospects/:id', requireAuth, requireRole('PLATFORM_O
   } catch (e: any) {
     replyError(res, e);
   }
+}));
+
+// ---------------------------------------------------------------------------
+// Lead discovery (candidate intake — owner-gated; evidence only; discovery
+// NEVER triggers research/scoring/factory/outreach)
+// ---------------------------------------------------------------------------
+
+orchestrationRouter.post('/discovery-runs', rateLimit({ ...RATE_LIMITS.generate, prefix: 'discovery' }), requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const run = await runDiscovery({
+      idempotencyKey: req.body?.idempotencyKey,
+      query: req.body?.query,
+      location: req.body?.location,
+      candidates: req.body?.candidates,
+      provider: req.body?.provider
+    });
+    res.status(201).json({ run, results: await listResultsForRun(run.id) });
+  } catch (e: any) {
+    replyError(res, e);
+  }
+}));
+
+orchestrationRouter.get('/discovery-runs', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  const limit = Number(req.query.limit) || 50;
+  res.json(await listDiscoveryRuns(limit));
+}));
+
+orchestrationRouter.get('/discovery-runs/:id', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  const run = await getDiscoveryRun(String(req.params.id));
+  if (!run) return res.status(404).json({ error: 'Not found.' });
+  res.json({ run, results: await listResultsForRun(run.id) });
 }));
 
 // ---------------------------------------------------------------------------

@@ -206,14 +206,44 @@ pgDescribe('PostgreSQL transaction integrity (real PG)', () => {
   // Orchestration (Sales & Delivery) PG parity
   // -------------------------------------------------------------------------
 
-  it('orchestration tables exist after PG init (prospects/design/factory/deliveries/acceptances/lead_research_reports)', async () => {
+  it('orchestration tables exist after PG init (prospects/design/factory/deliveries/acceptances/lead_research_reports/discovery)', async () => {
     const res = await state.db.client.query(
-      `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('prospects','design_proposals','factory_jobs','deliveries','acceptances','lead_research_reports')`
+      `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('prospects','design_proposals','factory_jobs','deliveries','acceptances','lead_research_reports','discovery_runs','discovery_results')`
     );
     const names = res.rows.map((r: any) => r.table_name);
-    for (const t of ['prospects', 'design_proposals', 'factory_jobs', 'deliveries', 'acceptances', 'lead_research_reports']) {
+    for (const t of ['prospects', 'design_proposals', 'factory_jobs', 'deliveries', 'acceptances', 'lead_research_reports', 'discovery_runs', 'discovery_results']) {
       expect(names).toContain(t);
     }
+    const cols = await state.db.client.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_name = 'prospects' AND column_name = 'discovery_result_id'`
+    );
+    expect(cols.rows.length).toBe(1);
+  });
+
+  it('discovery run persists on PG transactionally with JSON round-trip + idempotency', async () => {
+    const { runDiscovery, listResultsForRun, findRunByIdempotencyKey } = await import('../src/server/orchestration/discoveryRuns');
+    const a = await runDiscovery({
+      idempotencyKey: 'pgtx-discovery-1',
+      query: 'pg parity',
+      candidates: [
+        { businessName: 'PG Cut', instagramHandle: '@pgcut' },
+        { businessName: 'PG Cut Two', instagramHandle: 'pgcut' } // duplicate by handle
+      ]
+    });
+    expect(a.status).toBe('COMPLETED');
+    expect(a.resultCount).toBe(1);
+    expect(a.duplicateCount).toBe(1);
+    // UNIQUE idempotency backstop on PG.
+    const b = await runDiscovery({ idempotencyKey: 'pgtx-discovery-1', candidates: [{ businessName: 'Other', instagramHandle: 'other' }] });
+    expect(b.id).toBe(a.id);
+    expect(await findRunByIdempotencyKey('pgtx-discovery-1')).toBeTruthy();
+    const results = await listResultsForRun(a.id);
+    expect(results.length).toBe(1);
+    // JSON columns round-trip via PG TEXT: params + normalized objects persist.
+    expect(typeof results[0].normalized).toBe('object');
+    expect(results[0].normalized.dedupeKey).toBe('ig:pgcut');
+    const run = await state.db.discoveryRuns.find((r: any) => r.id === a.id);
+    expect(run.params.query).toBe('pg parity');
   });
 
   it('lead research run persists on PG with JSON report round-trip + idempotency', async () => {

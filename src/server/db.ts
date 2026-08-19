@@ -28,7 +28,9 @@ import {
   FactoryJob,
   Delivery,
   Acceptance,
-  LeadResearchReport
+  LeadResearchReport,
+  DiscoveryRun,
+  DiscoveryResult
 } from '../types';
 import { hashPassword } from './passwords';
 import { initEmbeddingsTable } from './embeddings';
@@ -212,6 +214,16 @@ const TABLES: Record<string, TableConfig> = {
   leadResearchReports: {
     table: 'lead_research_reports',
     jsonColumns: ['report', 'scoreReasons'],
+    booleanColumns: []
+  },
+  discoveryRuns: {
+    table: 'discovery_runs',
+    jsonColumns: ['params'],
+    booleanColumns: []
+  },
+  discoveryResults: {
+    table: 'discovery_results',
+    jsonColumns: ['raw', 'normalized'],
     booleanColumns: []
   }
 };
@@ -560,6 +572,8 @@ export class AppDatabase {
   public deliveries!: Collection<Delivery>;
   public acceptances!: Collection<Acceptance>;
   public leadResearchReports!: Collection<LeadResearchReport>;
+  public discoveryRuns!: Collection<DiscoveryRun>;
+  public discoveryResults!: Collection<DiscoveryResult>;
 
   constructor(opts: AppDatabaseOptions = {}) {
     // Select the driver. DATABASE_URL (postgres://...) -> PostgreSQL production
@@ -620,6 +634,8 @@ export class AppDatabase {
     this.deliveries = new Collection<Delivery>(this.client, TABLES.deliveries);
     this.acceptances = new Collection<Acceptance>(this.client, TABLES.acceptances);
     this.leadResearchReports = new Collection<LeadResearchReport>(this.client, TABLES.leadResearchReports);
+    this.discoveryRuns = new Collection<DiscoveryRun>(this.client, TABLES.discoveryRuns);
+    this.discoveryResults = new Collection<DiscoveryResult>(this.client, TABLES.discoveryResults);
   }
 
   /** Run migrations, initialize the embeddings table, and seed demo data.

@@ -585,7 +585,11 @@ export type TelemetryEventType =
   // Lead research (evidence/extraction layer — never carries raw LLM prompts).
   | 'LEAD_RESEARCH_RUN'
   | 'LEAD_RESEARCH_COMPLETED'
-  | 'LEAD_RESEARCH_FAILED';
+  | 'LEAD_RESEARCH_FAILED'
+// Lead discovery (candidate intake — never triggers research/scoring/outreach).
+  | 'DISCOVERY_RUN'
+  | 'DISCOVERY_COMPLETED'
+  | 'DISCOVERY_FAILED';
 
 export interface TelemetryEvent {
   id: string;
@@ -645,6 +649,8 @@ export interface Prospect {
   location?: string;
   notes?: string;
   status: ProspectStatus;
+  /** One-way provenance link to the discovery result that produced this prospect (set at accept time). */
+  discoveryResultId?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -812,4 +818,66 @@ export interface LeadResearchReport {
   idempotencyKey: string;
   createdAt: string;
   updatedAt: string;
+}
+
+// ---------------------------------------------------------------------------
+// Lead discovery (candidate intake layer — platform-owner scope, pre-tenant)
+// ---------------------------------------------------------------------------
+
+/** Manual candidate input. Every field is untrusted — data, never instructions. */
+export interface DiscoveryCandidateInput {
+  businessName: string;
+  location?: string;
+  phone?: string;
+  website?: string;
+  instagramHandle?: string;
+  notes?: string;
+  sourceUrl?: string;
+}
+
+/** Normalized candidate as persisted on a discovery result. */
+export interface NormalizedDiscoveryCandidate {
+  businessName: string;
+  location?: string;
+  phone?: string;
+  website?: string;
+  instagramHandle?: string;
+  notes?: string;
+  sourceUrl?: string;
+  /** Deterministic in-run identity key (ig: / dom: / tel: / nl: prefixes) or absent when unsafe. */
+  dedupeKey?: string;
+}
+
+export type DiscoveryRunStatus = 'COMPLETED' | 'FAILED';
+
+export interface DiscoveryRun {
+  id: string;
+  /** Provider registry id (e.g. 'manual_list'). */
+  provider: string;
+  params?: { query?: string; location?: string };
+  status: DiscoveryRunStatus;
+  resultCount: number;
+  duplicateCount: number;
+  invalidCount: number;
+  error?: string;
+  idempotencyKey: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DiscoveryResult {
+  id: string;
+  runId: string;
+  /** Set only when a human later accepts the candidate into a prospect. */
+  prospectId?: string;
+  sourceProvider: string;
+  sourceUrl?: string;
+  sourceType: 'manual';
+  /** Bounded copy of the untrusted input candidate (never executed). */
+  raw?: Record<string, unknown>;
+  normalized: NormalizedDiscoveryCandidate;
+  /** Discovery can never produce VERIFIED facts — research owns verification. */
+  verification: 'UNVERIFIED';
+  dismissedAt?: string;
+  createdAt: string;
 }

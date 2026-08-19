@@ -112,8 +112,12 @@ export async function recordOrchestrationEvent(params: {
     | 'DELIVERY_ACCEPTED'
     | 'LEAD_RESEARCH_RUN'
     | 'LEAD_RESEARCH_COMPLETED'
-    | 'LEAD_RESEARCH_FAILED';
-  prospectId: string;
+    | 'LEAD_RESEARCH_FAILED'
+    | 'DISCOVERY_RUN'
+    | 'DISCOVERY_COMPLETED'
+    | 'DISCOVERY_FAILED';
+  /** Absent for pre-prospect discovery events. */
+  prospectId?: string;
   businessId?: string;
   agentId?: string;
   /** Ids of related orchestration entities (never PII). */
@@ -123,6 +127,7 @@ export async function recordOrchestrationEvent(params: {
     deliveryId?: string;
     acceptanceId?: string;
     researchReportId?: string;
+    discoveryRunId?: string;
     step?: string;
   };
   summary?: string;

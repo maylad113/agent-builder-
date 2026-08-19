@@ -1,9 +1,10 @@
 /**
  * Orchestration table DDL (single source of truth) + self-heal init.
  *
- * The migration files (migrations/016_orchestration.sql +
- * 017_lead_research.sql for SQLite, migrations/pg/017_orchestration.sql +
- * pg/018_lead_research.sql for PostgreSQL) embed the same statements; this
+ * The migration files (migrations/016_orchestration.sql,
+ * 017_lead_research.sql, 018_discovery.sql for SQLite;
+ * migrations/pg/017_orchestration.sql, pg/018_lead_research.sql,
+ * pg/019_discovery.sql for PostgreSQL) embed the same statements; this
  * module's init function is the idempotent fallback the
  * database bootstrap calls so fresh/existing databases of either dialect get
  * the tables even if migration numbering races (same pattern as
@@ -41,6 +42,7 @@ CREATE TABLE IF NOT EXISTS prospects (
   location          TEXT,
   notes             TEXT,
   status            TEXT NOT NULL,
+  discovery_result_id TEXT,
   created_at        TEXT NOT NULL,
   updated_at        TEXT NOT NULL
 );
@@ -134,10 +136,57 @@ CREATE TABLE IF NOT EXISTS lead_research_reports (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_lead_research_idem ON lead_research_reports(idempotency_key);
 CREATE INDEX IF NOT EXISTS idx_lead_research_prospect ON lead_research_reports(prospect_id);
 CREATE INDEX IF NOT EXISTS idx_lead_research_status ON lead_research_reports(status);
+
+CREATE TABLE IF NOT EXISTS discovery_runs (
+  id               TEXT PRIMARY KEY,
+  provider         TEXT NOT NULL,
+  params           TEXT,
+  status           TEXT NOT NULL,
+  result_count     INTEGER NOT NULL DEFAULT 0,
+  duplicate_count  INTEGER NOT NULL DEFAULT 0,
+  invalid_count    INTEGER NOT NULL DEFAULT 0,
+  error            TEXT,
+  idempotency_key  TEXT NOT NULL,
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_discovery_runs_idem ON discovery_runs(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_discovery_runs_status ON discovery_runs(status);
+
+CREATE TABLE IF NOT EXISTS discovery_results (
+  id              TEXT PRIMARY KEY,
+  run_id          TEXT NOT NULL REFERENCES discovery_runs(id),
+  prospect_id     TEXT REFERENCES prospects(id),
+  source_provider TEXT NOT NULL,
+  source_url      TEXT,
+  source_type     TEXT NOT NULL,
+  raw             TEXT,
+  normalized      TEXT NOT NULL,
+  verification    TEXT NOT NULL DEFAULT 'UNVERIFIED',
+  dismissed_at    TEXT,
+  created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_discovery_results_run ON discovery_results(run_id);
+CREATE INDEX IF NOT EXISTS idx_discovery_results_prospect ON discovery_results(prospect_id);
 `;
 }
 
 /** Idempotent bootstrap for orchestration tables (called from db.init). */
 export async function initOrchestrationTables(client: InitClient): Promise<void> {
   await client.execMany(ddl(client.dialect));
+  // Self-heal for pre-018 databases whose prospects table lacks the discovery
+  // provenance column (migrations normally add it; this covers DBs that were
+  // created before the migration existed).
+  if (client.dialect === 'postgres') {
+    await client.execMany(
+      'ALTER TABLE prospects ADD COLUMN IF NOT EXISTS discovery_result_id TEXT REFERENCES discovery_results(id)'
+    );
+  } else {
+    const cols = await client.query("SELECT name FROM pragma_table_info('prospects')");
+    if (!cols.rows.some((c: any) => c.name === 'discovery_result_id')) {
+      await client.execMany(
+        'ALTER TABLE prospects ADD COLUMN discovery_result_id TEXT REFERENCES discovery_results(id)'
+      );
+    }
+  }
 }
