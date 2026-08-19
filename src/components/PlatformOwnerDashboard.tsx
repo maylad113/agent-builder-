@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Business, Agent, AgentTemplate, AuditLog } from '../types';
+import { OrchestrationView } from './OrchestrationView';
 import { 
   Building2, 
   Bot, 
@@ -47,7 +48,7 @@ export const PlatformOwnerDashboard: React.FC<PlatformOwnerDashboardProps> = ({
   const [filterType, setFilterType] = useState<string>('all');
   const [duplicatingBizId, setDuplicatingBizId] = useState<string | null>(null);
   const [duplicateNameInput, setDuplicateNameInput] = useState('');
-  const [activeTab, setActiveTab] = useState<'businesses' | 'templates' | 'analytics' | 'logs'>('businesses');
+  const [activeTab, setActiveTab] = useState<'businesses' | 'templates' | 'analytics' | 'logs' | 'orchestration'>('businesses');
 
   const filteredBusinesses = businesses.filter(b => {
     const matchesSearch = b.name.toLowerCase().includes(searchQuery.toLowerCase()) || 
@@ -183,6 +184,16 @@ export const PlatformOwnerDashboard: React.FC<PlatformOwnerDashboardProps> = ({
             }`}
           >
             System Audit Logs ({auditLogs.length})
+          </button>
+          <button
+            onClick={() => setActiveTab('orchestration')}
+            className={`pb-3 border-b-2 transition-colors ${
+              activeTab === 'orchestration'
+                ? 'border-blue-600 text-blue-600 font-semibold'
+                : 'border-transparent text-slate-500 hover:text-slate-800'
+            }`}
+          >
+            Orchestration
           </button>
         </div>
       </div>
@@ -382,6 +393,9 @@ export const PlatformOwnerDashboard: React.FC<PlatformOwnerDashboardProps> = ({
           </div>
         </div>
       )}
+
+      {/* Tab: Orchestration (Sales & Delivery pipeline) */}
+      {activeTab === 'orchestration' && <OrchestrationView />}
 
     </div>
   );

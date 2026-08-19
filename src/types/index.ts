@@ -571,7 +571,17 @@ export type TelemetryEventType =
   | 'HUMAN_HANDOFF'
   | 'EVALUATION_RUN'
   | 'CORRECTION_ATTEMPT'
-  | 'VERSION_PUBLISHED';
+  | 'VERSION_PUBLISHED'
+  // Orchestration lifecycle (recorded server-side only; same safe-summary
+  // discipline — never secrets/PII/tool-args).
+  | 'PROSPECT_CREATED'
+  | 'DESIGN_CREATED'
+  | 'DESIGN_APPROVED'
+  | 'FACTORY_JOB_STARTED'
+  | 'FACTORY_JOB_STEP'
+  | 'FACTORY_JOB_FAILED'
+  | 'AGENT_DELIVERED'
+  | 'DELIVERY_ACCEPTED';
 
 export interface TelemetryEvent {
   id: string;
@@ -605,4 +615,142 @@ export interface TelemetryEvent {
   summary?: string;
   /** Structured extra metadata (counts, categories, etc.). JSON-serialized. */
   metadata?: Record<string, any>;
+}
+
+// ---------------------------------------------------------------------------
+// Sales & Delivery Orchestrator (Phase: orchestration MVP core)
+//
+// Deterministic orchestration on top of the Agent Factory. Prospects are
+// platform-owned until conversion (prospect.businessId links the real tenant).
+// All state machines are explicit; LLMs may produce artifacts but never
+// perform transitions.
+// ---------------------------------------------------------------------------
+
+export type ProspectStatus = 'NEW' | 'DESIGN_PROPOSED' | 'APPROVED' | 'IN_FACTORY' | 'CONVERTED' | 'REJECTED';
+
+export interface Prospect {
+  id: string;
+  /** Linked tenant once the prospect converts to a real factory business. */
+  businessId?: string;
+  businessName: string;
+  contactName?: string;
+  contactEmail?: string;
+  contactPhone?: string;
+  website?: string;
+  instagramHandle?: string;
+  location?: string;
+  notes?: string;
+  status: ProspectStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type DesignStatus = 'DRAFT' | 'APPROVED' | 'SUBMITTED' | 'REJECTED';
+
+/**
+ * The structured artifact a (future) Designer agent produces and a human
+ * approves. `configuration` is the factory input: business facts, agent spec,
+ * evaluation scenarios, trusted knowledge sources, and knowledge chunks used
+ * to satisfy the activation readiness gate.
+ */
+export interface DesignConfiguration {
+  business: {
+    name: string;
+    type: string;
+    description?: string;
+    location?: string;
+    timezone?: string;
+    language?: string;
+    currency?: string;
+    hours?: BusinessHours[];
+    services?: ServiceItem[];
+    faqs?: FAQItem[];
+    policies?: Business['policies'];
+    communicationStyle?: string;
+    allowedWidgetOrigins?: string[];
+  };
+  agent: {
+    name: string;
+    description?: string;
+    systemPrompt: string;
+    structuredConfig: StructuredAgentConfig;
+    llmProvider?: Agent['llmProvider'];
+    model?: string;
+  };
+  scenarios: EvalScenario[];
+  trustedKnowledgeSources?: TrustedKnowledgeSource[];
+  /** Optional knowledge chunks created for the tenant so the readiness gate's
+   *  "Knowledge base" check can pass. */
+  knowledge?: { title: string; type?: KnowledgeChunk['type']; content: string; tags?: string[] }[];
+}
+
+export interface DesignProposal {
+  id: string;
+  prospectId: string;
+  title: string;
+  problemStatement: string;
+  proposedSolution: string;
+  agentType: string;
+  capabilities: string[];
+  channels: string[];
+  integrations: string[];
+  configuration?: DesignConfiguration;
+  status: DesignStatus;
+  approvedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type FactoryJobStatus =
+  | 'PENDING'
+  | 'SUBMITTING'
+  | 'EVALUATING'
+  | 'CORRECTING'
+  | 'PUBLISHING'
+  | 'ACTIVATING'
+  | 'COMPLETED'
+  | 'FAILED'
+  | 'DEAD_LETTERED';
+
+export interface FactoryJob {
+  id: string;
+  prospectId: string;
+  designProposalId: string;
+  businessId?: string;
+  agentId?: string;
+  status: FactoryJobStatus;
+  currentStep: FactoryJobStatus;
+  idempotencyKey: string;
+  attemptCount: number;
+  lastError?: string;
+  deadLettered: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type DeliveryStatus = 'PENDING' | 'DELIVERED' | 'ACCEPTED';
+
+export interface Delivery {
+  id: string;
+  prospectId: string;
+  businessId: string;
+  agentId: string;
+  status: DeliveryStatus;
+  deliveryMethod: string;
+  deliveryPayload?: Record<string, any>;
+  deliveredAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface Acceptance {
+  id: string;
+  /** UNIQUE — one acceptance per delivery. */
+  deliveryId: string;
+  businessId: string;
+  acceptedBy: string;
+  acceptanceMethod?: string;
+  acceptedAt: string;
+  metadata?: Record<string, any>;
+  createdAt: string;
 }

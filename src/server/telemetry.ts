@@ -93,6 +93,51 @@ async function record(event: Omit<TelemetryEvent, 'id' | 'timestamp'> & Partial<
   }
 }
 
+/**
+ * Orchestration lifecycle recorder. Orchestration events are platform-level:
+ * before a prospect converts they have no tenant, so they are scoped to the
+ * sentinel business id 'platform' (`telemetry_events.business_id` is NOT NULL
+ * and has no FK — it is a scope tag, not a constraint). Once a prospect has
+ * converted, pass its real businessId. Never throws; safe summaries only.
+ */
+export async function recordOrchestrationEvent(params: {
+  eventType:
+    | 'PROSPECT_CREATED'
+    | 'DESIGN_CREATED'
+    | 'DESIGN_APPROVED'
+    | 'FACTORY_JOB_STARTED'
+    | 'FACTORY_JOB_STEP'
+    | 'FACTORY_JOB_FAILED'
+    | 'AGENT_DELIVERED'
+    | 'DELIVERY_ACCEPTED';
+  prospectId: string;
+  businessId?: string;
+  agentId?: string;
+  /** Ids of related orchestration entities (never PII). */
+  metadata?: {
+    jobId?: string;
+    designId?: string;
+    deliveryId?: string;
+    acceptanceId?: string;
+    step?: string;
+  };
+  summary?: string;
+  timestamp?: string;
+}): Promise<void> {
+  await record({
+    businessId: params.businessId || 'platform',
+    eventType: params.eventType,
+    agentId: params.agentId,
+    isPublished: false,
+    summary: safeSummary(params.summary),
+    metadata: {
+      prospectId: params.prospectId,
+      ...(params.metadata || {})
+    },
+    timestamp: params.timestamp
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Domain-specific recorders (called from the runtime/eval/correction/publish
 // seams). Each is async but fire-and-forget-safe; callers may await or not.

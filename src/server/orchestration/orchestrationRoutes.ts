@@ -1,0 +1,204 @@
+import { Router, Request, Response } from 'express';
+import { requireAuth, requireRole, asyncHandler } from '../auth';
+import { safeError } from '../logSanitizer';
+import {
+  createProspect,
+  getProspect,
+  listProspects,
+  updateProspect
+} from './prospects';
+import {
+  createDesign,
+  getDesign,
+  listDesignsForProspect,
+  approveDesign,
+  validateDesignConfiguration
+} from './design';
+import { listJobs, getJob } from './factoryJobs';
+import { listDeliveries, getDelivery, acceptDelivery } from './deliveries';
+import { submitDesignToFactory } from './factorySubmitter';
+
+/**
+ * Owner-gated orchestration API. EVERY route is requireAuth +
+ * requireRole('PLATFORM_OWNER'). No route ever returns err.stack, SQL,
+ * credentials, or raw internal messages — module errors carry client-safe
+ * text; unexpected errors are safeError'd server-side and answered 500 with
+ * a generic message.
+ */
+
+export const orchestrationRouter = Router();
+
+/** Map module errors: 'not found' → 404, validation → 400, other → 500. */
+function replyError(res: Response, e: any): null {
+  if (e && typeof e.message === 'string' && e.message.toLowerCase().includes('not found')) {
+    res.status(404).json({ error: 'Not found.' });
+    return null;
+  }
+  if (e && typeof e.message === 'string' && e.message) {
+    // Validation-style errors authored by the module (safe text, no internals).
+    res.status(400).json({ error: e.message });
+    return null;
+  }
+  safeError('[orchestration] unexpected error:', e);
+  res.status(500).json({ error: 'Internal error.' });
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Prospects
+// ---------------------------------------------------------------------------
+
+orchestrationRouter.post('/prospects', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const prospect = await createProspect({
+      businessName: req.body?.businessName,
+      contactName: req.body?.contactName,
+      contactEmail: req.body?.contactEmail,
+      contactPhone: req.body?.contactPhone,
+      website: req.body?.website,
+      instagramHandle: req.body?.instagramHandle,
+      location: req.body?.location,
+      notes: req.body?.notes
+    });
+    res.status(201).json(prospect);
+  } catch (e: any) {
+    replyError(res, e);
+  }
+}));
+
+orchestrationRouter.get('/prospects', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (_req: Request, res: Response) => {
+  res.json(await listProspects());
+}));
+
+orchestrationRouter.get('/prospects/:id', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  const prospect = await getProspect(String(req.params.id));
+  if (!prospect) return res.status(404).json({ error: 'Not found.' });
+  res.json(prospect);
+}));
+
+orchestrationRouter.patch('/prospects/:id', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const prospect = await getProspect(String(req.params.id));
+    if (!prospect) return res.status(404).json({ error: 'Not found.' });
+    const updated = await updateProspect(prospect, req.body || {});
+    res.json(updated);
+  } catch (e: any) {
+    replyError(res, e);
+  }
+}));
+
+// ---------------------------------------------------------------------------
+// Designs
+// ---------------------------------------------------------------------------
+
+orchestrationRouter.post('/prospects/:id/designs', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const prospect = await getProspect(String(req.params.id));
+    if (!prospect) return res.status(404).json({ error: 'Not found.' });
+    const design = await createDesign(prospect, {
+      title: req.body?.title,
+      problemStatement: req.body?.problemStatement,
+      proposedSolution: req.body?.proposedSolution,
+      agentType: req.body?.agentType,
+      capabilities: req.body?.capabilities,
+      channels: req.body?.channels,
+      integrations: req.body?.integrations,
+      configuration: req.body?.configuration
+    });
+    res.status(201).json(design);
+  } catch (e: any) {
+    replyError(res, e);
+  }
+}));
+
+orchestrationRouter.get('/prospects/:id/designs', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  const prospect = await getProspect(String(req.params.id));
+  if (!prospect) return res.status(404).json({ error: 'Not found.' });
+  res.json(await listDesignsForProspect(prospect.id));
+}));
+
+orchestrationRouter.get('/designs/:id', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  const design = await getDesign(String(req.params.id));
+  if (!design) return res.status(404).json({ error: 'Not found.' });
+  res.json(design);
+}));
+
+/** HUMAN approval only. Guarded: validation problem summary is client-safe. */
+orchestrationRouter.post('/designs/:id/approve', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const design = await getDesign(String(req.params.id));
+    if (!design) return res.status(404).json({ error: 'Not found.' });
+    const prospect = await getProspect(design.prospectId);
+    if (!prospect) return res.status(404).json({ error: 'Not found.' });
+    // Approval is an explicit human action; configuration validity is checked
+    // up-front so an invalid design cannot be silently approved.
+    if (design.configuration) {
+      const problems = validateDesignConfiguration(design.configuration);
+      if (problems.length > 0) {
+        return res.status(400).json({ error: 'Design configuration is invalid: ' + problems.join(' ') });
+      }
+    }
+    const updated = await approveDesign(prospect, design);
+    res.json(updated);
+  } catch (e: any) {
+    replyError(res, e);
+  }
+}));
+
+/** Submit to the factory. Idempotent on body.idempotencyKey. */
+orchestrationRouter.post('/designs/:id/submit', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const idempotencyKey = req.body?.idempotencyKey;
+    if (!idempotencyKey || typeof idempotencyKey !== 'string' || idempotencyKey.length > 200) {
+      return res.status(400).json({ error: 'idempotencyKey is required (string <= 200 chars).' });
+    }
+    const job = await submitDesignToFactory(String(req.params.id), idempotencyKey);
+    res.status(200).json(job);
+  } catch (e: any) {
+    replyError(res, e);
+  }
+}));
+
+// ---------------------------------------------------------------------------
+// Factory jobs
+// ---------------------------------------------------------------------------
+
+orchestrationRouter.get('/factory-jobs', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (_req: Request, res: Response) => {
+  res.json(await listJobs());
+}));
+
+orchestrationRouter.get('/factory-jobs/:id', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  const job = await getJob(String(req.params.id));
+  if (!job) return res.status(404).json({ error: 'Not found.' });
+  res.json(job);
+}));
+
+// ---------------------------------------------------------------------------
+// Deliveries + acceptance
+// ---------------------------------------------------------------------------
+
+orchestrationRouter.get('/deliveries', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (_req: Request, res: Response) => {
+  res.json(await listDeliveries());
+}));
+
+orchestrationRouter.get('/deliveries/:id', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  const delivery = await getDelivery(String(req.params.id));
+  if (!delivery) return res.status(404).json({ error: 'Not found.' });
+  res.json(delivery);
+}));
+
+orchestrationRouter.post('/deliveries/:id/accept', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const delivery = await getDelivery(String(req.params.id));
+    if (!delivery) return res.status(404).json({ error: 'Not found.' });
+    const prospect = await getProspect(delivery.prospectId);
+    const acceptance = await acceptDelivery(prospect, delivery, {
+      acceptedBy: req.body?.acceptedBy,
+      acceptanceMethod: req.body?.acceptanceMethod,
+      metadata: req.body?.metadata
+    });
+    res.status(201).json(acceptance);
+  } catch (e: any) {
+    replyError(res, e);
+  }
+}));

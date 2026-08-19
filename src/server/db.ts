@@ -22,7 +22,12 @@ import {
   StaffMember,
   User,
   Session,
-  TelemetryEvent
+  TelemetryEvent,
+  Prospect,
+  DesignProposal,
+  FactoryJob,
+  Delivery,
+  Acceptance
 } from '../types';
 import { hashPassword } from './passwords';
 import { initEmbeddingsTable } from './embeddings';
@@ -30,6 +35,7 @@ import { embeddingProviderAvailable } from './llmProvider';
 import { initEvaluationTable } from './evaluation';
 import { initCorrectionTable } from './correction';
 import { initTelemetryTable } from './telemetry';
+import { initOrchestrationTables } from './orchestration/tables';
 import { DbClient, SqliteClient, PostgresClient } from './dbClient';
 
 /**
@@ -175,6 +181,31 @@ const TABLES: Record<string, TableConfig> = {
   sessions: {
     table: 'sessions',
     jsonColumns: [],
+    booleanColumns: []
+  },
+  prospects: {
+    table: 'prospects',
+    jsonColumns: [],
+    booleanColumns: []
+  },
+  designProposals: {
+    table: 'design_proposals',
+    jsonColumns: ['capabilities', 'channels', 'integrations', 'configuration'],
+    booleanColumns: []
+  },
+  factoryJobs: {
+    table: 'factory_jobs',
+    jsonColumns: [],
+    booleanColumns: ['deadLettered']
+  },
+  deliveries: {
+    table: 'deliveries',
+    jsonColumns: ['deliveryPayload'],
+    booleanColumns: []
+  },
+  acceptances: {
+    table: 'acceptances',
+    jsonColumns: ['metadata'],
     booleanColumns: []
   }
 };
@@ -517,6 +548,11 @@ export class AppDatabase {
   public telemetry!: Collection<TelemetryEvent>;
   public users!: Collection<User>;
   public sessions!: Collection<Session>;
+  public prospects!: Collection<Prospect>;
+  public designProposals!: Collection<DesignProposal>;
+  public factoryJobs!: Collection<FactoryJob>;
+  public deliveries!: Collection<Delivery>;
+  public acceptances!: Collection<Acceptance>;
 
   constructor(opts: AppDatabaseOptions = {}) {
     // Select the driver. DATABASE_URL (postgres://...) -> PostgreSQL production
@@ -571,6 +607,11 @@ export class AppDatabase {
     this.telemetry = new Collection<TelemetryEvent>(this.client, TABLES.telemetry);
     this.users = new Collection<User>(this.client, TABLES.users);
     this.sessions = new Collection<Session>(this.client, TABLES.sessions);
+    this.prospects = new Collection<Prospect>(this.client, TABLES.prospects);
+    this.designProposals = new Collection<DesignProposal>(this.client, TABLES.designProposals);
+    this.factoryJobs = new Collection<FactoryJob>(this.client, TABLES.factoryJobs);
+    this.deliveries = new Collection<Delivery>(this.client, TABLES.deliveries);
+    this.acceptances = new Collection<Acceptance>(this.client, TABLES.acceptances);
   }
 
   /** Run migrations, initialize the embeddings table, and seed demo data.
@@ -591,6 +632,7 @@ export class AppDatabase {
     await initEvaluationTable(this.client);
     await initCorrectionTable(this.client);
     await initTelemetryTable(this.client);
+    await initOrchestrationTables(this.client);
 
     if (shouldSeed) {
       await this.seed();

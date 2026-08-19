@@ -201,4 +201,48 @@ pgDescribe('PostgreSQL transaction integrity (real PG)', () => {
     expect(await state.db.customers.find((c: any) => c.id === 'pgtx-iso-a')).toBeTruthy();
     expect(await state.db.customers.find((c: any) => c.id === 'pgtx-iso-b')).toBeTruthy();
   });
+
+  // -------------------------------------------------------------------------
+  // Orchestration (Sales & Delivery) PG parity
+  // -------------------------------------------------------------------------
+
+  it('orchestration tables exist after PG init (prospects/design/factory/deliveries/acceptances)', async () => {
+    const res = await state.db.client.query(
+      `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('prospects','design_proposals','factory_jobs','deliveries','acceptances')`
+    );
+    const names = res.rows.map((r: any) => r.table_name);
+    for (const t of ['prospects', 'design_proposals', 'factory_jobs', 'deliveries', 'acceptances']) {
+      expect(names).toContain(t);
+    }
+  });
+
+  it('factory job idempotencyKey is UNIQUE on PG; markDeadLetter round-trips boolean', async () => {
+    // PG enforces the FK on (prospect, design) — satisfy it with real rows.
+    const now = new Date().toISOString();
+    const prospect: any = { id: 'pro-pgtx', businessName: 'PG Idem', status: 'NEW', createdAt: now, updatedAt: now };
+    await state.db.prospects.push(prospect);
+    const design: any = {
+      id: 'des-pgtx', prospectId: 'pro-pgtx', title: 't', problemStatement: 'p', proposedSolution: 's',
+      status: 'DRAFT', createdAt: now, updatedAt: now
+    };
+    await state.db.designProposals.push(design);
+
+    const mk: any = {
+      id: `job-pgtx-${Math.random().toString(36).slice(2, 6)}`,
+      prospectId: 'pro-pgtx', designProposalId: 'des-pgtx',
+      status: 'PENDING', currentStep: 'PENDING', idempotencyKey: 'pgtx-idem-1',
+      attemptCount: 0, deadLettered: false, createdAt: now, updatedAt: now
+    };
+    await state.db.factoryJobs.push(mk);
+    // Duplicate key must be rejected by the PG unique constraint.
+    await expect(state.db.factoryJobs.push({ ...mk, id: `job-pgtx-dup-${Math.random().toString(36).slice(2, 6)}` })).rejects.toBeTruthy();
+    const jobs = await state.db.factoryJobs.filter((j: any) => j.idempotencyKey === 'pgtx-idem-1');
+    expect(jobs.length).toBe(1);
+    // Boolean column (dead_lettered) round-trips as a real boolean on PG.
+    const dl = await state.db.factoryJobs.find((j: any) => j.idempotencyKey === 'pgtx-idem-1');
+    dl.deadLettered = true;
+    await state.db.factoryJobs.update(dl);
+    const reloaded = await state.db.factoryJobs.find((j: any) => j.idempotencyKey === 'pgtx-idem-1');
+    expect(reloaded.deadLettered).toBe(true);
+  });
 });

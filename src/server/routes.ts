@@ -3,12 +3,12 @@ import { db } from './db';
 import { processAgentMessage, generateSuggestedAgentConfig } from './agentRuntime';
 import { executeAgentTool, ALL_TOOL_NAMES } from './tools';
 import {
-  createInitialDraft, createDraftFrom, editDraft, publishVersion,
+  createDraftFrom, editDraft, publishVersion,
   rollbackToVersion, archiveVersion, moveToTesting, listVersions,
   getPublishedVersion, getVersionForSim, versionBelongsToAgent
 } from './agentVersions';
 import { indexChunk, removeEmbedding } from './embeddings';
-import { assertActivatable, readinessSnapshot } from './readiness';
+import { readinessSnapshot } from './readiness';
 import { rateLimit, RATE_LIMITS } from './security';
 import { safeError } from './logSanitizer';
 import {
@@ -16,7 +16,8 @@ import {
   sanitizeIntegrationForClient
 } from './integrations';
 import { widgetCorsHeaders } from './widgetSecurity';
-import { SUPPORTED_LLM_PROVIDERS, resolveProviderAndModel } from './llmProvider';
+import { createBusinessTenant, createAgentWithInitialDraft, transitionAgentStatus, AGENT_STATUS_TRANSITIONS, AGENT_STATUSES } from './agentLifecycle';
+import { orchestrationRouter } from './orchestration/orchestrationRoutes';
 import { runEvaluation, getLatestEvaluation, listEvaluationsForAgent } from './evaluation';
 import { runSelfCorrection, listCorrectionsForAgent } from './correction';
 import { listTelemetryEvents, computeMetrics, listConversationsFromTelemetry, getConversationTimeline } from './telemetry';
@@ -39,6 +40,9 @@ import {
 } from './auth';
 
 export const router = Router();
+
+// Sales & Delivery Orchestrator — owner-gated sub-router (platform owner only).
+router.use('/orchestration', orchestrationRouter);
 
 /**
  * Cap a list response to bound memory and protect against unbounded result
@@ -167,113 +171,33 @@ router.get('/businesses', requireAuth, asyncHandler(async (req: Request, res: Re
   res.json(result);
 }));
 
-// Create Business — PLATFORM_OWNER only.
+// Create Business — PLATFORM_OWNER only. Authoritative creation logic lives
+// in agentLifecycle.createBusinessTenant (shared with the orchestrator).
 router.post('/businesses', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
   const {
     name,
     type,
     description,
     location,
-    language = 'en',
-    currency = 'toman',
-    timezone = 'Asia/Tehran',
-    hours,
-    services = [],
-    faqs = [],
-    policies,
-    communicationStyle,
-    allowedWidgetOrigins = []
-  } = req.body;
-
-  if (!name || !type) {
-    return res.status(400).json({ error: 'Business name and type are required.' });
-  }
-  if (typeof name !== 'string' || name.length > 200) {
-    return res.status(400).json({ error: 'Business name must be 1-200 characters.' });
-  }
-
-  const defaultHours = [
-    { day: 'monday', isOpen: true, openTime: '09:00', closeTime: '20:00' },
-    { day: 'tuesday', isOpen: true, openTime: '09:00', closeTime: '20:00' },
-    { day: 'wednesday', isOpen: true, openTime: '09:00', closeTime: '20:00' },
-    { day: 'thursday', isOpen: true, openTime: '09:00', closeTime: '20:00' },
-    { day: 'friday', isOpen: true, openTime: '09:00', closeTime: '20:00' },
-    { day: 'saturday', isOpen: true, openTime: '09:00', closeTime: '20:00' },
-    { day: 'sunday', isOpen: false, openTime: '09:00', closeTime: '20:00' },
-  ] as const;
-
-  const newBiz: Business = {
-    id: `biz-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    name,
-    type,
-    description: description || '',
-    location: location || 'Main Street',
     language,
     currency,
     timezone,
-    hours: hours || defaultHours,
-    services: services.map((s: any, idx: number) => ({
-      id: s.id || `srv-${Date.now()}-${idx}`,
-      name: s.name,
-      price: Number(s.price) || 0,
-      // Accept both durationMinutes (canonical) and duration (common shorthand)
-      durationMinutes: Number(s.durationMinutes ?? s.duration) || 30,
-      description: s.description || ''
-    })),
-    faqs: faqs.map((f: any, idx: number) => ({
-      id: f.id || `faq-${Date.now()}-${idx}`,
-      question: f.question,
-      answer: f.answer
-    })),
-    policies: policies || {
-      cancellation: 'Cancel at least 2 hours in advance.',
-      refund: 'No monetary refunds after service completed.',
-      bookingNotice: 'Book up to 14 days in advance.'
-    },
-    communicationStyle: communicationStyle || 'Friendly, courteous, and efficient.',
-    status: 'ACTIVE',
-    allowedWidgetOrigins: Array.isArray(allowedWidgetOrigins) ? allowedWidgetOrigins : [],
-    holidays: [],
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
-  };
-
-  await db.businesses.push(newBiz);
-
-  // Initialize Default Channels & Integrations for new tenant
-  const defaultChannels = ['web_chat', 'instagram', 'sms', 'voice'] as const;
-  for (const chanType of defaultChannels) {
-    await db.channels.push({
-      id: `chan-${Date.now()}-${chanType}`,
-      businessId: newBiz.id,
-      type: chanType,
-      status: chanType === 'web_chat' ? 'connected' : 'not_configured',
-      details: chanType === 'web_chat' ? 'Widget ready to embed' : 'Not configured',
-      updatedAt: new Date().toISOString()
+    hours,
+    services,
+    faqs,
+    policies,
+    communicationStyle,
+    allowedWidgetOrigins
+  } = req.body;
+  try {
+    const newBiz = await createBusinessTenant({
+      name, type, description, location, language, currency, timezone,
+      hours, services, faqs, policies, communicationStyle, allowedWidgetOrigins
     });
+    res.status(201).json(newBiz);
+  } catch (e: any) {
+    res.status(400).json({ error: e.message });
   }
-
-  const providers = ['google_calendar', 'meta_instagram', 'twilio_sms', 'voice_ai'] as const;
-  for (const prov of providers) {
-    await db.integrations.push({
-      id: `integ-${Date.now()}-${prov}`,
-      businessId: newBiz.id,
-      provider: prov,
-      state: 'NOT_CONFIGURED',
-      statusMessage: 'Not configured',
-      credentialsSet: false
-    });
-  }
-
-  await db.auditLogs.push({
-    id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    businessId: newBiz.id,
-    action: 'BUSINESS_CREATED',
-    details: `Business "${newBiz.name}" (${newBiz.type}) created.`,
-    timestamp: new Date().toISOString()
-  });
-
-  res.status(201).json(newBiz);
 }));
 
 // Get Business by ID — platform owner or the business's own owner/staff.
@@ -427,36 +351,11 @@ router.post('/businesses/:id/duplicate', requireAuth, requireRole('PLATFORM_OWNE
  * Pausing/archiving the active agent leaves the business with NO active agent
  * — the public widget then honestly reports the assistant is unavailable.
  * Same-status transitions are idempotent no-ops.
+ *
+ * The authoritative map and transition logic now live in agentLifecycle.ts
+ * (AGENT_STATUS_TRANSITIONS / transitionAgentStatus) so the route layer and
+ * the orchestration layer share one implementation.
  */
-const AGENT_STATUS_TRANSITIONS: Record<AgentStatus, AgentStatus[]> = {
-  DRAFT: ['TESTING', 'PAUSED', 'ARCHIVED'],
-  TESTING: ['READY', 'DRAFT', 'PAUSED', 'ARCHIVED'],
-  READY: ['ACTIVE', 'TESTING', 'PAUSED', 'ARCHIVED'],
-  ACTIVE: ['PAUSED', 'ARCHIVED'],
-  PAUSED: ['ACTIVE', 'ARCHIVED'],
-  ARCHIVED: []
-};
-
-const AGENT_STATUSES = Object.keys(AGENT_STATUS_TRANSITIONS) as AgentStatus[];
-
-/** Pause every other ACTIVE agent of the business (keeps exactly one ACTIVE). */
-async function pauseOtherActiveAgents(businessId: string, keepAgentId: string): Promise<void> {
-  const others = await db.agents.filter(a => a.businessId === businessId && a.id !== keepAgentId && a.status === 'ACTIVE');
-  for (const other of others) {
-    other.status = 'PAUSED';
-    other.pausedFrom = 'ACTIVE'; // unpausing this agent may resume it as ACTIVE
-    other.updatedAt = new Date().toISOString();
-    await db.agents.update(other);
-    await db.auditLogs.push({
-      id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      businessId,
-      agentId: other.id,
-      action: 'AGENT_STATUS_CHANGED',
-      details: `Agent "${other.name}" auto-paused because agent ${keepAgentId} became ACTIVE (one ACTIVE agent per business).`,
-      timestamp: new Date().toISOString()
-    });
-  }
-}
 
 // Get Agents (optionally filtered by businessId; tenant enforced server-side)
 router.get('/agents', requireAuth, requireTenantScope, asyncHandler(async (req: Request, res: Response) => {
@@ -499,83 +398,20 @@ router.post('/agents/generate-config', rateLimit({ ...RATE_LIMITS.generate, pref
 
 // Create Agent — tenant derived from the session (body businessId cannot widen access)
 router.post('/agents', requireAuth, requireTenantScope, asyncHandler(async (req: Request, res: Response) => {
-  const {
-    name,
-    description,
-    systemPrompt,
-    structuredConfig,
-    llmProvider,
-    model,
-    status = 'READY'
-  } = req.body;
+  const { name, description, systemPrompt, structuredConfig, llmProvider, model, status } = req.body;
   const businessId = res.locals.businessId as string | null;
 
   if (!businessId || !name) {
     return res.status(400).json({ error: 'businessId and agent name are required.' });
   }
-  if (!AGENT_STATUSES.includes(status)) {
-    return res.status(400).json({ error: `Invalid status. Must be one of: ${AGENT_STATUSES.join(', ')}.` });
-  }
-  // Validate + default the LLM provider/model (free-first: default to ollama
-  // when GEMINI_API_KEY is absent so a fresh install works without a paid API;
-  // an explicitly-requested provider is honored if supported).
-  const requestedProvider = llmProvider as Agent['llmProvider'] | undefined;
-  if (requestedProvider && !SUPPORTED_LLM_PROVIDERS.includes(requestedProvider)) {
-    return res.status(400).json({
-      error: `Unsupported llmProvider. Supported: ${SUPPORTED_LLM_PROVIDERS.join(', ')}.`
+  try {
+    const newAgent = await createAgentWithInitialDraft({
+      businessId, name, description, systemPrompt, structuredConfig, llmProvider, model, status
     });
+    res.status(201).json(newAgent);
+  } catch (e: any) {
+    res.status(400).json({ error: e.message });
   }
-  const { provider: resolvedProvider, model: resolvedModel } = resolveProviderAndModel({
-    llmProvider: requestedProvider,
-    model
-  });
-
-  const newAgent: Agent = {
-    id: `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    businessId,
-    name,
-    description: description || 'AI Receptionist & Assistant',
-    version: 1,
-    status,
-    systemPrompt: systemPrompt || 'You are an AI assistant. Answer customer queries politely based on business context.',
-    structuredConfig: structuredConfig || {
-      personality: { tone: 'friendly', behavior: 'service', language: 'en' },
-      goals: ['Answer FAQs', 'Book appointments'],
-      allowedActions: ['check_business_hours', 'get_business_information', 'check_availability', 'book_appointment', 'search_knowledge', 'transfer_to_human'],
-      restrictedActions: ['Do not make up fake information'],
-      escalationRules: ['Customer requests human'],
-      bookingRules: 'Require name and phone number',
-      orderRules: 'Standard checkout',
-      refundRules: 'Non-refundable',
-      toolsEnabled: ['check_business_hours', 'get_business_information', 'check_availability', 'book_appointment', 'search_knowledge', 'transfer_to_human']
-    },
-    llmProvider: resolvedProvider.type,
-    model: resolvedModel,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
-  };
-
-  await db.agents.push(newAgent);
-
-  // Create the first DRAFT version snapshot. The version history is immutable;
-  // editing happens on drafts, never directly on the live config.
-  await createInitialDraft(newAgent);
-
-  // Creating an agent directly as ACTIVE also enforces exactly-one-ACTIVE.
-  if (newAgent.status === 'ACTIVE') {
-    await pauseOtherActiveAgents(businessId, newAgent.id);
-  }
-
-  await db.auditLogs.push({
-    id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    businessId,
-    agentId: newAgent.id,
-    action: 'AGENT_CREATED',
-    details: `Created agent "${newAgent.name}" v1 (status ${newAgent.status}).`,
-    timestamp: new Date().toISOString()
-  });
-
-  res.status(201).json(newAgent);
 }));
 
 // Update Agent — resource belongs to the authorized tenant.
@@ -621,7 +457,8 @@ router.put(
   }
 ));
 
-// Change Agent Status — lifecycle enforced server-side (see transition map)
+// Change Agent Status — lifecycle enforced server-side (authoritative logic
+// in agentLifecycle.transitionAgentStatus; readiness gate cannot be bypassed).
 router.post(
   '/agents/:id/status',
   requireAuth,
@@ -630,65 +467,13 @@ router.post(
     const agent = res.locals.resource as Agent;
 
     const { status } = req.body;
-    if (!AGENT_STATUSES.includes(status)) {
-      return res.status(400).json({ error: `Invalid status. Must be one of: ${AGENT_STATUSES.join(', ')}.` });
+    try {
+      const updated = await transitionAgentStatus(agent, status);
+      res.json(updated);
+    } catch (err: any) {
+      // Readiness-gate failures carry the structured checklist for the UI.
+      res.status(400).json({ error: err.message, readiness: err.readiness });
     }
-
-    // Same status = idempotent no-op.
-    if (status !== agent.status) {
-      let allowed = AGENT_STATUS_TRANSITIONS[agent.status];
-      // A PAUSED agent may also resume the exact state it was paused from
-      // (e.g. READY -> PAUSED then PAUSED -> READY), in addition to the
-      // static ACTIVE/ARCHIVED exits.
-      if (agent.status === 'PAUSED' && agent.pausedFrom && !allowed.includes(agent.pausedFrom)) {
-        allowed = [...allowed, agent.pausedFrom];
-      }
-      if (!allowed.includes(status)) {
-        return res.status(400).json({
-          error: `Invalid status transition: ${agent.status} -> ${status}. Allowed: ${[...allowed, agent.status].join(', ')}.`
-        });
-      }
-
-      // Validate readiness before setting ACTIVE (Phase 20): the server-side
-      // composite checklist must pass. The frontend cannot bypass this.
-      if (status === 'ACTIVE') {
-        try {
-          await assertActivatable(agent);
-        } catch (err: any) {
-          return res.status(400).json({
-            error: err.message,
-            readiness: err.readiness
-          });
-        }
-        // Exactly one ACTIVE per business: activating this agent auto-pauses
-        // every other ACTIVE agent of the same business.
-        const biz = await db.businesses.find(b => b.id === agent.businessId);
-        if (!biz) return res.status(400).json({ error: 'Cannot activate agent: Business not found.' });
-        await pauseOtherActiveAgents(agent.businessId, agent.id);
-      }
-
-      // Pausing records the state we paused FROM so unpausing can resume it.
-      if (status === 'PAUSED') {
-        agent.pausedFrom = agent.status;
-      } else if (agent.status === 'PAUSED') {
-        delete agent.pausedFrom;
-      }
-
-      agent.status = status;
-      agent.updatedAt = new Date().toISOString();
-      await db.agents.update(agent);
-
-      await db.auditLogs.push({
-        id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        businessId: agent.businessId,
-        agentId: agent.id,
-        action: 'AGENT_STATUS_CHANGED',
-        details: `Agent "${agent.name}" state set to ${status}.`,
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    res.json(agent);
   }
 ));
 
