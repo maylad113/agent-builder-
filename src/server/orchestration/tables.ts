@@ -2,9 +2,10 @@
  * Orchestration table DDL (single source of truth) + self-heal init.
  *
  * The migration files (migrations/016_orchestration.sql,
- * 017_lead_research.sql, 018_discovery.sql for SQLite;
- * migrations/pg/017_orchestration.sql, pg/018_lead_research.sql,
- * pg/019_discovery.sql for PostgreSQL) embed the same statements; this
+ * 017_lead_research.sql, 018_discovery.sql, 019_discovery_acceptance.sql
+ * for SQLite; migrations/pg/017_orchestration.sql, pg/018_lead_research.sql,
+ * pg/019_discovery.sql, pg/020_discovery_acceptance.sql for PostgreSQL)
+ * embed the same statements; this
  * module's init function is the idempotent fallback the
  * database bootstrap calls so fresh/existing databases of either dialect get
  * the tables even if migration numbering races (same pattern as
@@ -48,6 +49,7 @@ CREATE TABLE IF NOT EXISTS prospects (
 );
 CREATE INDEX IF NOT EXISTS idx_prospects_status ON prospects(status);
 CREATE INDEX IF NOT EXISTS idx_prospects_business ON prospects(business_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_prospects_discovery_result ON prospects(discovery_result_id) WHERE discovery_result_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS design_proposals (
   id               TEXT PRIMARY KEY,

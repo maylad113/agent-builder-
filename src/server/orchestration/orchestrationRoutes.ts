@@ -28,6 +28,7 @@ import {
   getDiscoveryRun,
   listResultsForRun
 } from './discoveryRuns';
+import { acceptDiscoveryResult } from './discoveryAcceptance';
 import { rateLimit, RATE_LIMITS } from '../security';
 
 /**
@@ -128,6 +129,23 @@ orchestrationRouter.get('/discovery-runs/:id', requireAuth, requireRole('PLATFOR
   const run = await getDiscoveryRun(String(req.params.id));
   if (!run) return res.status(404).json({ error: 'Not found.' });
   res.json({ run, results: await listResultsForRun(run.id) });
+}));
+
+// Acceptance bridge: discovery_result -> prospect. Data/lifecycle transition
+// only — the handler performs no research/scoring/factory/outreach side
+// effects. Client-supplied tenant/prospect ids are ignored (server-derived).
+orchestrationRouter.post('/discovery-results/:id/accept', rateLimit({ ...RATE_LIMITS.generate, prefix: 'discovery-accept' }), requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const outcome = await acceptDiscoveryResult(String(req.params.id));
+    res.status(outcome.created ? 201 : 200).json({
+      prospect: outcome.prospect,
+      result: outcome.result,
+      created: outcome.created,
+      associated: outcome.associated
+    });
+  } catch (e: any) {
+    replyError(res, e);
+  }
 }));
 
 // ---------------------------------------------------------------------------

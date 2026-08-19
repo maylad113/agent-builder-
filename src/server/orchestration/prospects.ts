@@ -42,7 +42,7 @@ export async function createProspect(input: {
   instagramHandle?: unknown;
   location?: unknown;
   notes?: unknown;
-}): Promise<Prospect> {
+}, opts: { discoveryResultId?: string } = {}): Promise<Prospect> {
   const businessName = cleanStr(input.businessName, MAX_FIELD_LEN);
   if (!businessName) throw new Error('businessName is required.');
   const now = new Date().toISOString();
@@ -57,6 +57,7 @@ export async function createProspect(input: {
     location: cleanStr(input.location, MAX_FIELD_LEN),
     notes: cleanStr(input.notes, MAX_NOTES_LEN),
     status: 'NEW',
+    ...(opts.discoveryResultId ? { discoveryResultId: opts.discoveryResultId } : {}),
     createdAt: now,
     updatedAt: now
   };

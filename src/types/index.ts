@@ -589,7 +589,9 @@ export type TelemetryEventType =
 // Lead discovery (candidate intake — never triggers research/scoring/outreach).
   | 'DISCOVERY_RUN'
   | 'DISCOVERY_COMPLETED'
-  | 'DISCOVERY_FAILED';
+  | 'DISCOVERY_FAILED'
+// Discovery acceptance (data/lifecycle transition only — never automation).
+  | 'DISCOVERY_ACCEPTED';
 
 export interface TelemetryEvent {
   id: string;
