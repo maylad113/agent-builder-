@@ -197,6 +197,34 @@ describe('widget origin policy (H1 assessment: allow-list already closes imperso
   });
 });
 
+describe('rate-limit store selection (PostgreSQL production boot regression)', () => {
+  // Regression for: production + PostgreSQL previously crashed at module load
+  // because selectStore() unconditionally constructed SqliteRateLimitStore,
+  // which requires a better-sqlite3 handle that does not exist on the PG
+  // dialect. The server must DEGRADE to the in-memory store, not fail to boot.
+  it('production + sqlite handle present → sqlite store', async () => {
+    const { resolveRateLimitStoreKind } = await import('../src/server/security');
+    expect(resolveRateLimitStoreKind(undefined, 'production', true)).toBe('sqlite');
+  });
+
+  it('production + NO sqlite handle (PostgreSQL) → memory fallback', async () => {
+    const { resolveRateLimitStoreKind } = await import('../src/server/security');
+    expect(resolveRateLimitStoreKind(undefined, 'production', false)).toBe('memory');
+  });
+
+  it('explicit RATE_LIMIT_STORE always wins', async () => {
+    const { resolveRateLimitStoreKind } = await import('../src/server/security');
+    expect(resolveRateLimitStoreKind('sqlite', 'production', false)).toBe('sqlite');
+    expect(resolveRateLimitStoreKind('memory', 'production', true)).toBe('memory');
+  });
+
+  it('non-production always defaults to memory', async () => {
+    const { resolveRateLimitStoreKind } = await import('../src/server/security');
+    expect(resolveRateLimitStoreKind(undefined, 'test', true)).toBe('memory');
+    expect(resolveRateLimitStoreKind(undefined, 'development', false)).toBe('memory');
+  });
+});
+
 describe('sqlite store unit behavior', () => {
   it('sweeps only expired buckets and keeps sliding-window counts intact', () => {
     // Exercises SqliteRateLimitStore directly on a scratch DB.

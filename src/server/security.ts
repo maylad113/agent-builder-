@@ -197,17 +197,40 @@ export class SqliteRateLimitStore implements RateLimitStore {
  * restart-persistence, everything else keeps the legacy in-memory behavior):
  *
  *   RATE_LIMIT_STORE=memory  → MemoryRateLimitStore (tests/local dev)
- *   RATE_LIMIT_STORE=sqlite  → SqliteRateLimitStore (production default)
- *   unset + NODE_ENV=production → SqliteRateLimitStore
+ *   RATE_LIMIT_STORE=sqlite  → SqliteRateLimitStore (explicit; throws on PG)
+ *   unset + NODE_ENV=production + sqlite dialect → SqliteRateLimitStore
+ *   unset + NODE_ENV=production + PG dialect     → MemoryRateLimitStore + warn
  *   unset + anything else      → MemoryRateLimitStore
+ *
+ * The production default only makes sense when a better-sqlite3 handle exists.
+ * On the PostgreSQL dialect `db.sqlite` is undefined and constructing the
+ * SQLite store throws — which previously prevented a PG production server from
+ * booting at all. Degrade to the in-memory store (per-process limiter) instead
+ * of crashing; ops who need cross-process limits can set RATE_LIMIT_STORE or
+ * plug in a shared backend via setRateLimitStore().
  */
+export function resolveRateLimitStoreKind(
+  env: string | undefined,
+  nodeEnv: string | undefined,
+  sqliteAvailable: boolean
+): 'sqlite' | 'memory' {
+  if (env === 'sqlite') return 'sqlite';
+  if (env === 'memory') return 'memory';
+  if (nodeEnv === 'production') return sqliteAvailable ? 'sqlite' : 'memory';
+  return 'memory';
+}
+
 function selectStore(): RateLimitStore {
-  const env = process.env.RATE_LIMIT_STORE;
-  if (env === 'sqlite') return new SqliteRateLimitStore();
-  if (env === 'memory') return new MemoryRateLimitStore();
-  return process.env.NODE_ENV === 'production'
-    ? new SqliteRateLimitStore()
-    : new MemoryRateLimitStore();
+  const kind = resolveRateLimitStoreKind(process.env.RATE_LIMIT_STORE, process.env.NODE_ENV, !!db.sqlite);
+  if (kind === 'sqlite') return new SqliteRateLimitStore();
+  if (
+    process.env.NODE_ENV === 'production' &&
+    process.env.RATE_LIMIT_STORE !== 'memory' &&
+    !db.sqlite
+  ) {
+    console.warn('[rateLimit] no SQLite handle (PostgreSQL dialect) — using in-memory rate limiting (per-process). Set RATE_LIMIT_STORE=memory to silence this warning.');
+  }
+  return new MemoryRateLimitStore();
 }
 
 let store: RateLimitStore = selectStore();

@@ -1,4 +1,5 @@
 import type BetterSqlite3 from 'better-sqlite3';
+import { AsyncLocalStorage } from 'async_hooks';
 
 /**
  * Async database client abstraction (the "compatibility layer" for migrating
@@ -161,9 +162,25 @@ export class PostgresClient implements DbClient {
   readonly dialect = 'postgres' as const;
   private pool: any;
   private readonly opts: PostgresClientOptions;
+  // Holds the checked-out pg client for the currently executing transaction.
+  // query()/exec()/execMany()/getColumns() consult this store FIRST so every
+  // statement issued inside a transaction callback (including Collection
+  // methods, which only know this DbClient) runs on the SAME connection as
+  // the BEGIN/COMMIT — otherwise callback writes auto-commit on random pooled
+  // connections and the transaction is a no-op (no atomicity, no rollback,
+  // FOR UPDATE locks released immediately). AsyncLocalStorage scopes the
+  // binding per async context, so concurrent transactions each see their own
+  // client and run safely in parallel.
+  private readonly txStore = new AsyncLocalStorage<any>();
 
   constructor(opts: PostgresClientOptions) {
     this.opts = opts;
+  }
+
+  /** The connection to use for ad-hoc statements: the active transaction's
+   *  client when inside `transaction(fn)`, otherwise the pool. */
+  private conn(): any {
+    return this.txStore.getStore() ?? this.pool;
   }
 
   private async getPool(): Promise<any> {
@@ -214,9 +231,9 @@ export class PostgresClient implements DbClient {
   }
 
   async query(sql: string, params: any[] = []): Promise<QueryResult> {
-    const pool = await this.getPool();
+    await this.getPool();
     const { text, values } = this.toPgParams(sql, params);
-    const res = await pool.query(text, values);
+    const res = await this.conn().query(text, values);
     return { rows: res.rows ?? [], changes: res.rowCount ?? 0 };
   }
 
@@ -225,18 +242,21 @@ export class PostgresClient implements DbClient {
   }
 
   async execMany(sql: string): Promise<void> {
-    const pool = await this.getPool();
+    await this.getPool();
     // pg cannot run multiple statements in one query() — split on `;` at the
-    // top level (ignoring `;` inside string literals).
+    // top level (ignoring `;` inside string literals and comments).
     const statements = splitStatements(sql);
-    const client = await pool.connect();
+    // Inside a transaction, run on the transaction's client; otherwise take a
+    // dedicated pooled client so the statements stay on one connection.
+    const txClient = this.txStore.getStore();
+    const client = txClient ?? await this.pool.connect();
     try {
       for (const stmt of statements) {
         if (!stmt.trim()) continue;
         await client.query(stmt);
       }
     } finally {
-      client.release();
+      if (!txClient) client.release();
     }
   }
 
@@ -246,8 +266,8 @@ export class PostgresClient implements DbClient {
     if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(table)) {
       throw new Error(`Invalid table identifier: ${table}`);
     }
-    const pool = await this.getPool();
-    const res = await pool.query(
+    await this.getPool();
+    const res = await this.conn().query(
       `SELECT column_name FROM information_schema.columns
        WHERE table_name = $1 ORDER BY ordinal_position`,
       [table]
@@ -256,11 +276,21 @@ export class PostgresClient implements DbClient {
   }
 
   async transaction<T>(fn: () => Promise<T>): Promise<T> {
+    // Nested call inside an active transaction on this client: join the
+    // enclosing transaction (a second BEGIN would only emit a warning on
+    // PostgreSQL and a premature COMMIT would break atomicity). No call site
+    // nests transactions today; this is a safety net, not a feature.
+    if (this.txStore.getStore()) {
+      return fn();
+    }
     const pool = await this.getPool();
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      const result = await fn();
+      // Run the callback with this client bound into the async context so
+      // every query it issues (directly or via Collection methods) executes
+      // inside THIS transaction on THIS connection.
+      const result = await this.txStore.run(client, fn);
       await client.query('COMMIT');
       return result;
     } catch (err) {
@@ -293,14 +323,29 @@ export function stripForUpdate(sql: string): string {
 }
 
 /** Split a SQL script into individual statements on top-level `;`, respecting
- *  single/double-quoted string literals so `;` inside strings is preserved. */
+ *  single/double-quoted string literals AND `--` / `/* *\/` comments, so `;`
+ *  inside strings or comments never splits a statement. (Migration scripts
+ *  contain semicolons inside comments; splitting there produced fragments
+ *  like `when ...` that PostgreSQL rejects with a syntax error.) */
 export function splitStatements(sql: string): string[] {
   const out: string[] = [];
   let buf = '';
   let inSingle = false;
   let inDouble = false;
+  let inLineComment = false;
+  let inBlockComment = false;
   for (let i = 0; i < sql.length; i++) {
     const ch = sql[i];
+    if (inLineComment) {
+      buf += ch;
+      if (ch === '\n') inLineComment = false;
+      continue;
+    }
+    if (inBlockComment) {
+      buf += ch;
+      if (ch === '*' && sql[i + 1] === '/') { buf += '/'; i++; inBlockComment = false; }
+      continue;
+    }
     if (inSingle) {
       buf += ch;
       if (ch === "'" && sql[i + 1] === "'") { buf += sql[i + 1]; i++; }
@@ -312,11 +357,16 @@ export function splitStatements(sql: string): string[] {
       if (ch === '"') inDouble = false;
       continue;
     }
+    if (ch === '-' && sql[i + 1] === '-') { inLineComment = true; buf += ch; continue; }
+    if (ch === '/' && sql[i + 1] === '*') { inBlockComment = true; buf += ch; continue; }
     if (ch === "'") { inSingle = true; buf += ch; continue; }
     if (ch === '"') { inDouble = true; buf += ch; continue; }
     if (ch === ';') { out.push(buf); buf = ''; continue; }
     buf += ch;
   }
   if (buf.trim()) out.push(buf);
-  return out;
+  // Drop fragments that contain only comments/whitespace — PostgreSQL accepts
+  // them, but skipping avoids pointless round-trips and keeps error positions
+  // aligned with real statements.
+  return out.filter(s => s.replace(/--[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '').trim().length > 0);
 }

@@ -489,15 +489,23 @@ export async function executeAgentTool(
         const nowIso = new Date().toISOString();
 
         const result = await db.client.transaction(async (): Promise<{ ok: true; appointment: any } | { ok: false; error: string }> => {
-          // PostgreSQL-safe concurrency (audit P1.3): lock the existing
-          // non-cancelled appointments for this tenant+date with SELECT ... FOR
-          // UPDATE before the overlap check. On PostgreSQL this acquires row
-          // locks so two concurrent bookings for the same slot serialize — the
-          // second waits for the first to COMMIT, then sees the new row and
-          // correctly detects the overlap. SQLite parses but ignores FOR UPDATE
-          // (writes already serialize via the per-connection mutex), so the same
-          // code path is correct on both dialects. Exactly one concurrent booking
-          // can succeed.
+          // PostgreSQL-safe concurrency (audit P1.3): lock the parent business
+          // row FIRST. The appointments FOR UPDATE below locks only rows that
+          // already exist — when no appointments exist yet for this date it
+          // locks nothing, and two concurrent first-bookings would both pass
+          // the overlap check (empty-set race). Locking the always-present
+          // business row serializes ALL booking transactions for the tenant,
+          // so exactly one concurrent booking can succeed regardless of
+          // pre-existing rows. SQLite strips FOR UPDATE and serializes writes
+          // via the per-connection mutex, so this is a no-op there.
+          await db.client.query(
+            `SELECT id FROM businesses WHERE id = ? FOR UPDATE`,
+            [tenantId]
+          );
+          // Then lock the existing non-cancelled appointments for this
+          // tenant+date with SELECT ... FOR UPDATE before the overlap check.
+          // On PostgreSQL the second concurrent booking waits for the first to
+          // COMMIT, then sees the new row and correctly detects the overlap.
           const lockRows = await db.client.query(
             `SELECT id, service_id, start_time, end_time FROM appointments
              WHERE business_id = ? AND date = ? AND status != 'CANCELLED' FOR UPDATE`,
@@ -665,8 +673,14 @@ export async function executeAgentTool(
 
         // Transactional overlap check (excluding the appointment being moved).
         // Mirrors the booking overlap rule + uses SELECT ... FOR UPDATE row
-        // locking so concurrent reschedules serialize (audit P1.3).
+        // locking so concurrent reschedules serialize (audit P1.3). The parent
+        // business row is locked first to close the empty-set race (a FOR
+        // UPDATE over zero appointment rows locks nothing).
         const r = await db.client.transaction(async () => {
+          await db.client.query(
+            `SELECT id FROM businesses WHERE id = ? FOR UPDATE`,
+            [tenantId]
+          );
           const lockRows = await db.client.query(
             `SELECT id, service_id, start_time, end_time FROM appointments
              WHERE business_id = ? AND date = ? AND status != 'CANCELLED' AND id != ? FOR UPDATE`,
