@@ -171,7 +171,7 @@ function normalizeExtraction(raw: unknown, inputText: string): ResearchReportDoc
 }
 
 /** Tolerate markdown fences / stray prose; strict on anything else. */
-function parseJsonObject(text: string): unknown {
+export function parseJsonObject(text: string): unknown {
   const trimmed = text.trim();
   const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const candidate = (fence ? fence[1] : trimmed).trim();

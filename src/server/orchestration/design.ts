@@ -51,7 +51,13 @@ export async function createDesign(prospect: Prospect, input: {
   channels?: unknown;
   integrations?: unknown;
   configuration?: unknown;
-}): Promise<DesignProposal> {
+}, opts: {
+  generationKey?: string;
+  sourceReportId?: string;
+  generatorModel?: string;
+  rationale?: string;
+  uncertainty?: string;
+} = {}): Promise<DesignProposal> {
   const title = cleanStr(input.title, MAX_TITLE_LEN);
   const problemStatement = cleanStr(input.problemStatement, MAX_TEXT_LEN);
   const proposedSolution = cleanStr(input.proposedSolution, MAX_TEXT_LEN);
@@ -75,6 +81,11 @@ export async function createDesign(prospect: Prospect, input: {
     integrations: asStrSet(input.integrations),
     configuration: config,
     status: 'DRAFT',
+    ...(opts.generationKey ? { generationKey: opts.generationKey } : {}),
+    ...(opts.sourceReportId ? { sourceReportId: opts.sourceReportId } : {}),
+    ...(opts.generatorModel ? { generatorModel: opts.generatorModel } : {}),
+    ...(opts.rationale ? { rationale: cleanStr(opts.rationale, MAX_TEXT_LEN) } : {}),
+    ...(opts.uncertainty ? { uncertainty: cleanStr(opts.uncertainty, MAX_TEXT_LEN) } : {}),
     createdAt: now,
     updatedAt: now
   };

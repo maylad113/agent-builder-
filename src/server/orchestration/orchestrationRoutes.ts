@@ -30,6 +30,7 @@ import {
 } from './discoveryRuns';
 import { acceptDiscoveryResult } from './discoveryAcceptance';
 import { analyzeProspect } from './prospectAnalysis';
+import { generateDesignProposal } from './prospectDesigner';
 import { rateLimit, RATE_LIMITS } from '../security';
 
 /**
@@ -193,6 +194,18 @@ orchestrationRouter.get('/research/:id', requireAuth, requireRole('PLATFORM_OWNE
 // ---------------------------------------------------------------------------
 // Designs
 // ---------------------------------------------------------------------------
+
+// Designer generation (Task 11): validated DRAFT proposal from the latest
+// COMPLETED analysis report. 201 first generation, 200 idempotent replay.
+// The handler NEVER approves/submits/builds — human approval route unchanged.
+orchestrationRouter.post('/prospects/:id/design', rateLimit({ ...RATE_LIMITS.generate, prefix: 'design' }), requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const outcome = await generateDesignProposal(String(req.params.id));
+    res.status(outcome.created ? 201 : 200).json(outcome);
+  } catch (e: any) {
+    replyError(res, e);
+  }
+}));
 
 orchestrationRouter.post('/prospects/:id/designs', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
   try {

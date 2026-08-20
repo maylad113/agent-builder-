@@ -320,6 +320,33 @@ pgDescribe('PostgreSQL transaction integrity (real PG)', () => {
     expect(after.status).toBe('NEW');
   });
 
+  it('concurrent designer generation on PG produces exactly one proposal with provenance', async () => {
+    const { createProspect } = await import('../src/server/orchestration/prospects');
+    const { runResearch } = await import('../src/server/orchestration/leadResearch');
+    const { generateDesignProposal } = await import('../src/server/orchestration/prospectDesigner');
+    const { validateDesignConfiguration } = await import('../src/server/orchestration/design');
+    const idx = await state.db.client.query(
+      `SELECT indexname FROM pg_indexes WHERE tablename = 'design_proposals' AND indexname = 'idx_design_proposals_generation_key'`
+    );
+    expect(idx.rows.length).toBe(1);
+    const prospect = await createProspect({ businessName: 'PG Design Co' });
+    const report = await runResearch(prospect.id, { idempotencyKey: 'pgtx-des-src-1', inputText: 'They miss calls daily.' });
+    const [a, b] = await Promise.all([
+      generateDesignProposal(prospect.id),
+      generateDesignProposal(prospect.id)
+    ]);
+    expect(a.design.id).toBe(b.design.id);
+    const all = await state.db.designProposals.filter((d: any) => d.prospectId === prospect.id);
+    expect(all.length).toBe(1);
+    const d = all[0];
+    expect(d.status).toBe('DRAFT');
+    expect(d.sourceReportId).toBe(report.id);
+    expect(d.generatorModel).toBe('fallback');
+    expect(d.generationKey.startsWith(`design:${prospect.id}:`)).toBe(true);
+    expect(d.rationale).toBeTruthy();
+    expect(validateDesignConfiguration(d.configuration)).toEqual([]);
+  });
+
   it('lead research run persists on PG with JSON report round-trip + idempotency', async () => {
     const { runResearch, listResearchForProspect } = await import('../src/server/orchestration/leadResearch');
     const now = new Date().toISOString();

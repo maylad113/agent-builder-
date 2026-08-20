@@ -119,7 +119,10 @@ export async function recordOrchestrationEvent(params: {
     | 'DISCOVERY_ACCEPTED'
     | 'PROSPECT_ANALYZE_RUN'
     | 'PROSPECT_ANALYZE_COMPLETED'
-    | 'PROSPECT_ANALYZE_FAILED';
+    | 'PROSPECT_ANALYZE_FAILED'
+    | 'DESIGN_GENERATE_RUN'
+    | 'DESIGN_GENERATE_COMPLETED'
+    | 'DESIGN_GENERATE_FAILED';
   /** Absent for pre-prospect discovery events. */
   prospectId?: string;
   businessId?: string;

@@ -595,7 +595,11 @@ export type TelemetryEventType =
 // Prospect analyze (thin composition over research — never a decision).
   | 'PROSPECT_ANALYZE_RUN'
   | 'PROSPECT_ANALYZE_COMPLETED'
-  | 'PROSPECT_ANALYZE_FAILED';
+  | 'PROSPECT_ANALYZE_FAILED'
+// Designer proposal generation (DRAFT only — approval stays human).
+  | 'DESIGN_GENERATE_RUN'
+  | 'DESIGN_GENERATE_COMPLETED'
+  | 'DESIGN_GENERATE_FAILED';
 
 export interface TelemetryEvent {
   id: string;
@@ -713,6 +717,12 @@ export interface DesignProposal {
   configuration?: DesignConfiguration;
   status: DesignStatus;
   approvedAt?: string;
+  /** Designer provenance (Task 11). Present only on generated proposals. */
+  generationKey?: string;
+  sourceReportId?: string;
+  generatorModel?: string;
+  rationale?: string;
+  uncertainty?: string;
   createdAt: string;
   updatedAt: string;
 }

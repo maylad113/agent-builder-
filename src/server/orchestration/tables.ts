@@ -64,11 +64,17 @@ CREATE TABLE IF NOT EXISTS design_proposals (
   configuration    TEXT,
   status           TEXT NOT NULL,
   approved_at      TEXT,
+  generation_key   TEXT,
+  source_report_id TEXT,
+  generator_model  TEXT,
+  rationale        TEXT,
+  uncertainty      TEXT,
   created_at       TEXT NOT NULL,
   updated_at       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_design_proposals_prospect ON design_proposals(prospect_id);
 CREATE INDEX IF NOT EXISTS idx_design_proposals_status ON design_proposals(status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_design_proposals_generation_key ON design_proposals(generation_key) WHERE generation_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS factory_jobs (
   id                 TEXT PRIMARY KEY,
@@ -183,7 +189,12 @@ export async function initOrchestrationTables(client: InitClient): Promise<void>
   if (client.dialect === 'postgres') {
     await client.execMany(
       'ALTER TABLE prospects ADD COLUMN IF NOT EXISTS discovery_result_id TEXT REFERENCES discovery_results(id);\n' +
-      'ALTER TABLE discovery_results ADD COLUMN IF NOT EXISTS source_expires_at TEXT;'
+      'ALTER TABLE discovery_results ADD COLUMN IF NOT EXISTS source_expires_at TEXT;\n' +
+      'ALTER TABLE design_proposals ADD COLUMN IF NOT EXISTS generation_key TEXT;\n' +
+      'ALTER TABLE design_proposals ADD COLUMN IF NOT EXISTS source_report_id TEXT;\n' +
+      'ALTER TABLE design_proposals ADD COLUMN IF NOT EXISTS generator_model TEXT;\n' +
+      'ALTER TABLE design_proposals ADD COLUMN IF NOT EXISTS rationale TEXT;\n' +
+      'ALTER TABLE design_proposals ADD COLUMN IF NOT EXISTS uncertainty TEXT;'
     );
   } else {
     const cols = await client.query("SELECT name FROM pragma_table_info('prospects')");
@@ -195,6 +206,12 @@ export async function initOrchestrationTables(client: InitClient): Promise<void>
     const dcols = await client.query("SELECT name FROM pragma_table_info('discovery_results')");
     if (!dcols.rows.some((c: any) => c.name === 'source_expires_at')) {
       await client.execMany('ALTER TABLE discovery_results ADD COLUMN source_expires_at TEXT');
+    }
+    const pcols = await client.query("SELECT name FROM pragma_table_info('design_proposals')");
+    const names = new Set(pcols.rows.map((c: any) => c.name));
+    const missing = ['generation_key', 'source_report_id', 'generator_model', 'rationale', 'uncertainty'].filter(c => !names.has(c));
+    for (const col of missing) {
+      await client.execMany(`ALTER TABLE design_proposals ADD COLUMN ${col} TEXT`);
     }
   }
 }
