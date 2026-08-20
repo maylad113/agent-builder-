@@ -591,7 +591,11 @@ export type TelemetryEventType =
   | 'DISCOVERY_COMPLETED'
   | 'DISCOVERY_FAILED'
 // Discovery acceptance (data/lifecycle transition only — never automation).
-  | 'DISCOVERY_ACCEPTED';
+  | 'DISCOVERY_ACCEPTED'
+// Prospect analyze (thin composition over research — never a decision).
+  | 'PROSPECT_ANALYZE_RUN'
+  | 'PROSPECT_ANALYZE_COMPLETED'
+  | 'PROSPECT_ANALYZE_FAILED';
 
 export interface TelemetryEvent {
   id: string;
@@ -772,7 +776,7 @@ export interface Acceptance {
 // ============================================================================
 
 export type LeadResearchStatus = 'COMPLETED' | 'FAILED';
-export type LeadResearchInputSource = 'manual' | 'business_provided';
+export type LeadResearchInputSource = 'manual' | 'business_provided' | 'system_assembled';
 export type Verification = 'VERIFIED' | 'UNVERIFIED' | 'UNKNOWN';
 export type AppointmentFit = 'STRONG' | 'PARTIAL' | 'NONE' | 'UNKNOWN';
 

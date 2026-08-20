@@ -281,7 +281,9 @@ export async function runResearch(
     throw new Error('idempotencyKey is required.');
   }
   const inputSource: LeadResearchInputSource =
-    params.inputSource === 'business_provided' ? 'business_provided' : 'manual';
+    params.inputSource === 'business_provided' || params.inputSource === 'system_assembled'
+      ? params.inputSource
+      : 'manual';
 
   const existing = await findByIdempotencyKey(params.idempotencyKey);
   if (existing) return existing;

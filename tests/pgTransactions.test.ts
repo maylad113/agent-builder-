@@ -302,6 +302,24 @@ pgDescribe('PostgreSQL transaction integrity (real PG)', () => {
     }
   });
 
+  it('concurrent analyze on PG produces exactly one research report', async () => {
+    const { createProspect } = await import('../src/server/orchestration/prospects');
+    const { analyzeProspect } = await import('../src/server/orchestration/prospectAnalysis');
+    const prospect = await createProspect({ businessName: 'PG Analyze Co', instagramHandle: 'pganalyzeco' });
+    const [a, b] = await Promise.all([analyzeProspect(prospect.id), analyzeProspect(prospect.id)]);
+    expect(a.report.id).toBe(b.report.id);
+    expect(a.report.inputSource).toBe('system_assembled');
+    expect(a.report.idempotencyKey.startsWith(`analyze:${prospect.id}:`)).toBe(true);
+    const reports = await state.db.leadResearchReports.filter((r: any) => r.prospectId === prospect.id);
+    expect(reports.length).toBe(1);
+    // Honest fallback persisted (no LLM in test env), JSON report round-trips.
+    expect(reports[0].llmModel).toBe('fallback');
+    expect(typeof reports[0].report).toBe('object');
+    // Prospect untouched.
+    const after = await state.db.prospects.find((p: any) => p.id === prospect.id);
+    expect(after.status).toBe('NEW');
+  });
+
   it('lead research run persists on PG with JSON report round-trip + idempotency', async () => {
     const { runResearch, listResearchForProspect } = await import('../src/server/orchestration/leadResearch');
     const now = new Date().toISOString();

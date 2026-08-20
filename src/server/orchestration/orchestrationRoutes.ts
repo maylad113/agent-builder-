@@ -29,6 +29,7 @@ import {
   listResultsForRun
 } from './discoveryRuns';
 import { acceptDiscoveryResult } from './discoveryAcceptance';
+import { analyzeProspect } from './prospectAnalysis';
 import { rateLimit, RATE_LIMITS } from '../security';
 
 /**
@@ -152,7 +153,19 @@ orchestrationRouter.post('/discovery-results/:id/accept', rateLimit({ ...RATE_LI
 // Lead research (evidence/extraction layer — owner-gated; never a decision)
 // ---------------------------------------------------------------------------
 
-orchestrationRouter.post('/prospects/:id/research', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+// Prospect analyze (Task 9): thin composition over runResearch with
+// content-hash idempotency. 201 first creation, 200 identical replay.
+// Client-supplied tenant/prospect ids are ignored; path id wins.
+orchestrationRouter.post('/prospects/:id/analyze', rateLimit({ ...RATE_LIMITS.generate, prefix: 'analyze' }), requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const outcome = await analyzeProspect(String(req.params.id), { inputText: req.body?.inputText });
+    res.status(outcome.created ? 201 : 200).json(outcome);
+  } catch (e: any) {
+    replyError(res, e);
+  }
+}));
+
+orchestrationRouter.post('/prospects/:id/research', rateLimit({ ...RATE_LIMITS.generate, prefix: 'research' }), requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
   try {
     const report = await runResearch(String(req.params.id), {
       idempotencyKey: req.body?.idempotencyKey,
