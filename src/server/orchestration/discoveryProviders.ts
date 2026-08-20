@@ -2,6 +2,7 @@ import {
   DiscoveryCandidateInput,
   NormalizedDiscoveryCandidate
 } from '../../types';
+import { googlePlacesProvider } from './discoveryProvidersGoogle';
 
 /**
  * Lead Discovery provider abstraction (Phase C / Task 4).
@@ -40,6 +41,14 @@ export interface DiscoveryProviderResult {
 export interface LeadDiscoveryProvider {
   readonly type: string;
   readonly label: string;
+  /** When true the orchestration layer requires input.query before calling search. */
+  readonly requiresQuery?: boolean;
+  /**
+   * Source-retention bound in days (e.g. Google's 30-day non-ID content cache
+   * limit). When set, runDiscovery stamps sourceExpiresAt on each result and
+   * the acceptance bridge refuses expired results. Undefined = no bound.
+   */
+  readonly retentionDays?: number;
   isConfigured(): boolean;
   /** Never throws; failures are returned as { error } with empty candidates. */
   search(input: DiscoveryProviderInput): Promise<DiscoveryProviderResult>;
@@ -94,10 +103,15 @@ function normalizeLocation(location: string): string {
 
 /**
  * Deterministic in-run identity key. Strongest signal wins:
- * instagram handle > domain > phone ≥7 digits > normalized name+location.
- * Name-only is NEVER a key (ambiguous names stay separate per audit).
+ * provider result id (pid:) > instagram handle > domain > phone ≥7 digits >
+ * normalized name+location. Name-only is NEVER a key (ambiguous names stay
+ * separate per audit). pid: is set only by trusted adapters — untrusted
+ * manual input cannot forge it.
  */
 export function computeDedupeKey(c: NormalizedDiscoveryCandidate): string | undefined {
+  if (c.providerResultId && /^[A-Za-z0-9_-]{1,128}$/.test(c.providerResultId)) {
+    return `pid:${c.providerResultId}`;
+  }
   const ig = normalizeInstagramHandle(c.instagramHandle || '');
   if (ig) return `ig:${ig}`;
   const dom = normalizeDomain(c.website || '');
@@ -134,6 +148,37 @@ export function normalizeCandidate(input: unknown): NormalizedDiscoveryCandidate
   return out;
 }
 
+/** Validate a provider result id (trusted-adapter input only). */
+export function validateProviderResultId(id: unknown): string | undefined {
+  if (typeof id !== 'string') return undefined;
+  return /^[A-Za-z0-9_-]{1,128}$/.test(id) ? id : undefined;
+}
+
+/**
+ * Shared in-run dedupe over normalized candidates: first-seen wins on the
+ * strongest identity key; candidates without a key are always kept. Used by
+ * every provider adapter so dedupe semantics are identical.
+ */
+export function dedupeNormalized(candidates: NormalizedDiscoveryCandidate[]): {
+  candidates: NormalizedDiscoveryCandidate[];
+  duplicateCount: number;
+} {
+  const seen = new Set<string>();
+  const kept: NormalizedDiscoveryCandidate[] = [];
+  let duplicateCount = 0;
+  for (const c of candidates) {
+    if (c.dedupeKey) {
+      if (seen.has(c.dedupeKey)) {
+        duplicateCount++;
+        continue;
+      }
+      seen.add(c.dedupeKey);
+    }
+    kept.push(c);
+  }
+  return { candidates: kept, duplicateCount };
+}
+
 // ---------------------------------------------------------------------------
 // Providers
 // ---------------------------------------------------------------------------
@@ -153,24 +198,16 @@ class ManualListProvider implements LeadDiscoveryProvider {
       return { candidates: [], invalidCount: 0, duplicateCount: 0, error: 'candidates array is required.' };
     }
     let invalidCount = 0;
-    let duplicateCount = 0;
-    const seen = new Set<string>();
-    const candidates: NormalizedDiscoveryCandidate[] = [];
+    const normalizedAll: NormalizedDiscoveryCandidate[] = [];
     for (const raw of input.candidates) {
       const normalized = normalizeCandidate(raw);
       if (!normalized) {
         invalidCount++;
         continue;
       }
-      if (normalized.dedupeKey) {
-        if (seen.has(normalized.dedupeKey)) {
-          duplicateCount++;
-          continue;
-        }
-        seen.add(normalized.dedupeKey);
-      }
-      candidates.push(normalized);
+      normalizedAll.push(normalized);
     }
+    const { candidates, duplicateCount } = dedupeNormalized(normalizedAll);
     return { candidates, invalidCount, duplicateCount };
   }
 }
@@ -179,7 +216,8 @@ export const manualListProvider = new ManualListProvider();
 
 /** Closed static registry — unknown ids are rejected, never resolved to code. */
 const DISCOVERY_PROVIDERS: Record<string, LeadDiscoveryProvider> = Object.freeze({
-  manual_list: manualListProvider
+  manual_list: manualListProvider,
+  google_places: googlePlacesProvider
 });
 
 export function registeredProviderTypes(): string[] {

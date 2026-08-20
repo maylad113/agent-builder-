@@ -90,7 +90,7 @@ describe('provider registry', () => {
   it('resolves the registered manual_list provider (default when none given)', () => {
     const p = resolveDiscoveryProvider();
     expect(p.type).toBe('manual_list');
-    expect(registeredProviderTypes()).toEqual(['manual_list']);
+    expect(registeredProviderTypes()).toContain('manual_list');
     expect(resolveDiscoveryProvider('manual_list').type).toBe('manual_list');
   });
   it('rejects unknown providers safely', () => {

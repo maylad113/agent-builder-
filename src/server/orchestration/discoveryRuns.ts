@@ -64,6 +64,9 @@ export async function runDiscovery(params: RunDiscoveryParams): Promise<Discover
 
   const provider = resolveDiscoveryProvider(params.provider); // throws on unknown id
   if (!provider.isConfigured()) throw new Error(`Discovery provider not configured: ${provider.type}`);
+  if (provider.requiresQuery && !(typeof params.query === 'string' && params.query.trim())) {
+    throw new Error(`query is required for provider: ${provider.type}`);
+  }
 
   const existing = await findRunByIdempotencyKey(params.idempotencyKey);
   if (existing) return existing;
@@ -103,14 +106,21 @@ export async function runDiscovery(params: RunDiscoveryParams): Promise<Discover
       run.resultCount = out.candidates.length;
       run.duplicateCount = out.duplicateCount;
       run.invalidCount = out.invalidCount;
+      // Retention bound (e.g. Google's 30-day non-ID content limit): results
+      // carry a source expiry and the acceptance bridge refuses expired ones,
+      // so retention-restricted content cannot flow into a durable prospect.
+      const sourceExpiresAt = provider.retentionDays
+        ? new Date(new Date(startedAt).getTime() + provider.retentionDays * 86_400_000).toISOString()
+        : undefined;
       results = out.candidates.map(c => ({
         id: genId('dsr'),
         runId: run.id,
         sourceProvider: provider.type,
         sourceUrl: c.sourceUrl,
-        sourceType: 'manual' as const,
+        sourceType: (provider.type === 'manual_list' ? 'manual' : 'api') as 'manual' | 'api',
         raw: {
           businessName: c.businessName,
+          ...(c.providerResultId ? { providerResultId: c.providerResultId } : {}),
           ...(c.location ? { location: c.location } : {}),
           ...(c.phone ? { phone: c.phone } : {}),
           ...(c.website ? { website: c.website } : {}),
@@ -120,6 +130,7 @@ export async function runDiscovery(params: RunDiscoveryParams): Promise<Discover
         },
         normalized: c,
         verification: 'UNVERIFIED' as const,
+        ...(sourceExpiresAt ? { sourceExpiresAt } : {}),
         createdAt: startedAt
       }));
     }

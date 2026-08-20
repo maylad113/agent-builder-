@@ -96,6 +96,11 @@ export async function acceptDiscoveryResult(resultId: string): Promise<Acceptanc
     if (prospect) return finishLinked(existing, prospect, false, false);
   }
   if (existing.dismissedAt) throw new Error('Discovery result is dismissed and not eligible for acceptance.');
+  if (existing.sourceExpiresAt && existing.sourceExpiresAt <= new Date().toISOString()) {
+    // Retention-restricted source content (e.g. Google non-ID Places data)
+    // must not flow into a durable prospect after its retention window.
+    throw new Error('Discovery result source data has expired and is not eligible for acceptance.');
+  }
   if (!existing.normalized?.businessName) throw new Error('Discovery result has no usable business identity.');
 
   try {

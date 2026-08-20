@@ -846,8 +846,10 @@ export interface NormalizedDiscoveryCandidate {
   instagramHandle?: string;
   notes?: string;
   sourceUrl?: string;
-  /** Deterministic in-run identity key (ig: / dom: / tel: / nl: prefixes) or absent when unsafe. */
+  /** Deterministic in-run identity key (pid: / ig: / dom: / tel: / nl: prefixes) or absent when unsafe. */
   dedupeKey?: string;
+  /** Stable provider result id (e.g. Google place id). Set only by trusted adapters, never by manual input. */
+  providerResultId?: string;
 }
 
 export type DiscoveryRunStatus = 'COMPLETED' | 'FAILED';
@@ -874,12 +876,14 @@ export interface DiscoveryResult {
   prospectId?: string;
   sourceProvider: string;
   sourceUrl?: string;
-  sourceType: 'manual';
-  /** Bounded copy of the untrusted input candidate (never executed). */
+  sourceType: 'manual' | 'api';
+  /** Bounded copy of the mapped candidate fields (never a raw provider response). */
   raw?: Record<string, unknown>;
   normalized: NormalizedDiscoveryCandidate;
   /** Discovery can never produce VERIFIED facts — research owns verification. */
   verification: 'UNVERIFIED';
+  /** Retention bound for provider-restricted content (e.g. Google non-ID data); acceptance refused after this. */
+  sourceExpiresAt?: string;
   dismissedAt?: string;
   createdAt: string;
 }

@@ -271,6 +271,37 @@ pgDescribe('PostgreSQL transaction integrity (real PG)', () => {
     expect(stored.prospectId).toBe(linked[0].id);
   });
 
+  it('google-typed discovery result persists on PG with retention expiry + pid provenance', async () => {
+    process.env.GOOGLE_PLACES_API_KEY = 'pg-fake-key';
+    const { vi } = await import('vitest');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      places: [{
+        id: 'pgPlaceId1',
+        displayName: { text: 'PG Google Biz' },
+        formattedAddress: '1 PG Way',
+        websiteUri: 'https://pgbiz.example'
+      }]
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })));
+    try {
+      const { runDiscovery, listResultsForRun } = await import('../src/server/orchestration/discoveryRuns');
+      const { acceptDiscoveryResult } = await import('../src/server/orchestration/discoveryAcceptance');
+      const run = await runDiscovery({ idempotencyKey: 'pgtx-google-1', provider: 'google_places', query: 'repair shops' });
+      expect(run.status).toBe('COMPLETED');
+      const [r] = await listResultsForRun(run.id);
+      expect(r.sourceProvider).toBe('google_places');
+      expect(r.sourceType).toBe('api');
+      expect(r.sourceExpiresAt).toBeTruthy();
+      expect(r.normalized.providerResultId).toBe('pgPlaceId1');
+      expect(r.normalized.dedupeKey).toBe('pid:pgPlaceId1');
+      // Expired source data cannot be accepted on PG either.
+      await state.db.discoveryResults.update({ ...r, sourceExpiresAt: new Date(Date.now() - 1000).toISOString() });
+      await expect(acceptDiscoveryResult(r.id)).rejects.toThrow(/expired/i);
+    } finally {
+      vi.unstubAllGlobals();
+      delete process.env.GOOGLE_PLACES_API_KEY;
+    }
+  });
+
   it('lead research run persists on PG with JSON report round-trip + idempotency', async () => {
     const { runResearch, listResearchForProspect } = await import('../src/server/orchestration/leadResearch');
     const now = new Date().toISOString();

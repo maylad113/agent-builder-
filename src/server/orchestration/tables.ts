@@ -2,10 +2,10 @@
  * Orchestration table DDL (single source of truth) + self-heal init.
  *
  * The migration files (migrations/016_orchestration.sql,
- * 017_lead_research.sql, 018_discovery.sql, 019_discovery_acceptance.sql
- * for SQLite; migrations/pg/017_orchestration.sql, pg/018_lead_research.sql,
- * pg/019_discovery.sql, pg/020_discovery_acceptance.sql for PostgreSQL)
- * embed the same statements; this
+ * 017_lead_research.sql, 018_discovery.sql, 019_discovery_acceptance.sql,
+ * 020_discovery_source_expiry.sql for SQLite; migrations/pg/017_orchestration.sql,
+ * pg/018_lead_research.sql, pg/019_discovery.sql, pg/020_discovery_acceptance.sql,
+ * pg/021_discovery_source_expiry.sql for PostgreSQL) embed the same statements; this
  * module's init function is the idempotent fallback the
  * database bootstrap calls so fresh/existing databases of either dialect get
  * the tables even if migration numbering races (same pattern as
@@ -165,6 +165,7 @@ CREATE TABLE IF NOT EXISTS discovery_results (
   raw             TEXT,
   normalized      TEXT NOT NULL,
   verification    TEXT NOT NULL DEFAULT 'UNVERIFIED',
+  source_expires_at TEXT,
   dismissed_at    TEXT,
   created_at      TEXT NOT NULL
 );
@@ -181,7 +182,8 @@ export async function initOrchestrationTables(client: InitClient): Promise<void>
   // created before the migration existed).
   if (client.dialect === 'postgres') {
     await client.execMany(
-      'ALTER TABLE prospects ADD COLUMN IF NOT EXISTS discovery_result_id TEXT REFERENCES discovery_results(id)'
+      'ALTER TABLE prospects ADD COLUMN IF NOT EXISTS discovery_result_id TEXT REFERENCES discovery_results(id);\n' +
+      'ALTER TABLE discovery_results ADD COLUMN IF NOT EXISTS source_expires_at TEXT;'
     );
   } else {
     const cols = await client.query("SELECT name FROM pragma_table_info('prospects')");
@@ -189,6 +191,10 @@ export async function initOrchestrationTables(client: InitClient): Promise<void>
       await client.execMany(
         'ALTER TABLE prospects ADD COLUMN discovery_result_id TEXT REFERENCES discovery_results(id)'
       );
+    }
+    const dcols = await client.query("SELECT name FROM pragma_table_info('discovery_results')");
+    if (!dcols.rows.some((c: any) => c.name === 'source_expires_at')) {
+      await client.execMany('ALTER TABLE discovery_results ADD COLUMN source_expires_at TEXT');
     }
   }
 }
