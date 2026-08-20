@@ -207,7 +207,7 @@ orchestrationRouter.post('/prospects/:id/design', rateLimit({ ...RATE_LIMITS.gen
   }
 }));
 
-orchestrationRouter.post('/prospects/:id/designs', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+orchestrationRouter.post('/prospects/:id/designs', rateLimit({ ...RATE_LIMITS.generate, prefix: 'design-create' }), requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
   try {
     const prospect = await getProspect(String(req.params.id));
     if (!prospect) return res.status(404).json({ error: 'Not found.' });
@@ -240,7 +240,7 @@ orchestrationRouter.get('/designs/:id', requireAuth, requireRole('PLATFORM_OWNER
 }));
 
 /** HUMAN approval only. Guarded: validation problem summary is client-safe. */
-orchestrationRouter.post('/designs/:id/approve', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+orchestrationRouter.post('/designs/:id/approve', rateLimit({ ...RATE_LIMITS.generate, prefix: 'design-approve' }), requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
   try {
     const design = await getDesign(String(req.params.id));
     if (!design) return res.status(404).json({ error: 'Not found.' });
@@ -262,7 +262,7 @@ orchestrationRouter.post('/designs/:id/approve', requireAuth, requireRole('PLATF
 }));
 
 /** Submit to the factory. Idempotent on body.idempotencyKey. */
-orchestrationRouter.post('/designs/:id/submit', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+orchestrationRouter.post('/designs/:id/submit', rateLimit({ ...RATE_LIMITS.generate, prefix: 'design-submit' }), requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
   try {
     const idempotencyKey = req.body?.idempotencyKey;
     if (!idempotencyKey || typeof idempotencyKey !== 'string' || idempotencyKey.length > 200) {

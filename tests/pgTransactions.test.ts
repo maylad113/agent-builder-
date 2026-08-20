@@ -347,6 +347,54 @@ pgDescribe('PostgreSQL transaction integrity (real PG)', () => {
     expect(validateDesignConfiguration(d.configuration)).toEqual([]);
   });
 
+  it('concurrent submission of the same approved design on PG yields exactly one job + one agent', async () => {
+    const { createProspect } = await import('../src/server/orchestration/prospects');
+    const { createDesign } = await import('../src/server/orchestration/design');
+    const { submitDesignToFactory } = await import('../src/server/orchestration/factorySubmitter');
+    const prospect = await createProspect({ businessName: 'PG Submit Race Co' });
+    const design = await createDesign(prospect, {
+      title: 'Race',
+      problemStatement: 'p',
+      proposedSolution: 's',
+      configuration: {
+        business: { name: 'PG Submit Race Co', type: 'local_business' },
+        agent: {
+          name: 'Race Assistant',
+          systemPrompt: 'You are the Race assistant.',
+          structuredConfig: {
+            personality: { tone: 'friendly', behavior: 'service', language: 'en' },
+            goals: [], allowedActions: [], restrictedActions: [], escalationRules: [],
+            bookingRules: '', orderRules: '', refundRules: '',
+            toolsEnabled: []
+          }
+        },
+        scenarios: [{ id: 'sc-1', name: 'S1', userMessage: 'hi', dimension: 'factual_knowledge', severity: 'warning' }]
+      }
+    });
+    design.status = 'APPROVED';
+    await state.db.designProposals.update(design);
+
+    // Two truly concurrent submissions (same process; PG pool gives each its
+    // own connection — UNIQUE(idempotency_key) is the database backstop).
+    const [a, b] = await Promise.all([
+      submitDesignToFactory(design.id, 'pgtx-submit-race-1'),
+      submitDesignToFactory(design.id, 'pgtx-submit-race-1')
+    ]);
+    expect(a.id).toBe(b.id);
+    const jobs = await state.db.factoryJobs.filter((j: any) => j.designProposalId === design.id);
+    expect(jobs.length).toBe(1);
+    const stored = await state.db.factoryJobs.find((j: any) => j.id === a.id);
+    expect(['COMPLETED', 'DEAD_LETTERED', 'FAILED']).toContain(stored.status);
+    if (stored.status === 'COMPLETED') {
+      const agents = await state.db.agents.filter((x: any) => x.id === stored.agentId);
+      expect(agents.length).toBe(1);
+      const deliveries = await state.db.deliveries.filter((d: any) => d.factoryJobId === stored.id);
+      expect(deliveries.length).toBe(1);
+    }
+    const storedDesign = await state.db.designProposals.find((d: any) => d.id === design.id);
+    expect(storedDesign.status).toBe('SUBMITTED');
+  });
+
   it('lead research run persists on PG with JSON report round-trip + idempotency', async () => {
     const { runResearch, listResearchForProspect } = await import('../src/server/orchestration/leadResearch');
     const now = new Date().toISOString();
