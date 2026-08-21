@@ -223,6 +223,37 @@ describe('designer LLM path (fake provider, untrusted output)', () => {
     expect(out.design.generatorModel).toBe('fallback'); // rejected → fallback
   });
 
+  it('fabricated business facts pass validation but never outrank analysis provenance (readiness gate + provenance preserved)', async () => {
+    const { prospect, report } = await analyzedProspect('Fabricate Co', 'fabricateco');
+    const invented = validDesignerInput();
+    invented.configuration.business = {
+      ...invented.configuration.business,
+      services: [{ name: 'Helicopter rides', price: 999, durationMinutes: 60 }],
+      hours: [{ day: 'monday', isOpen: true, openTime: '08:00', closeTime: '22:00' }],
+      policies: { cancellation: 'No refunds ever.' }
+    };
+    const out = await generateDesignProposal(prospect.id, { llm: fakeLlm(JSON.stringify(invented)) as any });
+    // Structurally valid → stored; but verification stays with the analysis
+    // layer (source report provenance) and factory gates remain authoritative.
+    expect(typeof out.design.configuration).toBe('object');
+    expect(out.design.sourceReportId).toBe(report.id);
+    expect(out.design.status).toBe('DRAFT');
+    const compat = (await import('../src/server/orchestration/readinessCompat')).checkFactoryReadinessCompatibility(out.design.configuration);
+    expect(compat.gaps.every(g => typeof g.code === 'string')).toBe(true);
+  });
+
+  it('unsupported enums (channel/tone/language/scenario) never persist', async () => {
+    const { prospect } = await analyzedProspect('Enum Co', 'enumco');
+    const bad = validDesignerInput({ channels: ['carrier_pigeon'] });
+    bad.configuration.agent.structuredConfig.personality.tone = 'sinister';
+    bad.configuration.agent.structuredConfig.personality.language = 'xx';
+    bad.configuration.scenarios = [{ id: 's', name: 'n', userMessage: 'm', dimension: 'mindreading', severity: 'warning' }];
+    const out = await generateDesignProposal(prospect.id, { llm: fakeLlm(JSON.stringify(bad)) as any });
+    expect(out.design.generatorModel).toBe('fallback'); // invalid → fallback
+    const sc: any = out.design.configuration!.agent.structuredConfig;
+    expect(['professional', 'friendly', 'casual', 'concise', 'luxury', 'energetic']).toContain(sc.personality.tone);
+  });
+
   it('prompt-injection in analysis stays data; no network; no secret leakage', async () => {
     const fetchSpy = vi.fn(async (..._a: any[]) => { throw new Error('no network'); });
     vi.stubGlobal('fetch', fetchSpy);
@@ -244,6 +275,28 @@ describe('designer LLM path (fake provider, untrusted output)', () => {
 // ---------------------------------------------------------------------------
 // Lifecycle boundaries
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Optional REAL provider integration (explicitly gated; skipped honestly)
+// ---------------------------------------------------------------------------
+
+// Runs ONLY when DESIGNER_LLM_TEST=gemini AND GEMINI_API_KEY are explicitly
+// set together. Never requires a credential; skipped honestly otherwise.
+const REAL_LLM = process.env.DESIGNER_LLM_TEST === 'gemini' && !!process.env.GEMINI_API_KEY;
+(REAL_LLM ? describe : describe.skip)('REAL LLM designer integration [GATED]', () => {
+  it('real provider executes (generatorModel ≠ fallback) and produces a validated DRAFT with provenance', async () => {
+    const { prospect, report } = await analyzedProspect('Real LLM Cuts', 'realllm');
+    const out = await generateDesignProposal(prospect.id);
+    expect(out.design.generatorModel).not.toBe('fallback');
+    expect(out.design.generatorModel).toBeTruthy();
+    expect(out.design.status).toBe('DRAFT');
+    expect(out.design.sourceReportId).toBe(report.id);
+    expect(out.design.generationKey).toMatch(/^design:/);
+    expect(validateDesignConfiguration(out.design.configuration)).toEqual([]);
+    expect((await db.factoryJobs.toJSON()).length).toBe(0);
+    expect((await db.agents.toJSON()).length).toBe(0);
+  }, 120000);
+});
 
 describe('designer lifecycle boundaries', () => {
   it('generates DRAFT only: no approval, no submit, no factory, no agents', async () => {
