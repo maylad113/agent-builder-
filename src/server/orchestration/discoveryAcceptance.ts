@@ -105,14 +105,19 @@ export async function acceptDiscoveryResult(resultId: string): Promise<Acceptanc
 
   try {
     return await db.client.transaction(async () => {
-      // Re-read inside the transaction: a concurrent acceptance may have
-      // committed the link since the pre-check.
+      // Lock the result row first (PG row lock; SQLite strips FOR UPDATE and
+      // the per-connection mutex serializes whole transactions). This
+      // serializes accept vs dismiss so exactly one decision wins.
+      await db.client.query('SELECT id FROM discovery_results WHERE id = ? FOR UPDATE', [resultId]);
+      // Re-read inside the transaction: a concurrent acceptance/dismissal may
+      // have committed since the pre-check.
       const current = await readResult(resultId);
       if (!current) throw new Error('Discovery result not found.');
       if (current.prospectId) {
         const prospect = await getProspect(current.prospectId);
         if (prospect) return finishLinked(current, prospect, false, false);
       }
+      if (current.dismissedAt) throw new Error('Discovery result is dismissed and not eligible for acceptance.');
 
       const matches = await findIdentityMatches(current.normalized);
       if (matches.length > 1) {
@@ -164,4 +169,48 @@ export async function acceptDiscoveryResult(resultId: string): Promise<Acceptanc
     }
     throw e;
   }
+}
+
+/**
+ * Dismiss a discovery result (Phase C / Task 21) — the reject half of the
+ * triage loop. Mirrors acceptance as a DATA transition only: it never
+ * modifies the candidate payload, never accepts, and never triggers research,
+ * scoring, analysis, design, factory, outreach, or any downstream workflow.
+ *
+ * Semantics:
+ *  - Idempotent: re-dismissing returns the existing dismissed state unchanged
+ *    (no second telemetry event).
+ *  - A result already linked to a prospect is a real pipeline entity — its
+ *    outcome is owned downstream, so dismissal is refused.
+ *  - Concurrency with acceptance resolves honestly: the flag write and the
+ *    acceptance re-read both run inside their own transactions (SQLite mutex
+ *    serializes; PG binds the tx client), so exactly one decision wins and
+ *    the loser's follow-up re-check sees the winner's committed state.
+ */
+export async function dismissDiscoveryResult(resultId: string): Promise<DiscoveryResult> {
+  if (!resultId || typeof resultId !== 'string') throw new Error('discovery result id is required.');
+
+  return db.client.transaction(async () => {
+    // Same row-lock convention as acceptance (FOR UPDATE on PG; the SQLite
+    // mutex serializes the whole transaction) — accept vs dismiss serializes
+    // on this row, so exactly one decision wins.
+    await db.client.query('SELECT id FROM discovery_results WHERE id = ? FOR UPDATE', [resultId]);
+    const current = await readResult(resultId);
+    if (!current) throw new Error('Discovery result not found.');
+    if (current.dismissedAt) return current; // idempotent replay
+    if (current.prospectId) {
+      throw new Error('Discovery result is linked to a prospect and cannot be dismissed.');
+    }
+    const dismissed: DiscoveryResult = {
+      ...current,
+      dismissedAt: new Date().toISOString()
+    };
+    await db.discoveryResults.update(dismissed);
+    await recordOrchestrationEvent({
+      eventType: 'DISCOVERY_DISMISSED',
+      summary: 'Discovery result dismissed',
+      metadata: { discoveryRunId: current.runId, discoveryResultId: current.id }
+    });
+    return dismissed;
+  });
 }

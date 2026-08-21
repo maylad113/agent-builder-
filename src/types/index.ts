@@ -592,6 +592,7 @@ export type TelemetryEventType =
   | 'DISCOVERY_FAILED'
 // Discovery acceptance (data/lifecycle transition only — never automation).
   | 'DISCOVERY_ACCEPTED'
+  | 'DISCOVERY_DISMISSED'
 // Prospect analyze (thin composition over research — never a decision).
   | 'PROSPECT_ANALYZE_RUN'
   | 'PROSPECT_ANALYZE_COMPLETED'

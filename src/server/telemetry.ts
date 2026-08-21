@@ -117,6 +117,7 @@ export async function recordOrchestrationEvent(params: {
     | 'DISCOVERY_COMPLETED'
     | 'DISCOVERY_FAILED'
     | 'DISCOVERY_ACCEPTED'
+    | 'DISCOVERY_DISMISSED'
     | 'PROSPECT_ANALYZE_RUN'
     | 'PROSPECT_ANALYZE_COMPLETED'
     | 'PROSPECT_ANALYZE_FAILED'
@@ -135,6 +136,7 @@ export async function recordOrchestrationEvent(params: {
     acceptanceId?: string;
     researchReportId?: string;
     discoveryRunId?: string;
+    discoveryResultId?: string;
     step?: string;
   };
   summary?: string;

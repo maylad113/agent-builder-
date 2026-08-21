@@ -271,6 +271,68 @@ pgDescribe('PostgreSQL transaction integrity (real PG)', () => {
     expect(stored.prospectId).toBe(linked[0].id);
   });
 
+  it('discovery dismissal on PG: persists, replays idempotently, and blocks acceptance', async () => {
+    const { runDiscovery, listResultsForRun } = await import('../src/server/orchestration/discoveryRuns');
+    const { acceptDiscoveryResult, dismissDiscoveryResult } = await import('../src/server/orchestration/discoveryAcceptance');
+    const run = await runDiscovery({
+      idempotencyKey: 'pgtx-dismiss-1',
+      candidates: [{ businessName: 'PG Reject Cuts', instagramHandle: 'pgrejectcuts' }]
+    });
+    const resultId = (await listResultsForRun(run.id))[0].id;
+    const first = await dismissDiscoveryResult(resultId);
+    expect(first.dismissedAt).toBeTruthy();
+    const replay = await dismissDiscoveryResult(resultId);
+    expect(replay.dismissedAt).toBe(first.dismissedAt); // idempotent replay
+    const stored = await state.db.discoveryResults.find((r: any) => r.id === resultId);
+    expect(stored.dismissedAt).toBe(first.dismissedAt);
+    expect(stored.prospectId).toBeFalsy();
+    // Accept-after-dismiss is refused on PG too (guard reads the real flag).
+    await expect(acceptDiscoveryResult(resultId)).rejects.toThrow(/dismissed/i);
+  });
+
+  it('concurrent dismiss-vs-accept on PG resolves to exactly one winner (row lock)', async () => {
+    const { runDiscovery, listResultsForRun } = await import('../src/server/orchestration/discoveryRuns');
+    const { acceptDiscoveryResult, dismissDiscoveryResult } = await import('../src/server/orchestration/discoveryAcceptance');
+    const run = await runDiscovery({
+      idempotencyKey: 'pgtx-dismiss-race-1',
+      candidates: [{ businessName: 'PG Race Decision', instagramHandle: 'pgracedecision' }]
+    });
+    const resultId = (await listResultsForRun(run.id))[0].id;
+    // Truly concurrent (separate pool clients in parallel txs): the FOR UPDATE
+    // row lock serializes the two decisions; the loser re-reads and refuses.
+    const outcomes = await Promise.allSettled([
+      acceptDiscoveryResult(resultId),
+      dismissDiscoveryResult(resultId)
+    ]);
+    const accepted = outcomes[0].status === 'fulfilled';
+    const dismissed = outcomes[1].status === 'fulfilled';
+    const stored = await state.db.discoveryResults.find((r: any) => r.id === resultId);
+    // Exactly one decision won — the row is never BOTH linked and dismissed.
+    if (accepted) {
+      expect(stored.prospectId).toBeTruthy();
+      expect(stored.dismissedAt).toBeFalsy();
+      expect(dismissed).toBe(false);
+      expect((outcomes[1] as PromiseRejectedResult).reason.message).toMatch(/linked/i);
+    } else {
+      expect(stored.dismissedAt).toBeTruthy();
+      expect(stored.prospectId).toBeFalsy();
+      expect(dismissed).toBe(true);
+      expect((outcomes[0] as PromiseRejectedResult).reason.message).toMatch(/dismissed/i);
+    }
+    // A follow-up decision still sees the winner's committed state.
+    const retry = await Promise.allSettled([
+      acceptDiscoveryResult(resultId),
+      dismissDiscoveryResult(resultId)
+    ]);
+    if (accepted) {
+      expect(retry[0].status).toBe('fulfilled'); // accept replays idempotently
+      expect(retry[1].status).toBe('rejected');  // dismiss stays refused
+    } else {
+      expect(retry[0].status).toBe('rejected');  // accept stays refused
+      expect(retry[1].status).toBe('fulfilled'); // dismiss replays idempotently
+    }
+  });
+
   it('google-typed discovery result persists on PG with retention expiry + pid provenance', async () => {
     process.env.GOOGLE_PLACES_API_KEY = 'pg-fake-key';
     const { vi } = await import('vitest');

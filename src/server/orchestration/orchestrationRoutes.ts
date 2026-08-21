@@ -28,7 +28,7 @@ import {
   getDiscoveryRun,
   listResultsForRun
 } from './discoveryRuns';
-import { acceptDiscoveryResult } from './discoveryAcceptance';
+import { acceptDiscoveryResult, dismissDiscoveryResult } from './discoveryAcceptance';
 import { analyzeProspect } from './prospectAnalysis';
 import { generateDesignProposal } from './prospectDesigner';
 import { checkFactoryReadinessCompatibility } from './readinessCompat';
@@ -146,6 +146,19 @@ orchestrationRouter.post('/discovery-results/:id/accept', rateLimit({ ...RATE_LI
       created: outcome.created,
       associated: outcome.associated
     });
+  } catch (e: any) {
+    replyError(res, e);
+  }
+}));
+
+// Dismissal bridge: the reject half of the triage decision (Task 21). Same
+// envelope as acceptance — owner-gated, rate-limited, path id is the only
+// scope authority (client-supplied tenant/prospect ids are ignored). The
+// handler performs no research/scoring/factory/outreach side effects.
+orchestrationRouter.post('/discovery-results/:id/dismiss', rateLimit({ ...RATE_LIMITS.generate, prefix: 'discovery-dismiss' }), requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const result = await dismissDiscoveryResult(String(req.params.id));
+    res.status(200).json({ result });
   } catch (e: any) {
     replyError(res, e);
   }
