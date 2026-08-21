@@ -39,18 +39,23 @@ const platformAgent = request.agent(app);
  *  only enforces presence — both shapes share the same validator). */
 function minimalConfig(): any {
   return {
-    business: { name: 'FB Salon', type: 'salon' },
+    business: {
+      name: 'FB Salon', type: 'salon',
+      services: [{ name: 'Cut', price: 20, durationMinutes: 30 }],
+      policies: { cancellation: 'Cancel 2h early.' }
+    },
     agent: {
       name: 'FB Salon Assistant',
       systemPrompt: 'You are the FB Salon assistant.',
       structuredConfig: {
         personality: { tone: 'friendly', behavior: 'service', language: 'en' },
-        goals: [], allowedActions: [], restrictedActions: [], escalationRules: [],
+        goals: [], allowedActions: ['get_business_information'], restrictedActions: [], escalationRules: [],
         bookingRules: '', orderRules: '', refundRules: '',
-        toolsEnabled: []
+        toolsEnabled: ['get_business_information']
       }
     },
-    scenarios: [{ id: 'sc-1', name: 'S1', userMessage: 'hi', dimension: 'factual_knowledge', severity: 'warning' }]
+    scenarios: [{ id: 'sc-1', name: 'S1', userMessage: 'hi', dimension: 'factual_knowledge', severity: 'warning' }],
+    knowledge: [{ title: 'FAQ', content: 'Open 9-5.' }]
   };
 }
 

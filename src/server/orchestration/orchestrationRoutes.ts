@@ -31,6 +31,7 @@ import {
 import { acceptDiscoveryResult } from './discoveryAcceptance';
 import { analyzeProspect } from './prospectAnalysis';
 import { generateDesignProposal } from './prospectDesigner';
+import { checkFactoryReadinessCompatibility } from './readinessCompat';
 import { rateLimit, RATE_LIMITS } from '../security';
 
 /**
@@ -255,7 +256,11 @@ orchestrationRouter.post('/designs/:id/approve', rateLimit({ ...RATE_LIMITS.gene
       }
     }
     const updated = await approveDesign(prospect, design);
-    res.json(updated);
+    // ADVISORY only: approval is never blocked by compatibility gaps (the
+    // owner may intend manual enrichment). Submission re-checks and refuses
+    // to start a guaranteed-doomed Factory job.
+    const compat = checkFactoryReadinessCompatibility(updated.configuration);
+    res.json({ ...updated, compatibilityGaps: compat.gaps });
   } catch (e: any) {
     replyError(res, e);
   }
@@ -271,6 +276,10 @@ orchestrationRouter.post('/designs/:id/submit', rateLimit({ ...RATE_LIMITS.gener
     const job = await submitDesignToFactory(String(req.params.id), idempotencyKey);
     res.status(200).json(job);
   } catch (e: any) {
+    // Readiness-compatibility rejections carry structured, client-safe gaps.
+    if (Array.isArray(e?.readinessGaps)) {
+      return res.status(400).json({ error: e.message, gaps: e.readinessGaps });
+    }
     replyError(res, e);
   }
 }));

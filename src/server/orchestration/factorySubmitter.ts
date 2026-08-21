@@ -1,6 +1,7 @@
 import { db } from '../db';
 import { FactoryJob, DesignProposal, Prospect, KnowledgeChunk, FactoryJobStatus } from '../../types';
 import { getDesign, validateDesignConfiguration, markDesignSubmitted } from './design';
+import { checkFactoryReadinessCompatibility, summarizeCompatibilityGaps } from './readinessCompat';
 import { getProspect, setProspectStatus } from './prospects';
 import {
   createJob,
@@ -59,6 +60,17 @@ export async function submitDesignToFactory(designId: string, idempotencyKey: st
   const problems = validateDesignConfiguration(design.configuration);
   if (problems.length > 0) {
     throw new Error(`Design configuration is invalid: ${problems.join(' ')}`);
+  }
+
+  // Pre-flight: refuse to start a Factory job that the ACTIVATING readiness
+  // gate is guaranteed to reject. The Factory gate remains authoritative and
+  // re-checks everything; this only prevents a guaranteed-doomed job. The
+  // design/configuration is NOT modified — the human owns any revision.
+  const compat = checkFactoryReadinessCompatibility(design.configuration);
+  if (!compat.compatible) {
+    const err: any = new Error(`Design configuration is not factory-ready: ${summarizeCompatibilityGaps(compat.gaps)}`);
+    err.readinessGaps = compat.gaps;
+    throw err;
   }
 
   let job: FactoryJob;

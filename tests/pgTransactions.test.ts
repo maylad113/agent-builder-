@@ -357,18 +357,23 @@ pgDescribe('PostgreSQL transaction integrity (real PG)', () => {
       problemStatement: 'p',
       proposedSolution: 's',
       configuration: {
-        business: { name: 'PG Submit Race Co', type: 'local_business' },
+        business: {
+          name: 'PG Submit Race Co', type: 'local_business',
+          services: [{ name: 'Race Service', price: 10, durationMinutes: 30 }],
+          policies: { cancellation: 'Cancel anytime.' }
+        },
         agent: {
           name: 'Race Assistant',
           systemPrompt: 'You are the Race assistant.',
           structuredConfig: {
             personality: { tone: 'friendly', behavior: 'service', language: 'en' },
-            goals: [], allowedActions: [], restrictedActions: [], escalationRules: [],
+            goals: [], allowedActions: ['get_business_information'], restrictedActions: [], escalationRules: [],
             bookingRules: '', orderRules: '', refundRules: '',
-            toolsEnabled: []
+            toolsEnabled: ['get_business_information']
           }
         },
-        scenarios: [{ id: 'sc-1', name: 'S1', userMessage: 'hi', dimension: 'factual_knowledge', severity: 'warning' }]
+        scenarios: [{ id: 'sc-1', name: 'S1', userMessage: 'hi', dimension: 'factual_knowledge', severity: 'warning' }],
+        knowledge: [{ title: 'FAQ', content: 'Open 9-5.' }]
       }
     });
     design.status = 'APPROVED';

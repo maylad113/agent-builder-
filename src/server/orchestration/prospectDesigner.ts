@@ -95,6 +95,25 @@ export function validateDesignerOutput(input: any): string[] {
   problems.push(...configProblems);
   const config = input.configuration as DesignConfiguration | undefined;
   if (config && typeof config === 'object' && configProblems.length === 0) {
+    // Business structure bounds (services/hours/policies are untrusted data).
+    const biz: any = config.business;
+    if (biz?.services !== undefined) {
+      if (!Array.isArray(biz.services) || biz.services.length > MAX_ARRAY) {
+        problems.push('business.services must be a bounded array.');
+      } else {
+        for (const s of biz.services) {
+          if (!s || typeof s !== 'object' || typeof s.name !== 'string' || !s.name.trim() || String(s.name).length > MAX_TITLE) {
+            problems.push('each service needs a bounded name.'); break;
+          }
+          if (s.price !== undefined && !Number.isFinite(Number(s.price))) { problems.push('service price must be numeric.'); break; }
+          if (s.durationMinutes !== undefined && !Number.isFinite(Number(s.durationMinutes))) { problems.push('service duration must be numeric.'); break; }
+        }
+      }
+    }
+    if (biz?.hours !== undefined && !Array.isArray(biz.hours)) problems.push('business.hours must be an array.');
+    if (biz?.policies !== undefined && (typeof biz.policies !== 'object' || biz.policies === null)) {
+      problems.push('business.policies must be an object.');
+    }
     const sc = config.agent?.structuredConfig;
     if (sc && typeof sc === 'object') {
       const p = sc.personality || ({} as any);
@@ -106,6 +125,11 @@ export function validateDesignerOutput(input: any): string[] {
       } else {
         for (const t of sc.toolsEnabled) {
           if (!TOOL_ALLOWLIST.has(t)) problems.push(`unknown tool: ${String(t).slice(0, 64)}.`);
+        }
+      }
+      if (Array.isArray(sc.allowedActions)) {
+        for (const a of sc.allowedActions) {
+          if (!TOOL_ALLOWLIST.has(a)) problems.push(`unknown allowed action: ${String(a).slice(0, 64)}.`);
         }
       }
     }
@@ -197,7 +221,9 @@ function buildFallbackInput(prospect: Prospect, report: LeadResearchReport): any
         structuredConfig: {
           personality: { tone: 'friendly' as const, behavior: 'service' as const, language: 'en' as const },
           goals,
-          allowedActions: [],
+          // allowedActions mirror ONLY the tools this design actually selected
+          // (never the whole catalog, never an unrelated permission set).
+          allowedActions: [...tools],
           restrictedActions: [],
           escalationRules: ['Escalate to a human when unsure or when the customer asks for a person.'],
           bookingRules: bookingFit ? 'Confirm details with the customer before booking.' : '',
@@ -239,6 +265,11 @@ function designerPrompt(): string {
     'RULES:',
     '- Only use tools from this allow-list in structuredConfig.toolsEnabled:',
     `  ${ALL_TOOL_NAMES.join(', ')}`,
+    '- structuredConfig.allowedActions must mirror ONLY the tools you enabled (same names).',
+    '- configuration.business may include services[] ({name,price,durationMinutes}),',
+    '  hours[] ({day,isOpen,openTime,closeTime}) and policies.cancellation ONLY when the',
+    '  analysis explicitly supports them. If unknown, OMIT the field entirely —',
+    '  NEVER invent services, hours, prices, or policies.',
     '- Only use channels from: web_chat, instagram, sms, voice.',
     '- Base every claim on the analysis. UNKNOWN means unknown — never invent facts.',
     '- scenarios must be non-empty with id, name, userMessage, dimension, severity.',

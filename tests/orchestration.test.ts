@@ -388,7 +388,7 @@ describe('gateway authority + DEAD_LETTERED', () => {
     expect(deliveries.length).toBe(0);
   }, 60000);
 
-  it('a design that passes evaluation but fails the ACTIVATION readiness gate dead-letters (12, 25)', async () => {
+  it('a design missing knowledge is rejected at the compatibility gate (never reaches the factory) (12, 25)', async () => {
     const p = await platformAgent.post('/api/orchestration/prospects').send({ businessName: 'Readiness Failing Gym' });
     ids.badGateProspectId = p.body.id;
     const d = await platformAgent.post(`/api/orchestration/prospects/${p.body.id}/designs`).send({
@@ -396,26 +396,21 @@ describe('gateway authority + DEAD_LETTERED', () => {
       configuration: fullConfig({ knowledge: undefined as any, scenarios: [PASSING_SCENARIO, PASSING_SCENARIO_2] })
     });
     ids.badGateDesignId = d.body.id;
-    // no knowledge chunks at all → readiness 'Knowledge base' must fail
+    // Strip knowledge (simulate operator edit) → guaranteed runtime failure,
+    // now caught by the Task 16 compatibility check at submission.
     const cfg = d.body.configuration;
     delete cfg.knowledge;
-    // update design directly through module-level db (simulate operator edit)
     const designRow = await db.designProposals.find((x: any) => x.id === d.body.id);
     designRow.configuration = cfg;
     await db.designProposals.update(designRow);
-
+    const jobsBefore = (await db.factoryJobs.toJSON()).length;
     await platformAgent.post(`/api/orchestration/designs/${d.body.id}/approve`);
     const submit = await platformAgent.post(`/api/orchestration/designs/${d.body.id}/submit`).send({
       idempotencyKey: 'bad-gate-1'
     });
-    expect(submit.status).toBe(200);
-    expect(submit.body.status).toBe('DEAD_LETTERED');
-    expect(submit.body.currentStep).toBe('ACTIVATING');
-    const agent = await db.agents.find((a: any) => a.businessId === submit.body.businessId);
-    expect(agent.status).not.toBe('ACTIVE');
-    // No delivery without activation.
-    const deliveries = await db.deliveries.filter((x: any) => x.businessId === submit.body.businessId);
-    expect(deliveries.length).toBe(0);
+    expect(submit.status).toBe(400);
+    expect(JSON.stringify(submit.body)).toContain('Knowledge base');
+    expect((await db.factoryJobs.toJSON()).length).toBe(jobsBefore);
   }, 60000);
 
   it('module-level failure path is deterministic: recordFailure → FAILED terminal (24)', async () => {
