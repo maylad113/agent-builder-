@@ -2,6 +2,8 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } 
 import os from 'os';
 import path from 'path';
 import fs from 'fs';
+import express from 'express';
+import request from 'supertest';
 
 /**
  * Google Places usage/quota protection tests (Phase C / Task 20).
@@ -17,6 +19,7 @@ process.env.SESSION_SECRET = 'test-discovery-quota-secret';
 delete process.env.GEMINI_API_KEY;
 process.env.GOOGLE_PLACES_API_KEY = 'test-quota-key-fake';
 
+const { router } = await import('../src/server/routes');
 const { db } = await import('../src/server/db');
 const { runDiscovery, listResultsForRun } = await import('../src/server/orchestration/discoveryRuns');
 const findRunByKey = async (key: string) => db.discoveryRuns.find(r => r.idempotencyKey === key);
@@ -163,5 +166,80 @@ describe('security', () => {
     const manual = await runDiscovery({ idempotencyKey: 'q-14', candidates: [{ businessName: 'Still Works', instagramHandle: 'sw1' }] });
     expect(manual.status).toBe('COMPLETED');
     expect((await listResultsForRun(manual.id)).length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Usage observability route (Phase C / Task 22) — READ-ONLY operator surface
+// over the existing counter. No writes, no tenant scope, no quota changes.
+// ---------------------------------------------------------------------------
+
+describe('places usage observability (Task 22)', () => {
+  const app = (() => {
+    const a = express();
+    a.use(express.json());
+    a.use('/api', router);
+    return a;
+  })();
+  const platformAgent = request.agent(app);
+  const tenantAgent = request.agent(app);
+
+  it('owner reads the current global usage: shape + honest null limit', async () => {
+    await platformAgent.post('/api/auth/login').send({ email: 'owner@agentfactory.io', password: 'Password123!' });
+    await runDiscovery({ idempotencyKey: 'q-obs-1', provider: 'google_places', query: 'barbers' });
+    const res = await platformAgent.get('/api/orchestration/discovery/usage');
+    expect(res.status).toBe(200);
+    expect(res.body.date).toBe(placesUsageBucket()); // current UTC day
+    expect(res.body.used).toBe(1);
+    expect(res.body.limit).toBeNull(); // unconfigured limit is honest, not 0/Infinity
+    expect(res.body.remaining).toBeNull();
+    expect(JSON.stringify(res.body)).not.toContain(KEY); // no key material
+  });
+
+  it('reports limit and remaining when a cap is configured', async () => {
+    process.env.GOOGLE_PLACES_DAILY_LIMIT = '3';
+    await platformAgent.post('/api/auth/login').send({ email: 'owner@agentfactory.io', password: 'Password123!' });
+    await runDiscovery({ idempotencyKey: 'q-obs-2', provider: 'google_places', query: 'salons' });
+    const res = await platformAgent.get('/api/orchestration/discovery/usage');
+    expect(res.status).toBe(200);
+    expect(res.body.used).toBe(1);
+    expect(res.body.limit).toBe(3);
+    expect(res.body.remaining).toBe(2);
+  });
+
+  it('an invalid cap config reads as no limit (matches enforcement semantics)', async () => {
+    process.env.GOOGLE_PLACES_DAILY_LIMIT = 'banana';
+    await platformAgent.post('/api/auth/login').send({ email: 'owner@agentfactory.io', password: 'Password123!' });
+    const res = await platformAgent.get('/api/orchestration/discovery/usage');
+    expect(res.status).toBe(200);
+    expect(res.body.limit).toBeNull();
+    expect(res.body.remaining).toBeNull();
+  });
+
+  it('unauthenticated 401; tenant-role 403', async () => {
+    expect((await request(app).get('/api/orchestration/discovery/usage')).status).toBe(401);
+    await tenantAgent.post('/api/auth/login').send({ email: 'tony@tonysbarber.com', password: 'Password123!' });
+    expect((await tenantAgent.get('/api/orchestration/discovery/usage')).status).toBe(403);
+  });
+
+  it('client-supplied tenant/query parameters cannot alter the global scope', async () => {
+    await platformAgent.post('/api/auth/login').send({ email: 'owner@agentfactory.io', password: 'Password123!' });
+    await runDiscovery({ idempotencyKey: 'q-obs-3', provider: 'google_places', query: 'gyms' });
+    const res = await platformAgent.get('/api/orchestration/discovery/usage?businessId=biz-tonys-barber&date=2000-01-01&used=999');
+    expect(res.status).toBe(200);
+    expect(res.body.date).toBe(placesUsageBucket()); // forged date ignored
+    expect(res.body.used).toBe(1); // forged count ignored
+    expect(JSON.stringify(res.body)).not.toMatch(/biz-tonys-barber/);
+  });
+
+  it('the read performs NO writes (counter row unchanged, no telemetry)', async () => {
+    await platformAgent.post('/api/auth/login').send({ email: 'owner@agentfactory.io', password: 'Password123!' });
+    await runDiscovery({ idempotencyKey: 'q-obs-4', provider: 'google_places', query: 'clinics' });
+    const before = await db.placesUsage.toJSON();
+    const telemetryBefore = (await db.telemetry.toJSON()).length;
+    const res = await platformAgent.get('/api/orchestration/discovery/usage');
+    expect(res.status).toBe(200);
+    expect(await db.placesUsage.toJSON()).toEqual(before);
+    expect((await db.telemetry.toJSON()).length).toBe(telemetryBefore);
   });
 });

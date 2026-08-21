@@ -32,6 +32,7 @@ import { acceptDiscoveryResult, dismissDiscoveryResult } from './discoveryAccept
 import { analyzeProspect } from './prospectAnalysis';
 import { generateDesignProposal } from './prospectDesigner';
 import { checkFactoryReadinessCompatibility } from './readinessCompat';
+import { placesUsageBucket, readPlacesUsage, placesDailyLimit } from './discoveryQuota';
 import { rateLimit, RATE_LIMITS } from '../security';
 
 /**
@@ -162,6 +163,23 @@ orchestrationRouter.post('/discovery-results/:id/dismiss', rateLimit({ ...RATE_L
   } catch (e: any) {
     replyError(res, e);
   }
+}));
+
+// Places usage observability (Task 22): READ-ONLY operator view of the
+// existing global UTC-day counter + configured cap. Performs no writes,
+// records no telemetry, and is deliberately NOT tenant-scoped — the counter
+// belongs to the single shared Google project (it is an operator guard,
+// never billing). Client-supplied tenant/date/count parameters are ignored.
+orchestrationRouter.get('/discovery/usage', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (_req: Request, res: Response) => {
+  const bucket = placesUsageBucket();
+  const usage = await readPlacesUsage(bucket);
+  const limit = placesDailyLimit();
+  res.json({
+    date: bucket,
+    used: usage.calls,
+    limit: limit ?? null,
+    remaining: limit === undefined ? null : Math.max(0, limit - usage.calls)
+  });
 }));
 
 // ---------------------------------------------------------------------------

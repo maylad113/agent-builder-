@@ -333,6 +333,28 @@ pgDescribe('PostgreSQL transaction integrity (real PG)', () => {
     }
   });
 
+  it('places usage observability route on PG: read-only global counter + honest limit', async () => {
+    const express = (await import('express')).default;
+    const request = (await import('supertest')).default;
+    const { router } = await import('../src/server/routes');
+    const { placesUsageBucket, placesDailyLimit } = await import('../src/server/orchestration/discoveryQuota');
+    const app = express();
+    app.use(express.json());
+    app.use('/api', router);
+    const platformAgent = request.agent(app);
+    await platformAgent.post('/api/auth/login').send({ email: 'owner@agentfactory.io', password: 'Password123!' });
+    const before = await state.db.placesUsage.toJSON();
+    const res = await platformAgent.get('/api/orchestration/discovery/usage');
+    expect(res.status).toBe(200);
+    expect(res.body.date).toBe(placesUsageBucket());
+    expect(typeof res.body.used).toBe('number');
+    const limit = placesDailyLimit();
+    expect(res.body.limit).toBe(limit ?? null);
+    // Pure read: the counter table is untouched by the route.
+    expect(await state.db.placesUsage.toJSON()).toEqual(before);
+    expect((await request(app).get('/api/orchestration/discovery/usage')).status).toBe(401);
+  });
+
   it('google-typed discovery result persists on PG with retention expiry + pid provenance', async () => {
     process.env.GOOGLE_PLACES_API_KEY = 'pg-fake-key';
     const { vi } = await import('vitest');
