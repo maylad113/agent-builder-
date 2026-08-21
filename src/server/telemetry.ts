@@ -110,6 +110,7 @@ export async function recordOrchestrationEvent(params: {
     | 'FACTORY_JOB_FAILED'
     | 'AGENT_DELIVERED'
     | 'DELIVERY_ACCEPTED'
+    | 'OWNER_ACCOUNT_PROVISIONED'
     | 'LEAD_RESEARCH_RUN'
     | 'LEAD_RESEARCH_COMPLETED'
     | 'LEAD_RESEARCH_FAILED'

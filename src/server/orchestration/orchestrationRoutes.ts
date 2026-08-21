@@ -16,6 +16,7 @@ import {
 } from './design';
 import { listJobs, getJob } from './factoryJobs';
 import { listDeliveries, getDelivery, acceptDelivery, buildOnboardingArtifact } from './deliveries';
+import { provisionOwnerAccount } from './ownerProvisioning';
 import { submitDesignToFactory } from './factorySubmitter';
 import {
   runResearch,
@@ -365,6 +366,23 @@ orchestrationRouter.post('/deliveries/:id/accept', requireAuth, requireRole('PLA
       metadata: req.body?.metadata
     });
     res.status(201).json(acceptance);
+  } catch (e: any) {
+    replyError(res, e);
+  }
+}));
+
+// Owner-account provisioning at delivery (Task 23). Creates the delivered
+// business's BUSINESS_OWNER login using the existing users table + scrypt
+// hashing; the server-generated one-time password is returned ONLY on the
+// initial 201 response. Idempotent per delivery — a replay returns 200 with
+// the existing account and NO password, and never creates a second user.
+orchestrationRouter.post('/deliveries/:id/provision-owner-account', rateLimit({ ...RATE_LIMITS.generate, prefix: 'provision-owner' }), requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const result = await provisionOwnerAccount(String(req.params.id), {
+      email: req.body?.email,
+      name: req.body?.name
+    });
+    res.status(result.alreadyProvisioned ? 200 : 201).json(result);
   } catch (e: any) {
     replyError(res, e);
   }

@@ -582,6 +582,8 @@ export type TelemetryEventType =
   | 'FACTORY_JOB_FAILED'
   | 'AGENT_DELIVERED'
   | 'DELIVERY_ACCEPTED'
+  // Owner-account provisioning (ids only — NEVER the one-time password).
+  | 'OWNER_ACCOUNT_PROVISIONED'
   // Lead research (evidence/extraction layer — never carries raw LLM prompts).
   | 'LEAD_RESEARCH_RUN'
   | 'LEAD_RESEARCH_COMPLETED'

@@ -560,4 +560,55 @@ pgDescribe('PostgreSQL transaction integrity (real PG)', () => {
     const reloaded = await state.db.factoryJobs.find((j: any) => j.idempotencyKey === 'pgtx-idem-1');
     expect(reloaded.deadLettered).toBe(true);
   });
+
+  it('owner provisioning is race-safe + idempotent on PG (one account; password returned once)', async () => {
+    const { provisionOwnerAccount } = await import('../src/server/orchestration/ownerProvisioning');
+    const { verifyPassword } = await import('../src/server/passwords');
+    const now = new Date().toISOString();
+    // Real rows to satisfy the PG FKs (deliveries.prospect_id -> prospects,
+    // deliveries.business_id -> businesses).
+    await state.db.client.query(
+      `INSERT INTO businesses (id, name, type, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (id) DO NOTHING`,
+      ['biz-pgtx-prov', 'PG Provision Biz', 'cafe', now, now]
+    );
+    await state.db.prospects.push({
+      id: 'pro-pgtx-prov', businessName: 'PG Provision Biz', status: 'CONVERTED',
+      businessId: 'biz-pgtx-prov', createdAt: now, updatedAt: now
+    } as any);
+    await state.db.deliveries.push({
+      id: 'del-pgtx-prov', prospectId: 'pro-pgtx-prov', businessId: 'biz-pgtx-prov',
+      agentId: 'agent-pgtx-prov', status: 'DELIVERED', deliveryMethod: 'manual',
+      deliveryPayload: { note: 'Agent activated and ready for handover.' },
+      deliveredAt: now, createdAt: now, updatedAt: now
+    } as any);
+
+    // Concurrent provisioning races: exactly ONE account, password returned ONCE.
+    const [r1, r2] = await Promise.all([
+      provisionOwnerAccount('del-pgtx-prov', { email: 'pg-race-one@shop.co', name: 'PG Racer One' }),
+      provisionOwnerAccount('del-pgtx-prov', { email: 'pg-race-two@shop.co', name: 'PG Racer Two' })
+    ]);
+    const withPassword = [r1, r2].filter(r => r.temporaryPassword);
+    expect(withPassword.length).toBe(1);
+    expect([r1, r2].filter(r => r.alreadyProvisioned).length).toBe(1);
+    const owners = await state.db.users.filter((u: any) => u.businessId === 'biz-pgtx-prov');
+    expect(owners.length).toBe(1);
+
+    // The one-time password verifies through the existing scrypt mechanism;
+    // only the hash is stored.
+    const owner = owners[0];
+    expect(owner.passwordHash.startsWith('scrypt$')).toBe(true);
+    expect(verifyPassword(withPassword[0].temporaryPassword!, owner.passwordHash)).toBe(true);
+
+    // Replay: existing account, NO password, NO second user.
+    const replay = await provisionOwnerAccount('del-pgtx-prov', { email: 'pg-another@shop.co', name: 'Another' });
+    expect(replay.alreadyProvisioned).toBe(true);
+    expect(replay.temporaryPassword).toBeUndefined();
+    expect(replay.user.id).toBe(owner.id);
+    expect((await state.db.users.filter((u: any) => u.businessId === 'biz-pgtx-prov')).length).toBe(1);
+
+    // The password appears in NO telemetry record.
+    const telemetry = JSON.stringify(await state.db.telemetry.toJSON());
+    expect(telemetry).not.toContain(withPassword[0].temporaryPassword);
+  }, 30000);
 });
