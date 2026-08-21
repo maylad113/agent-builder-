@@ -769,6 +769,41 @@ export interface Delivery {
   updatedAt: string;
 }
 
+// ---------------------------------------------------------------------------
+// Delivery onboarding artifact (Phase C / Task 19) — deterministic, LLM-free
+// representation assembled at read time from persisted platform state.
+// ---------------------------------------------------------------------------
+
+export interface OnboardingChannel {
+  type: string;
+  /** Existing channel status (e.g. 'connected', 'not_configured'). */
+  status: string;
+  /** Configured capability statement (web_chat only) or an honest not-configured note. */
+  note?: string;
+  /** Platform-controlled embed snippet (web_chat only when connected). */
+  embedSnippet?: string;
+}
+
+export interface OnboardingArtifact {
+  deliveryId: string;
+  deliveryStatus: DeliveryStatus;
+  deliveryMethod: string;
+  deliveredAt?: string;
+  business: { id: string; name: string };
+  agent: {
+    id: string;
+    name: string;
+    status: AgentStatus;
+    /** Supported capabilities derived ONLY from persisted goals/tools (never fabricated). */
+    capabilities: string[];
+  };
+  channels: OnboardingChannel[];
+  /** Present only after the existing acceptance workflow ran. */
+  acceptance?: { acceptedBy: string; acceptedAt: string };
+  /** Deterministic owner-facing guidance (no LLM, no marketing claims). */
+  instructions: string[];
+}
+
 export interface Acceptance {
   id: string;
   /** UNIQUE — one acceptance per delivery. */

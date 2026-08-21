@@ -15,7 +15,7 @@ import {
   validateDesignConfiguration
 } from './design';
 import { listJobs, getJob } from './factoryJobs';
-import { listDeliveries, getDelivery, acceptDelivery } from './deliveries';
+import { listDeliveries, getDelivery, acceptDelivery, buildOnboardingArtifact } from './deliveries';
 import { submitDesignToFactory } from './factorySubmitter';
 import {
   runResearch,
@@ -310,6 +310,17 @@ orchestrationRouter.get('/deliveries/:id', requireAuth, requireRole('PLATFORM_OW
   const delivery = await getDelivery(String(req.params.id));
   if (!delivery) return res.status(404).json({ error: 'Not found.' });
   res.json(delivery);
+}));
+
+// Deterministic, LLM-free customer onboarding artifact (Task 19). Read-only
+// assembly from persisted state — never activates channels or contacts anyone.
+orchestrationRouter.get('/deliveries/:id/onboarding', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const artifact = await buildOnboardingArtifact(String(req.params.id));
+    res.json(artifact);
+  } catch (e: any) {
+    replyError(res, e);
+  }
 }));
 
 orchestrationRouter.post('/deliveries/:id/accept', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {

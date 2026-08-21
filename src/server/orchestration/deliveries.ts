@@ -1,5 +1,5 @@
 import { db } from '../db';
-import { Delivery, Acceptance, FactoryJob, Prospect } from '../../types';
+import { Delivery, Acceptance, FactoryJob, Prospect, OnboardingArtifact, OnboardingChannel } from '../../types';
 import { recordOrchestrationEvent } from '../telemetry';
 
 /**
@@ -60,6 +60,89 @@ export async function createDelivery(prospect: Prospect, job: FactoryJob): Promi
 
 export async function getDelivery(id: string): Promise<Delivery | undefined> {
   return db.deliveries.find(d => d.id === id);
+}
+
+// ---------------------------------------------------------------------------
+// Delivery onboarding artifact (Phase C / Task 19)
+// ---------------------------------------------------------------------------
+
+/**
+ * Assemble the deterministic, LLM-free customer onboarding artifact for a
+ * delivery. PURE READ of persisted platform state (delivery + business +
+ * agent + channels + acceptance) — repeated returns are equivalent, nothing
+ * is created or mutated, and no customer contact occurs. The embed snippet
+ * interpolates ONLY the tenant business id (the existing public widget
+ * identifier, allow-listed id-shaped) into the platform-controlled
+ * /widget.js template; other channels are honestly NOT configured with no
+ * snippet. No secrets/credentials/keys ever appear.
+ */
+export async function buildOnboardingArtifact(deliveryId: string): Promise<OnboardingArtifact> {
+  const delivery = await db.deliveries.find(d => d.id === deliveryId);
+  if (!delivery) throw new Error('Delivery not found.');
+  const business = await db.businesses.find(b => b.id === delivery.businessId);
+  const agent = await db.agents.find(a => a.id === delivery.agentId);
+  const tenantChannels = await db.channels.filter(c => c.businessId === delivery.businessId);
+  const acceptance = await db.acceptances.find(a => a.deliveryId === delivery.id);
+
+  const channels: OnboardingChannel[] = tenantChannels
+    .map(c => {
+      if (c.type === 'web_chat' && c.status === 'connected') {
+        return {
+          type: 'web_chat',
+          status: c.status,
+          note: 'Website chat widget is available.',
+          embedSnippet: `<script src="/widget.js" data-business-id="${business?.id}"></script>`
+        };
+      }
+      return {
+        type: c.type,
+        status: c.status === 'connected' ? 'connected' : (c.status || 'not_configured'),
+        note: c.status === 'connected' ? c.details : 'Not configured — no action has been taken on this channel.'
+      };
+    })
+    .sort((a, b) => a.type.localeCompare(b.type));
+
+  const web = channels.find(c => c.type === 'web_chat');
+  const notConfigured = channels.filter(c => c.status !== 'connected').map(c => c.type);
+  const capabilities = (agent?.structuredConfig?.goals || []).filter(g => typeof g === 'string' && g.trim()).slice(0, 8);
+
+  const instructions: string[] = [
+    `Your AI agent "${agent?.name}" is ${agent?.status === 'ACTIVE' ? 'live and ready to serve customers.' : `currently ${agent?.status?.toLowerCase()}.`}`,
+    `It was built for ${business?.name}. Current delivery status: ${delivery.status}.`
+  ];
+  if (agent?.structuredConfig?.escalationRules?.length) {
+    instructions.push('When the agent is unsure, it escalates to a human handoff.');
+  }
+  if (web?.embedSnippet) {
+    instructions.push('To add the website chat widget to your site, paste the embed snippet shown under the web_chat channel into your website HTML.');
+  } else {
+    instructions.push('The website chat widget is not configured yet — configure web_chat to enable customer chat on your site.');
+  }
+  if (notConfigured.length > 0) {
+    instructions.push(`Not configured yet: ${notConfigured.join(', ')}. Contact your platform operator to enable additional channels.`);
+  }
+  if (acceptance) {
+    instructions.push(`Delivery was accepted by ${acceptance.acceptedBy} on ${acceptance.acceptedAt}.`);
+  } else {
+    instructions.push('This delivery has not been accepted yet. Use the existing acceptance workflow when you are ready to confirm receipt.');
+  }
+
+  return {
+    deliveryId: delivery.id,
+    deliveryStatus: delivery.status,
+    deliveryMethod: delivery.deliveryMethod,
+    deliveredAt: delivery.deliveredAt,
+    business: { id: delivery.businessId, name: business?.name || 'Unknown business' },
+    agent: {
+      id: delivery.agentId,
+      name: agent?.name || 'Unknown agent',
+      status: agent?.status || 'DRAFT',
+      capabilities
+    },
+    channels,
+    ...(acceptance ? { acceptance: { acceptedBy: acceptance.acceptedBy, acceptedAt: acceptance.acceptedAt } } : {}),
+    instructions
+  };
 }
 
 export async function listDeliveries(): Promise<Delivery[]> {
