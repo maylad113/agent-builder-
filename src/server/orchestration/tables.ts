@@ -177,6 +177,13 @@ CREATE TABLE IF NOT EXISTS discovery_results (
 );
 CREATE INDEX IF NOT EXISTS idx_discovery_results_run ON discovery_results(run_id);
 CREATE INDEX IF NOT EXISTS idx_discovery_results_prospect ON discovery_results(prospect_id);
+
+CREATE TABLE IF NOT EXISTS places_usage (
+  id         TEXT PRIMARY KEY,
+  bucket     TEXT NOT NULL UNIQUE,
+  calls      INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
 `;
 }
 

@@ -8,6 +8,7 @@ import {
 } from './discoveryProviders';
 import { NormalizedDiscoveryCandidate } from '../../types';
 import { resolveTimeoutMs, isAbortError } from '../llmProvider';
+import { consumePlacesAttempt } from './discoveryQuota';
 
 /**
  * Google Places API (New) — Text Search discovery adapter (Phase C / Task 7).
@@ -111,9 +112,25 @@ interface AttemptResult {
   body?: string;
   error?: string;
   retryable?: boolean;
+  quotaExceeded?: boolean;
+}
+
+function isQuotaExceeded(err: any): boolean {
+  return typeof err?.message === 'string' && err.message.includes('daily usage limit');
 }
 
 async function postOnce(apiKey: string, textQuery: string): Promise<AttemptResult> {
+  // Count the real attempt (operator safety guard) INSIDE the caller's
+  // active transaction. A cap rejection before the FIRST attempt throws
+  // (rolls the whole run back — nothing was attempted). A cap rejection at a
+  // LATER attempt is returned as an honest quota error so the charged first
+  // attempt stays counted and the run records a truthful FAILED state.
+  try {
+    await consumePlacesAttempt();
+  } catch (e: any) {
+    if (isQuotaExceeded(e)) return { ok: false, error: e.message, retryable: false, quotaExceeded: true };
+    throw e;
+  }
   const controller = new AbortController();
   const ms = timeoutMs();
   const timer = setTimeout(() => controller.abort(), ms);
@@ -180,10 +197,20 @@ class GooglePlacesProvider implements LeadDiscoveryProvider {
     const textQuery = location ? `${query} ${location}` : query;
 
     let attempt = await postOnce(apiKey, textQuery);
+    if (!attempt.ok && attempt.quotaExceeded) {
+      // Cap hit before the FIRST attempt: nothing was attempted — throw so the
+      // whole run rolls back (no usage charged, no run/result persisted).
+      throw new Error(attempt.error);
+    }
     if (!attempt.ok) {
       if (attempt.retryable) {
         await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
         attempt = await postOnce(apiKey, textQuery);
+        if (!attempt.ok && attempt.quotaExceeded) {
+          // First attempt was REAL and charged; the retry hit the cap. Record
+          // an honest FAILED run (usage stays charged — the attempt happened).
+          return fail(attempt.error);
+        }
       }
       if (!attempt.ok) return fail(attempt.error);
     }

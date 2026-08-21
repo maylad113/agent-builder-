@@ -400,6 +400,35 @@ pgDescribe('PostgreSQL transaction integrity (real PG)', () => {
     expect(storedDesign.status).toBe('SUBMITTED');
   });
 
+  it('concurrent google discovery racing for the final quota unit on PG: exactly one proceeds', async () => {
+    process.env.GOOGLE_PLACES_API_KEY = 'pg-quota-key';
+    process.env.GOOGLE_PLACES_DAILY_LIMIT = '1';
+    await state.db.client.exec('DELETE FROM places_usage');
+    const { vi } = await import('vitest');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      places: [{ id: 'pgq1', displayName: { text: 'PG Quota Biz' } }]
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })));
+    try {
+      const { runDiscovery } = await import('../src/server/orchestration/discoveryRuns');
+      const { readPlacesUsage, placesUsageBucket } = await import('../src/server/orchestration/discoveryQuota');
+      const [a, b] = await Promise.allSettled([
+        runDiscovery({ idempotencyKey: 'pgq-a', provider: 'google_places', query: 'a' }),
+        runDiscovery({ idempotencyKey: 'pgq-b', provider: 'google_places', query: 'b' })
+      ]);
+      const fulfilled = [a, b].filter(r => r.status === 'fulfilled').length;
+      const rejected = [a, b].filter(r => r.status === 'rejected').length;
+      // At most one consumes the final unit; the other gets an honest rejection.
+      expect(fulfilled + rejected).toBe(2);
+      const usage = await readPlacesUsage(placesUsageBucket());
+      expect(usage.calls).toBeLessThanOrEqual(1);
+      expect(fulfilled).toBeLessThanOrEqual(1);
+    } finally {
+      vi.unstubAllGlobals();
+      delete process.env.GOOGLE_PLACES_API_KEY;
+      delete process.env.GOOGLE_PLACES_DAILY_LIMIT;
+    }
+  });
+
   it('lead research run persists on PG with JSON report round-trip + idempotency', async () => {
     const { runResearch, listResearchForProspect } = await import('../src/server/orchestration/leadResearch');
     const now = new Date().toISOString();

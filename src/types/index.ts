@@ -936,3 +936,11 @@ export interface DiscoveryResult {
   dismissedAt?: string;
   createdAt: string;
 }
+
+/** Google Places usage counter row (one per UTC-day bucket; operator guard). */
+export interface PlacesUsage {
+  id: string;
+  bucket: string;
+  calls: number;
+  updatedAt: string;
+}

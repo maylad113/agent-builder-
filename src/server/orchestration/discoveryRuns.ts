@@ -94,61 +94,60 @@ export async function runDiscovery(params: RunDiscoveryParams): Promise<Discover
 
   let results: DiscoveryResult[] = [];
   try {
-    const out = await provider.search({
-      query: params.query,
-      location: params.location,
-      candidates: params.candidates
-    });
-    if (out.error) {
-      run.status = 'FAILED';
-      run.error = out.error.slice(0, 200);
-    } else {
-      run.resultCount = out.candidates.length;
-      run.duplicateCount = out.duplicateCount;
-      run.invalidCount = out.invalidCount;
-      // Retention bound (e.g. Google's 30-day non-ID content limit): results
-      // carry a source expiry and the acceptance bridge refuses expired ones,
-      // so retention-restricted content cannot flow into a durable prospect.
-      const sourceExpiresAt = provider.retentionDays
-        ? new Date(new Date(startedAt).getTime() + provider.retentionDays * 86_400_000).toISOString()
-        : undefined;
-      results = out.candidates.map(c => ({
-        id: genId('dsr'),
-        runId: run.id,
-        sourceProvider: provider.type,
-        sourceUrl: c.sourceUrl,
-        sourceType: (provider.type === 'manual_list' ? 'manual' : 'api') as 'manual' | 'api',
-        raw: {
-          businessName: c.businessName,
-          ...(c.providerResultId ? { providerResultId: c.providerResultId } : {}),
-          ...(c.location ? { location: c.location } : {}),
-          ...(c.phone ? { phone: c.phone } : {}),
-          ...(c.website ? { website: c.website } : {}),
-          ...(c.instagramHandle ? { instagramHandle: c.instagramHandle } : {}),
-          ...(c.notes ? { notes: c.notes } : {}),
-          ...(c.sourceUrl ? { sourceUrl: c.sourceUrl } : {})
-        },
-        normalized: c,
-        verification: 'UNVERIFIED' as const,
-        ...(sourceExpiresAt ? { sourceExpiresAt } : {}),
-        createdAt: startedAt
-      }));
-    }
-  } catch (err: any) {
-    // Providers must never throw, but a defensive failure is recorded, not lost.
-    safeError('[orchestration] discovery provider threw:', err?.message || err);
-    run.status = 'FAILED';
-    run.error = 'Provider failure (see server logs).';
-  }
-
-  try {
+    // Google attempts are consumed INSIDE this same transaction (the adapter's
+    // postOnce → consumePlacesAttempt), so quota check-then-increment is
+    // atomic with the run's own persistence. A cap rejection throws here,
+    // rolling back usage + run + results together (nothing is persisted).
     await db.client.transaction(async () => {
+      const out = await provider.search({
+        query: params.query,
+        location: params.location,
+        candidates: params.candidates
+      });
+      if (out.error) {
+        run.status = 'FAILED';
+        run.error = out.error.slice(0, 200);
+      } else {
+        run.resultCount = out.candidates.length;
+        run.duplicateCount = out.duplicateCount;
+        run.invalidCount = out.invalidCount;
+        // Retention bound (e.g. Google's 30-day non-ID content limit): results
+        // carry a source expiry and the acceptance bridge refuses expired ones,
+        // so retention-restricted content cannot flow into a durable prospect.
+        const sourceExpiresAt = provider.retentionDays
+          ? new Date(new Date(startedAt).getTime() + provider.retentionDays * 86_400_000).toISOString()
+          : undefined;
+        results = out.candidates.map(c => ({
+          id: genId('dsr'),
+          runId: run.id,
+          sourceProvider: provider.type,
+          sourceUrl: c.sourceUrl,
+          sourceType: (provider.type === 'manual_list' ? 'manual' : 'api') as 'manual' | 'api',
+          raw: {
+            businessName: c.businessName,
+            ...(c.providerResultId ? { providerResultId: c.providerResultId } : {}),
+            ...(c.location ? { location: c.location } : {}),
+            ...(c.phone ? { phone: c.phone } : {}),
+            ...(c.website ? { website: c.website } : {}),
+            ...(c.instagramHandle ? { instagramHandle: c.instagramHandle } : {}),
+            ...(c.notes ? { notes: c.notes } : {}),
+            ...(c.sourceUrl ? { sourceUrl: c.sourceUrl } : {})
+          },
+          normalized: c,
+          verification: 'UNVERIFIED' as const,
+          ...(sourceExpiresAt ? { sourceExpiresAt } : {}),
+          createdAt: startedAt
+        }));
+      }
       await db.discoveryRuns.push(run);
       for (const r of results) {
         await db.discoveryResults.push(r);
       }
     });
   } catch (e: any) {
+    // Quota guard rejections are honest input errors (fail closed) — rethrow
+    // verbatim so the caller sees the real reason; nothing is persisted.
+    if (typeof e?.message === 'string' && e.message.includes('daily usage limit')) throw e;
     // UNIQUE backstop: the losing side of a concurrent run returns the winner.
     safeError('[orchestration] discovery write raced:', e?.message || e);
     const raced = await findRunByIdempotencyKey(params.idempotencyKey);

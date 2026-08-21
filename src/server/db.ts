@@ -30,7 +30,8 @@ import {
   Acceptance,
   LeadResearchReport,
   DiscoveryRun,
-  DiscoveryResult
+  DiscoveryResult,
+  PlacesUsage
 } from '../types';
 import { hashPassword } from './passwords';
 import { initEmbeddingsTable } from './embeddings';
@@ -224,6 +225,11 @@ const TABLES: Record<string, TableConfig> = {
   discoveryResults: {
     table: 'discovery_results',
     jsonColumns: ['raw', 'normalized'],
+    booleanColumns: []
+  },
+  placesUsage: {
+    table: 'places_usage',
+    jsonColumns: [],
     booleanColumns: []
   }
 };
@@ -574,6 +580,7 @@ export class AppDatabase {
   public leadResearchReports!: Collection<LeadResearchReport>;
   public discoveryRuns!: Collection<DiscoveryRun>;
   public discoveryResults!: Collection<DiscoveryResult>;
+  public placesUsage!: Collection<PlacesUsage>;
 
   constructor(opts: AppDatabaseOptions = {}) {
     // Select the driver. DATABASE_URL (postgres://...) -> PostgreSQL production
@@ -636,6 +643,7 @@ export class AppDatabase {
     this.leadResearchReports = new Collection<LeadResearchReport>(this.client, TABLES.leadResearchReports);
     this.discoveryRuns = new Collection<DiscoveryRun>(this.client, TABLES.discoveryRuns);
     this.discoveryResults = new Collection<DiscoveryResult>(this.client, TABLES.discoveryResults);
+    this.placesUsage = new Collection<PlacesUsage>(this.client, TABLES.placesUsage);
   }
 
   /** Run migrations, initialize the embeddings table, and seed demo data.
