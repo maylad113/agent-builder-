@@ -355,9 +355,11 @@ describe('public widget + tenant isolation at runtime', () => {
     expect(res.body.retrievedKnowledge).toBeUndefined();
     expect(res.body.toolCalls).toBeUndefined();
     // Only the safe customer-facing fields are present: reply, conversationId,
-    // status, and the honest agentAvailable flag (false = widget must render
-    // an error, never a fake answer). No debug diagnostics.
-    expect(Object.keys(res.body).sort()).toEqual(['agentAvailable', 'conversationId', 'reply', 'status']);
+    // status, the honest agentAvailable flag (false = widget must render
+    // an error, never a fake answer), and messageId — the opaque id of the
+    // stored reply message the widget uses as its poll cursor (Task 25; ids
+    // are non-secret, `msg-<epoch>-<suffix>` shaped). No debug diagnostics.
+    expect(Object.keys(res.body).sort()).toEqual(['agentAvailable', 'conversationId', 'messageId', 'reply', 'status']);
   });
 
   it('runtime chat with an unknown tenant still errors honestly (no cross-tenant write)', async () => {

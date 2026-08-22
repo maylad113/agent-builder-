@@ -27,6 +27,15 @@
   let conversationId = localStorage.getItem('aaf_widget_conv_' + businessId) || null;
   let isOpen = false;
 
+  // Polling state (Task 25): closes the human-handoff reply loop. The widget
+  // polls for NEW messages in its own conversation (owner/human replies) using
+  // a message-id cursor. One loop per widget instance; failures are silent and
+  // retried on the next tick; no credentials or internals are ever logged.
+  const POLL_INTERVAL_MS = 3000;
+  let lastMessageId = null;
+  let pollTimer = null;
+  const renderedMessageIds = new Set();
+
   // Inject CSS
   const style = document.createElement('style');
   style.innerHTML = `
@@ -253,6 +262,13 @@
       if (data.conversationId) {
         conversationId = data.conversationId;
         localStorage.setItem('aaf_widget_conv_' + businessId, conversationId);
+        startPolling();
+      }
+      // The POST response already carries the reply — render it directly and
+      // advance the poll cursor so polling never rediscovers it.
+      if (data.messageId) {
+        lastMessageId = data.messageId;
+        renderedMessageIds.add(data.messageId);
       }
 
       const agentMsg = document.createElement('div');
@@ -281,4 +297,55 @@
   inputEl.addEventListener('keypress', function (e) {
     if (e.key === 'Enter') sendMessage();
   });
+
+  // --- Message polling (Task 25) -------------------------------------------
+  // Renders a server message into the transcript, deduped by id.
+  function renderServerMessage(m) {
+    if (!m || !m.id || renderedMessageIds.has(m.id)) return;
+    renderedMessageIds.add(m.id);
+    const el = document.createElement('div');
+    if (m.sender === 'customer') el.className = 'aaf-msg aaf-msg-user';
+    else if (m.sender === 'system') el.className = 'aaf-msg aaf-msg-system';
+    else el.className = 'aaf-msg aaf-msg-agent'; // agent + human_agent
+    el.textContent = m.content || '';
+    messagesDiv.appendChild(el);
+  }
+
+  // One lightweight poll for messages newer than the cursor. Pure GET; a
+  // failure is retried on the next tick and never surfaced to the customer.
+  async function pollOnce() {
+    if (!conversationId) return;
+    let url = apiOrigin + '/api/runtime/conversations/' + encodeURIComponent(conversationId) +
+      '/messages?business=' + encodeURIComponent(businessId);
+    if (lastMessageId) url += '&after=' + encodeURIComponent(lastMessageId);
+    const res = await fetch(url, { method: 'GET' });
+    if (!res.ok) return;
+    const data = await res.json();
+    const msgs = (data && Array.isArray(data.messages)) ? data.messages : [];
+    let appended = false;
+    for (const m of msgs) {
+      if (!renderedMessageIds.has(m.id)) { renderServerMessage(m); appended = true; }
+    }
+    if (msgs.length > 0) lastMessageId = msgs[msgs.length - 1].id;
+    if (appended) messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  }
+
+  // Recursive setTimeout (never overlapping requests, single loop). Starts
+  // only when a conversation exists; stopping is simply not rescheduling.
+  function startPolling() {
+    if (pollTimer || !conversationId) return;
+    const tick = async () => {
+      try {
+        await pollOnce();
+      } catch (e) {
+        /* transient network failure — retried on the next tick */
+      }
+      pollTimer = setTimeout(tick, POLL_INTERVAL_MS);
+    };
+    pollTimer = setTimeout(tick, POLL_INTERVAL_MS);
+  }
+
+  // A conversation restored from a previous page load starts polling
+  // immediately (bootstrap renders the transcript on the first tick).
+  if (conversationId) startPolling();
 })();

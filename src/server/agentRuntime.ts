@@ -31,6 +31,9 @@ export interface RuntimeExecutionResult {
   status: string;
   /** false when the business has no ACTIVE agent — the widget must treat it as an error, never a fake answer. */
   agentAvailable: boolean;
+  /** Id of the stored reply message, so the widget can cursor-poll for newer
+   *  messages (owner/human replies). Absent when no reply message was stored. */
+  replyMessageId?: string;
   /**
    * Internal debug (system prompt, retrieved knowledge, raw tool results).
    * ALWAYS null for public/unauthenticated callers — the public widget must
@@ -150,8 +153,9 @@ export async function processAgentMessage(params: {
     conv.summary = `Last exchange: "${userMessage.substring(0, 30)}..." -> assistant unavailable`;
     await db.conversations.update(conv);
 
+    const unavailableMsgId = `msg-${Date.now()}-agent`;
     await db.messages.push({
-      id: `msg-${Date.now()}-agent`,
+      id: unavailableMsgId,
       conversationId: conv.id,
       sender: 'agent',
       content: AGENT_UNAVAILABLE_REPLY,
@@ -164,6 +168,7 @@ export async function processAgentMessage(params: {
       conversationId: conv.id,
       status: 'WAITING_FOR_HUMAN',
       agentAvailable: false,
+      replyMessageId: unavailableMsgId,
       debug: null
     };
   }
@@ -236,8 +241,19 @@ export async function processAgentMessage(params: {
   if (conversation.status === 'HUMAN_HANDLING') {
     const holdingReply =
       'A team member is currently handling our conversation and will reply to you shortly. Thank you for your patience.';
+    // The customer's message is still stored (so the human sees it) — the AI
+    // is paused, but the human side of the loop must not lose messages.
     await db.messages.push({
-      id: `msg-${Date.now()}-agent`,
+      id: `msg-${Date.now()}-user`,
+      conversationId: conversation.id,
+      sender: 'customer',
+      content: userMessage,
+      channel,
+      timestamp: new Date().toISOString()
+    });
+    const holdingMsgId = `msg-${Date.now()}-agent`;
+    await db.messages.push({
+      id: holdingMsgId,
       conversationId: conversation.id,
       sender: 'system',
       content: holdingReply,
@@ -251,6 +267,7 @@ export async function processAgentMessage(params: {
       conversationId: conversation.id,
       status: conversation.status,
       agentAvailable: true,
+      replyMessageId: holdingMsgId,
       debug: null
     };
   }
@@ -512,8 +529,9 @@ CRITICAL MANDATES:
   await db.conversations.update(conversation);
 
   // Store Agent Reply Message
+  const agentReplyMsgId = `msg-${Date.now()}-agent`;
   await db.messages.push({
-    id: `msg-${Date.now()}-agent`,
+    id: agentReplyMsgId,
     conversationId: conversation.id,
     sender: 'agent',
     content: finalReply,
@@ -597,6 +615,7 @@ CRITICAL MANDATES:
     conversationId: conversation.id,
     status: conversation.status,
     agentAvailable: true,
+    replyMessageId: agentReplyMsgId,
     debug
   };
 }

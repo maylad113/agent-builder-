@@ -948,6 +948,8 @@ router.post('/runtime/chat', rateLimit({ ...RATE_LIMITS.public, prefix: 'chat', 
       conversationId: result.conversationId,
       status: result.status,
       agentAvailable: result.agentAvailable,
+      // Lets the widget cursor-poll for newer messages (owner/human replies).
+      ...(result.replyMessageId ? { messageId: result.replyMessageId } : {}),
       ...(includeDebug && result.debug ? { debug: result.debug } : {})
     });
   } catch (err: any) {
@@ -964,6 +966,75 @@ router.post('/runtime/chat', rateLimit({ ...RATE_LIMITS.public, prefix: 'chat', 
     });
   }
 });
+
+// PUBLIC widget message retrieval (Task 25) — closes the human-handoff reply
+// loop. The widget polls for NEW messages in ITS OWN conversation (owner/
+// human replies, agent replies, customer-visible system notices) using a
+// message-id cursor:
+//   GET /api/runtime/conversations/:conversationId/messages?business=<id>&after=<messageId>&limit=<n>
+// Authority model (same as POST /runtime/chat): the business id + the
+// unguessable conversation id + the per-business origin allow-list. The
+// server derives the conversation->business relationship; a mismatched
+// business id, a foreign conversation, or a guessed id is a 404 (no
+// existence leak). A cursor that does not belong to the conversation can
+// never cross the boundary — the message set is filtered to the
+// conversation FIRST and an unknown anchor simply falls back to bootstrap.
+// PURE READ: no writes, no telemetry, deterministic (timestamp, id) order.
+const WIDGET_POLL_MAX_LIMIT = 100;
+const WIDGET_POLL_DEFAULT_LIMIT = 50;
+router.get('/runtime/conversations/:conversationId/messages', rateLimit({ ...RATE_LIMITS.public, prefix: 'chat-messages', keyFn: (req) => String(req.query.business ?? '') }), asyncHandler(async (req: Request, res: Response) => {
+  const tenantId = String(req.query.business || '');
+  const origin = req.headers.origin;
+  // Same origin enforcement as POST /runtime/chat (Task 24 rules preserved):
+  // production requires an allow-listed Origin; a known-bad origin is 403.
+  if (!tenantId) {
+    return res.status(400).json({ error: 'business is required.' });
+  }
+  if (process.env.NODE_ENV === 'production' && !origin) {
+    return res.status(403).json({ error: 'Origin not allowed.' });
+  }
+  const headers = await widgetCorsHeaders(tenantId, origin);
+  if (origin && !headers) {
+    return res.status(403).json({ error: 'Origin not allowed.' });
+  }
+  if (headers) {
+    for (const [k, v] of Object.entries(headers)) res.setHeader(k, String(v));
+  }
+
+  // Tenant derivation: the conversation is found ONLY within the supplied
+  // business — a foreign or guessed conversation id is a 404 with no leak.
+  const conversationId = String(req.params.conversationId || '');
+  const conversation = await db.conversations.find(c => c.id === conversationId && c.businessId === tenantId);
+  if (!conversation) {
+    return res.status(404).json({ error: 'Not found.' });
+  }
+
+  const all = await db.messages.filter(m => m.conversationId === conversation.id);
+  all.sort((a, b) => (a.timestamp === b.timestamp ? a.id.localeCompare(b.id) : a.timestamp.localeCompare(b.timestamp)));
+
+  let start = 0;
+  const after = typeof req.query.after === 'string' && req.query.after ? req.query.after : undefined;
+  if (after) {
+    const anchor = all.findIndex(m => m.id === after);
+    // Unknown/foreign anchor: fall back to bootstrap (this conversation only).
+    if (anchor >= 0) start = anchor + 1;
+  }
+  let limit = Number(req.query.limit) || WIDGET_POLL_DEFAULT_LIMIT;
+  if (!Number.isFinite(limit) || limit < 1) limit = WIDGET_POLL_DEFAULT_LIMIT;
+  limit = Math.min(limit, WIDGET_POLL_MAX_LIMIT);
+
+  const page = all.slice(start, start + limit);
+  res.json({
+    messages: page.map(m => ({
+      id: m.id,
+      sender: m.sender,
+      content: m.content,
+      timestamp: m.timestamp
+    })),
+    conversationStatus: conversation.status,
+    hasMore: start + limit < all.length
+  });
+}));
 
 // Authenticated simulator endpoint for business owners/staff testing an agent.
 // Returns the full result INCLUDING the developer-only debug block (system

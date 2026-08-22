@@ -675,4 +675,62 @@ pgDescribe('PostgreSQL transaction integrity (real PG)', () => {
     expect(normalizeWidgetOriginList(after.allowedWidgetOrigins)).toEqual(after.allowedWidgetOrigins);
     expect(deriveOriginFromWebsite('https://customer.example/about')).toBe('https://customer.example');
   }, 60000);
+
+  it('widget message retrieval on PG: cursor + ordering + tenant isolation + pure read', async () => {
+    const express = (await import('express')).default;
+    const request = (await import('supertest')).default;
+    const { router } = await import('../src/server/routes');
+    const app = express();
+    app.use(express.json());
+    app.use('/api', router);
+    const now = new Date().toISOString();
+
+    // Two tenants, one conversation each (satisfies PG FKs).
+    for (const bizId of ['biz-pgtx-poll-a', 'biz-pgtx-poll-b']) {
+      await state.db.client.query(
+        `INSERT INTO businesses (id, name, type, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (id) DO NOTHING`,
+        [bizId, 'PG Poll Biz', 'cafe', now, now]
+      );
+    }
+    await state.db.conversations.push(
+      { id: 'conv-pgtx-poll-a', businessId: 'biz-pgtx-poll-a', customerId: 'cust-pg-a', customerName: 'A', channel: 'web_chat', status: 'HUMAN_HANDLING', lastMessageAt: now, createdAt: now } as any,
+      { id: 'conv-pgtx-poll-b', businessId: 'biz-pgtx-poll-b', customerId: 'cust-pg-b', customerName: 'B', channel: 'web_chat', status: 'AI_HANDLING', lastMessageAt: now, createdAt: now } as any
+    );
+    const t = (s: number) => new Date(Date.parse(now) + s * 1000).toISOString();
+    await state.db.messages.push(
+      { id: 'msg-pgtx-a1', conversationId: 'conv-pgtx-poll-a', sender: 'customer', content: 'hello', channel: 'web_chat', timestamp: t(1) } as any,
+      { id: 'msg-pgtx-a2', conversationId: 'conv-pgtx-poll-a', sender: 'agent', content: 'hi there', channel: 'web_chat', timestamp: t(2) } as any,
+      { id: 'msg-pgtx-b1', conversationId: 'conv-pgtx-poll-b', sender: 'agent', content: 'PG-FOREIGN-CONTENT', channel: 'web_chat', timestamp: t(1) } as any
+    );
+
+    const poll = (conv: string, qs: string) => request(app).get(`/api/runtime/conversations/${conv}/messages?${qs}`);
+
+    // Bootstrap: deterministic (timestamp, id) order, minimal fields.
+    const b1 = await poll('conv-pgtx-poll-a', 'business=biz-pgtx-poll-a');
+    expect(b1.status).toBe(200);
+    expect(b1.body.messages.map((m: any) => m.id)).toEqual(['msg-pgtx-a1', 'msg-pgtx-a2']);
+    expect(Object.keys(b1.body.messages[0]).sort()).toEqual(['content', 'id', 'sender', 'timestamp']);
+
+    // Cursor: only newer messages; repeat is identical; no DB writes.
+    const before = await state.db.messages.filter((m: any) => m.conversationId === 'conv-pgtx-poll-a');
+    const c1 = await poll('conv-pgtx-poll-a', 'business=biz-pgtx-poll-a&after=msg-pgtx-a1');
+    expect(c1.body.messages.map((m: any) => m.id)).toEqual(['msg-pgtx-a2']);
+    const c2 = await poll('conv-pgtx-poll-a', 'business=biz-pgtx-poll-a&after=msg-pgtx-a1');
+    expect(c2.body).toEqual(c1.body);
+    expect(await state.db.messages.filter((m: any) => m.conversationId === 'conv-pgtx-poll-a')).toEqual(before);
+
+    // Owner reply inserted via the existing persistence layer appears on the next poll.
+    await state.db.messages.push({ id: 'msg-pgtx-a3', conversationId: 'conv-pgtx-poll-a', sender: 'human_agent', content: 'Tony here', channel: 'web_chat', timestamp: t(3) } as any);
+    const c3 = await poll('conv-pgtx-poll-a', 'business=biz-pgtx-poll-a&after=msg-pgtx-a2');
+    expect(c3.body.messages.map((m: any) => m.id)).toEqual(['msg-pgtx-a3']);
+    expect(c3.body.conversationStatus).toBe('HUMAN_HANDLING');
+
+    // Tenant isolation: foreign business id, foreign conversation, foreign cursor.
+    expect((await poll('conv-pgtx-poll-a', 'business=biz-pgtx-poll-b')).status).toBe(404);
+    expect((await poll('conv-pgtx-poll-b', 'business=biz-pgtx-poll-a')).status).toBe(404);
+    const foreignCursor = await poll('conv-pgtx-poll-a', 'business=biz-pgtx-poll-a&after=msg-pgtx-b1');
+    expect(foreignCursor.status).toBe(200);
+    expect(JSON.stringify(foreignCursor.body)).not.toContain('PG-FOREIGN-CONTENT');
+  }, 30000);
 });
