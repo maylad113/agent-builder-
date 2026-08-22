@@ -1,5 +1,11 @@
 import React, { useEffect, useState } from 'react';
-import { Prospect, DesignProposal, FactoryJob, Delivery } from '../types';
+import { Prospect, DesignProposal, FactoryJob, Delivery, OnboardingArtifact } from '../types';
+import { DeliveryHandoffPanel, ProvisionState } from './DeliveryHandoffPanel';
+import {
+  PROVISION_ENDPOINT,
+  ONBOARDING_ENDPOINT,
+  provisionResultFromResponse
+} from './deliveryHandoffLogic';
 
 /** Minimal owner UI for the orchestration MVP: prospects, designs, factory
  *  jobs, deliveries, acceptance. Self-fetching (platform-owner session). */
@@ -30,6 +36,13 @@ export const OrchestrationView: React.FC = () => {
     capabilities: '',
     configuration: ''
   });
+
+  // Task 26 — delivery handoff. Per-delivery UI state for provisioning and
+  // the read-only onboarding artifact. The one-time password lives ONLY in
+  // this React state for the currently displayed result — never in storage,
+  // never in a URL, and cleared when the operator closes the display.
+  const [provisionStates, setProvisionStates] = useState<Record<string, ProvisionState>>({});
+  const [onboardingByDelivery, setOnboardingByDelivery] = useState<Record<string, OnboardingArtifact | null>>({});
 
   const load = async () => {
     const [pRes, jRes, dRes] = await Promise.all([
@@ -144,6 +157,58 @@ export const OrchestrationView: React.FC = () => {
       acceptanceMethod: 'manual'
     });
     await load();
+  };
+
+  // Provision the delivered customer's BUSINESS_OWNER account via the
+  // EXISTING Task 23 route. The server's one-time password (201 only) is held
+  // in state until the operator closes the display; a replay (200) carries
+  // none and is rendered as "already provisioned".
+  const provisionOwner = async (deliveryId: string, input: { email: string; name: string }) => {
+    setProvisionStates(s => ({ ...s, [deliveryId]: { status: 'busy' } }));
+    try {
+      const res = await fetch(PROVISION_ENDPOINT(deliveryId), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: input.email, name: input.name })
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setProvisionStates(s => ({ ...s, [deliveryId]: { status: 'error', error: body.error || `Request failed (${res.status})` } }));
+        return;
+      }
+      setProvisionStates(s => ({ ...s, [deliveryId]: { status: 'provisioned', result: provisionResultFromResponse(res.status, body) } }));
+      await load(); // refresh so deliveryPayload.ownerAccountUserId is reflected
+    } catch {
+      setProvisionStates(s => ({ ...s, [deliveryId]: { status: 'error', error: 'Network error.' } }));
+    }
+  };
+
+  // Closing the display clears the one-time password from state entirely.
+  const closeProvisionResult = (deliveryId: string) => {
+    setProvisionStates(s => ({ ...s, [deliveryId]: { status: 'idle' } }));
+  };
+
+  // Lazy-load the read-only onboarding artifact (existing Task 19/24 route).
+  const toggleOnboarding = async (deliveryId: string) => {
+    if (deliveryId in onboardingByDelivery) {
+      setOnboardingByDelivery(s => ({ ...s, [deliveryId]: null }));
+      return;
+    }
+    try {
+      const res = await fetch(ONBOARDING_ENDPOINT(deliveryId));
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(body.error || `Request failed (${res.status})`);
+        return;
+      }
+      setOnboardingByDelivery(s => ({ ...s, [deliveryId]: body }));
+    } catch {
+      setError('Network error.');
+    }
+  };
+
+  const closeOnboarding = (deliveryId: string) => {
+    setOnboardingByDelivery(s => ({ ...s, [deliveryId]: null }));
   };
 
   const selected = prospects.find(p => p.id === selectedId) || null;
@@ -320,6 +385,16 @@ export const OrchestrationView: React.FC = () => {
                       Mark Accepted
                     </button>
                   )}
+                  <DeliveryHandoffPanel
+                    delivery={d}
+                    provisionState={provisionStates[d.id] || { status: 'idle' }}
+                    onProvision={input => provisionOwner(d.id, input)}
+                    onProvisionClose={() => closeProvisionResult(d.id)}
+                    onboarding={onboardingByDelivery[d.id] ?? null}
+                    onboardingOpen={!!onboardingByDelivery[d.id]}
+                    onOnboardingToggle={() => toggleOnboarding(d.id)}
+                    onOnboardingClose={() => closeOnboarding(d.id)}
+                  />
                 </div>
               ))}
               {deliveries.length === 0 && <div className="text-sm text-slate-400">No deliveries yet.</div>}
