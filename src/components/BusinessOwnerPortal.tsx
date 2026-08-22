@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
-import { Business, Agent, Appointment, Product, Order, ChannelConfig, IntegrationConfig } from '../types';
+import React, { useEffect, useState } from 'react';
+import { Business, Agent, Appointment, Product, Order, ChannelConfig, IntegrationConfig, KnowledgeChunk } from '../types';
+import { BusinessProfileEditor, KnowledgeManager } from './OwnerSelfService';
 import { AgentBuilder } from './AgentBuilder';
 import { AgentSimulator } from './AgentSimulator';
 import { WebsiteChatWidgetDemo } from './WebsiteChatWidgetDemo';
@@ -59,6 +60,59 @@ export const BusinessOwnerPortal: React.FC<BusinessOwnerPortalProps> = ({
   const [newKbTitle, setNewKbTitle] = useState('');
   const [newKbType, setNewKbType] = useState<'faq' | 'document' | 'service_catalog' | 'policy'>('faq');
   const [newKbContent, setNewKbContent] = useState('');
+
+  // Task 31 — owner self-service: business edit + knowledge list/delete.
+  const [bizSaving, setBizSaving] = useState(false);
+  const [bizSaveError, setBizSaveError] = useState<string | null>(null);
+  const [bizSaved, setBizSaved] = useState(false);
+  const [kbItems, setKbItems] = useState<KnowledgeChunk[]>([]);
+  const [kbDeletingId, setKbDeletingId] = useState<string | null>(null);
+
+  // Load knowledge when the knowledge tab opens (self-loading, matches the
+  // existing portal conventions; the route is tenant-scoped).
+  useEffect(() => {
+    if (activeTab !== 'knowledge') return;
+    fetch(`/api/knowledge?businessId=${business.id}`)
+      .then(r => (r.ok ? r.json() : []))
+      .then(data => setKbItems(Array.isArray(data) ? data : (data.items || [])))
+      .catch(() => setKbItems([]));
+  }, [activeTab, business.id]);
+
+  const handleSaveBusiness = async (updates: any) => {
+    setBizSaving(true);
+    setBizSaveError(null);
+    setBizSaved(false);
+    try {
+      const res = await fetch(`/api/businesses/${business.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setBizSaveError(data.error || `Save failed (${res.status})`);
+        return;
+      }
+      setBizSaved(true);
+      onRefreshData();
+    } catch {
+      setBizSaveError('Network error.');
+    } finally {
+      setBizSaving(false);
+    }
+  };
+
+  const handleDeleteKnowledge = async (id: string) => {
+    setKbDeletingId(id);
+    try {
+      const res = await fetch(`/api/knowledge/${id}`, { method: 'DELETE' });
+      if (res.ok) {
+        setKbItems(items => items.filter(k => k.id !== id));
+      }
+    } finally {
+      setKbDeletingId(null);
+    }
+  };
 
   // New Appointment State
   const [newAppCustName, setNewAppCustName] = useState('');
@@ -250,6 +304,13 @@ export const BusinessOwnerPortal: React.FC<BusinessOwnerPortalProps> = ({
       {/* Tab: Overview */}
       {activeTab === 'overview' && (
         <div className="space-y-6">
+          <BusinessProfileEditor
+            business={business}
+            saving={bizSaving}
+            saveError={bizSaveError}
+            saved={bizSaved}
+            onSave={handleSaveBusiness}
+          />
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
             <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
               <div className="flex items-center justify-between text-slate-500 text-xs font-semibold">
@@ -407,6 +468,11 @@ export const BusinessOwnerPortal: React.FC<BusinessOwnerPortalProps> = ({
               Add to Knowledge Base
             </button>
           </div>
+          <KnowledgeManager
+            items={kbItems}
+            deletingId={kbDeletingId}
+            onDelete={handleDeleteKnowledge}
+          />
         </div>
       )}
 

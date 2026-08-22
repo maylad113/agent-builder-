@@ -788,4 +788,51 @@ pgDescribe('PostgreSQL transaction integrity (real PG)', () => {
     // At least one of the two retries settled without throwing.
     expect([r1, r2].some(r => r.status === 'fulfilled')).toBe(true);
   }, 60000);
+
+  it('knowledge deletion on PG: tenant-scoped, removes chunk + embedding, retrieval stops', async () => {
+    const express = (await import('express')).default;
+    const request = (await import('supertest')).default;
+    const { router } = await import('../src/server/routes');
+    const { retrieveRelevant } = await import('../src/server/embeddings');
+    const { hashPassword } = await import('../src/server/passwords');
+    const app = express();
+    app.use(express.json());
+    app.use('/api', router);
+    const now = new Date().toISOString();
+
+    // Two tenants + owners.
+    for (const [bizId, email] of [['biz-pgtx-kb-a', 'kba@x.co'], ['biz-pgtx-kb-b', 'kbb@x.co']] as const) {
+      await state.db.client.query(
+        `INSERT INTO businesses (id, name, type, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING`,
+        [bizId, 'KB Biz', 'cafe', now, now]
+      );
+      await state.db.users.push({
+        id: `usr-${bizId}`, email, passwordHash: hashPassword('Password123!'), name: 'KB',
+        role: 'BUSINESS_OWNER', businessId: bizId, createdAt: now, updatedAt: now
+      } as any);
+    }
+    const ownerA = request.agent(app);
+    const ownerB = request.agent(app);
+    await ownerA.post('/api/auth/login').send({ email: 'kba@x.co', password: 'Password123!' });
+    await ownerB.post('/api/auth/login').send({ email: 'kbb@x.co', password: 'Password123!' });
+
+    // Owner A adds knowledge; owner B cannot delete it.
+    const add = await ownerA.post('/api/knowledge').send({ businessId: 'biz-pgtx-kb-a', title: 'Secret Menu', type: 'faq', content: 'The secret is 42.' });
+    expect(add.status).toBe(201);
+    const chunkId = add.body.id;
+    const cross = await ownerB.delete(`/api/knowledge/${chunkId}`);
+    expect([403, 404]).toContain(cross.status);
+    expect(await state.db.knowledgeChunks.find((k: any) => k.id === chunkId)).toBeDefined();
+
+    // Owner A deletes it: chunk + embedding gone, retrieval stops.
+    const del = await ownerA.delete(`/api/knowledge/${chunkId}`);
+    expect(del.status).toBe(200);
+    expect(await state.db.knowledgeChunks.find((k: any) => k.id === chunkId)).toBeUndefined();
+    const emb = await state.db.client.query('SELECT chunk_id FROM knowledge_embeddings WHERE chunk_id = ?', [chunkId]);
+    expect(emb.rows.length).toBe(0);
+    const results = await retrieveRelevant('biz-pgtx-kb-a', 'secret menu');
+    expect(results.some((r: any) => r.chunk.id === chunkId)).toBe(false);
+    // Repeated delete is safe.
+    expect((await ownerA.delete(`/api/knowledge/${chunkId}`)).status).toBe(404);
+  }, 30000);
 });
