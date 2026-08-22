@@ -733,4 +733,59 @@ pgDescribe('PostgreSQL transaction integrity (real PG)', () => {
     expect(foreignCursor.status).toBe(200);
     expect(JSON.stringify(foreignCursor.body)).not.toContain('PG-FOREIGN-CONTENT');
   }, 30000);
+
+  it('factory job retry on PG: concurrent retries yield ONE continuation, no duplicate tenant/agent', async () => {
+    const { createProspect } = await import('../src/server/orchestration/prospects');
+    const { createDesign, approveDesign } = await import('../src/server/orchestration/design');
+    const { retryFactoryJob, maxFactoryAttempts } = await import('../src/server/orchestration/factorySubmitter');
+    const { createJob, advanceJob, recordFailure } = await import('../src/server/orchestration/factoryJobs');
+    const now = new Date().toISOString();
+
+    const prospect = await createProspect({ businessName: 'PG Retry Co.', website: 'https://pgretry.example' });
+    const design = await createDesign(prospect, {
+      title: 'PG retry design', problemStatement: 'P', proposedSolution: 'S',
+      configuration: {
+        business: { name: 'PG Retry Co.', type: 'barbershop', description: 'Real barbershop.', services: [{ name: 'Cut', price: 20, durationMinutes: 30 }] },
+        agent: {
+          name: 'PG AI', systemPrompt: 'You are the receptionist.',
+          structuredConfig: {
+            personality: { tone: 'friendly', behavior: 'service', language: 'en' },
+            goals: ['Answer FAQs'], allowedActions: ['get_business_information', 'transfer_to_human'],
+            restrictedActions: [], escalationRules: ['Customer asks for human'],
+            bookingRules: '', orderRules: '', refundRules: '',
+            toolsEnabled: ['get_business_information', 'transfer_to_human']
+          }
+        },
+        scenarios: [
+          { id: 's1', name: 'escalates', userMessage: 'hello', dimension: 'handoff', severity: 'critical', expectHandoff: true },
+          { id: 's2', name: 'no fab', userMessage: 'hello', dimension: 'hallucination', severity: 'critical', mustNotContain: ['zz-fab'] }
+        ],
+        knowledge: [{ title: 'FAQ', content: 'Open 9-5.' }]
+      }
+    } as any);
+    await approveDesign(prospect, design);
+
+    // A FAILED job (transient) below the attempt cap.
+    const created = await createJob({ prospectId: prospect.id, designProposalId: design.id, idempotencyKey: `pg-retry-${now}` });
+    let job = await advanceJob(created, 'SUBMITTING');
+    job = await advanceJob(job, 'EVALUATING').catch(() => job);
+    job = await recordFailure(job, 'transient');
+    expect(job.status).toBe('FAILED');
+
+    const bizBefore = (await state.db.businesses.toJSON()).length;
+    const agentBefore = (await state.db.agents.toJSON()).length;
+
+    // Two concurrent retries — the row lock serializes eligibility; exactly
+    // one continuation runs, and the tenant/agent are created exactly once.
+    const [r1, r2] = await Promise.allSettled([retryFactoryJob(job.id), retryFactoryJob(job.id)]);
+    const final = await state.db.factoryJobs.find((j: any) => j.id === job.id);
+    expect(['COMPLETED', 'FAILED']).toContain(final.status);
+    expect(final.attemptCount).toBeLessThanOrEqual(maxFactoryAttempts());
+    expect((await state.db.businesses.toJSON()).length).toBe(bizBefore + 1);
+    expect((await state.db.agents.toJSON()).length).toBe(agentBefore + 1);
+    expect(final.businessId).toBeTruthy();
+    expect(final.agentId).toBeTruthy();
+    // At least one of the two retries settled without throwing.
+    expect([r1, r2].some(r => r.status === 'fulfilled')).toBe(true);
+  }, 60000);
 });

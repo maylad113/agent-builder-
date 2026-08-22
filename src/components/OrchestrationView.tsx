@@ -19,6 +19,10 @@ import {
   prospectWebsiteValue
 } from './orchestrationPipelineLogic';
 
+// Mirrors the server's MAX_FACTORY_ATTEMPTS default for DISPLAY only — the
+// server enforces the real (env-overridable) limit on every retry.
+const MAX_FACTORY_ATTEMPTS = 3;
+
 /** Minimal owner UI for the orchestration MVP: prospects, designs, factory
  *  jobs, deliveries, acceptance. Self-fetching (platform-owner session). */
 
@@ -355,6 +359,28 @@ export const OrchestrationView: React.FC = () => {
       inputText: input.inputText,
       idempotencyKey: `ui-research-${selectedId}-${Date.now()}`
     });
+
+  // Retry a transient FAILED factory job (Task 29). Eligibility and the
+  // attempt limit are enforced server-side; the button is hidden for
+  // DEAD_LETTERED and for jobs at the attempt cap.
+  const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
+  const retryJob = async (jobId: string) => {
+    setRetryingJobId(jobId);
+    setError(null);
+    try {
+      const res = await fetch(`/api/orchestration/factory-jobs/${jobId}/retry`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data.error || `Retry failed (${res.status})`);
+        return;
+      }
+      await load();
+    } catch {
+      setError('Network error.');
+    } finally {
+      setRetryingJobId(null);
+    }
+  };
   const runAnalyze = () => prospectAction(ANALYZE_ENDPOINT(selectedId!));
   const runGenerateDesign = () => prospectAction(GENERATE_DESIGN_ENDPOINT(selectedId!));
 
@@ -531,8 +557,20 @@ export const OrchestrationView: React.FC = () => {
                     <span className="font-mono text-xs text-slate-500">{j.id.slice(0, 18)}…</span>
                     <span className={`text-xs px-2 py-0.5 rounded-full ${badgeClass(j.status)}`}>{j.status}</span>
                   </div>
-                  <div className="text-xs text-slate-500 mt-1">step: {j.currentStep}</div>
+                  <div className="text-xs text-slate-500 mt-1">step: {j.currentStep} · attempts {j.attemptCount}/{MAX_FACTORY_ATTEMPTS}</div>
                   {j.lastError && <div className="text-xs text-red-600 mt-1">{j.lastError}</div>}
+                  {j.status === 'FAILED' && j.attemptCount < MAX_FACTORY_ATTEMPTS && (
+                    <button
+                      onClick={() => retryJob(j.id)}
+                      disabled={retryingJobId === j.id || busy}
+                      className="mt-2 px-3 py-1 text-xs font-semibold bg-amber-600 text-white rounded-lg disabled:opacity-50"
+                    >
+                      {retryingJobId === j.id ? 'Retrying…' : `Retry build (${MAX_FACTORY_ATTEMPTS - j.attemptCount} left)`}
+                    </button>
+                  )}
+                  {j.status === 'FAILED' && j.attemptCount >= MAX_FACTORY_ATTEMPTS && (
+                    <div className="text-xs text-slate-400 mt-1">No retries remaining (max {MAX_FACTORY_ATTEMPTS} attempts).</div>
+                  )}
                 </div>
               ))}
               {jobs.length === 0 && <div className="text-sm text-slate-400">No factory jobs yet.</div>}

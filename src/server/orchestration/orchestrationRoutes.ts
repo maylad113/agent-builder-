@@ -17,7 +17,7 @@ import {
 import { listJobs, getJob } from './factoryJobs';
 import { listDeliveries, getDelivery, acceptDelivery, buildOnboardingArtifact } from './deliveries';
 import { provisionOwnerAccount } from './ownerProvisioning';
-import { submitDesignToFactory } from './factorySubmitter';
+import { submitDesignToFactory, retryFactoryJob } from './factorySubmitter';
 import {
   runResearch,
   getResearchReport,
@@ -328,6 +328,20 @@ orchestrationRouter.get('/factory-jobs/:id', requireAuth, requireRole('PLATFORM_
   const job = await getJob(String(req.params.id));
   if (!job) return res.status(404).json({ error: 'Not found.' });
   res.json(job);
+}));
+
+// Bounded retry of a transient FAILED job (Task 29). PLATFORM_OWNER only;
+// eligibility (FAILED + attempt limit) is enforced server-side inside a
+// row-locked transaction. DEAD_LETTERED stays terminal. The job's own
+// tenant/agent are reused — client-supplied ids are ignored.
+orchestrationRouter.post('/factory-jobs/:id/retry', rateLimit({ ...RATE_LIMITS.generate, prefix: 'factory-retry' }), requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const job = await retryFactoryJob(String(req.params.id));
+    res.status(200).json(job);
+  } catch (e: any) {
+    if (e?.message === 'Factory job not found.') return res.status(404).json({ error: 'Not found.' });
+    replyError(res, e);
+  }
 }));
 
 // ---------------------------------------------------------------------------

@@ -108,6 +108,69 @@ export async function submitDesignToFactory(designId: string, idempotencyKey: st
     safeError('[orchestration] prospect status update failed:', e?.message || e);
   }
 
+  return executeFactoryJob(job, prospect, design);
+}
+
+/**
+ * Maximum factory attempts (initial submission + retries). A FAILED job may be
+ * retried only while attemptCount is below this bound. Env-overridable for
+ * operations; invalid/negative values fall back to the default. Deterministic.
+ */
+export function maxFactoryAttempts(): number {
+  const raw = parseInt(process.env.MAX_FACTORY_ATTEMPTS || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 3;
+}
+export const MAX_FACTORY_ATTEMPTS = 3;
+
+/**
+ * Retry an eligible FAILED factory job (Task 29). Eligibility is enforced
+ * INSIDE a transaction with the job row locked (PG FOR UPDATE; SQLite strips
+ * it and the per-connection mutex serializes), so concurrent retries cannot
+ * both pass the attempt-limit check. The pipeline then re-runs from
+ * SUBMITTING, REUSING the job's existing tenant/agent (never duplicating),
+ * with every gate re-run and authoritative.
+ */
+export async function retryFactoryJob(jobId: string): Promise<FactoryJob> {
+  const job = await db.client.transaction(async (): Promise<FactoryJob> => {
+    const locked = await db.client.query('SELECT id FROM factory_jobs WHERE id = ? FOR UPDATE', [jobId]);
+    if (locked.rows.length === 0) throw new Error('Factory job not found.');
+    const current = await db.factoryJobs.find(j => j.id === jobId) as FactoryJob;
+    if (current.status === 'DEAD_LETTERED') {
+      throw new Error('A dead-lettered job cannot be retried.');
+    }
+    if (current.status !== 'FAILED') {
+      throw new Error(`Only a FAILED job can be retried (current: ${current.status}).`);
+    }
+    if (current.attemptCount >= maxFactoryAttempts()) {
+      throw new Error(`Factory job has reached the maximum of ${maxFactoryAttempts()} attempts.`);
+    }
+    return advanceJob(current, 'SUBMITTING');
+  });
+
+  const design = await getDesign(job.designProposalId);
+  if (!design) throw new Error('Design not found for this job.');
+  const prospect = await getProspect(job.prospectId);
+  if (!prospect) throw new Error('Prospect not found for this job.');
+
+  await recordOrchestrationEvent({
+    eventType: 'FACTORY_JOB_STARTED',
+    prospectId: prospect.id,
+    businessId: job.businessId,
+    agentId: job.agentId,
+    metadata: { jobId: job.id, designId: design.id },
+    summary: `Factory job retried (attempt ${job.attemptCount + 1})`
+  });
+
+  return executeFactoryJob(job, prospect, design);
+}
+
+/**
+ * The shared, resumable factory pipeline. Drives tenant/agent reuse-or-create
+ * → evaluate → correct-if-required → publish → activate → deliver. Every gate
+ * (evaluation publish gate, activation readiness) re-runs and stays
+ * authoritative on both the initial submission and any retry.
+ */
+async function executeFactoryJob(job: FactoryJob, prospect: Prospect, design: DesignProposal): Promise<FactoryJob> {
   job.attemptCount += 1;
 
   const stepEvent = async (step: FactoryJobStatus, detail?: string) => {
@@ -131,9 +194,11 @@ export async function submitDesignToFactory(designId: string, idempotencyKey: st
     // design-config origins and owner-added origins are preserved, duplicates
     // removed, and an existing tenant's allow-list is never overwritten.
     const websiteOrigin = deriveOriginFromWebsite(prospect.website);
-    let business = prospect.businessId
-      ? await db.businesses.find(b => b.id === prospect.businessId)
-      : undefined;
+    // REUSE the job's existing tenant on retry (job.businessId wins); fall
+    // back to the prospect's converted tenant, then create. Never duplicates.
+    let business = job.businessId
+      ? await db.businesses.find(b => b.id === job.businessId)
+      : (prospect.businessId ? await db.businesses.find(b => b.id === prospect.businessId) : undefined);
     if (!business) {
       business = await createBusinessTenant({
         ...config.business,
@@ -177,19 +242,23 @@ export async function submitDesignToFactory(designId: string, idempotencyKey: st
     }
     await stepEvent('SUBMITTING', 'tenant created');
 
-    const agent = await createAgentWithInitialDraft({
-      businessId: business.id,
-      name: config.agent.name,
-      description: config.agent.description,
-      systemPrompt: config.agent.systemPrompt,
-      structuredConfig: config.agent.structuredConfig,
-      llmProvider: config.agent.llmProvider,
-      model: config.agent.model,
-      status: 'READY'
-    });
-    job.agentId = agent.id;
-    job.updatedAt = new Date().toISOString();
-    await db.factoryJobs.update(job);
+    // REUSE the job's existing agent on retry; create only when absent.
+    let agent = job.agentId ? await db.agents.find(a => a.id === job.agentId) : undefined;
+    if (!agent) {
+      agent = await createAgentWithInitialDraft({
+        businessId: business.id,
+        name: config.agent.name,
+        description: config.agent.description,
+        systemPrompt: config.agent.systemPrompt,
+        structuredConfig: config.agent.structuredConfig,
+        llmProvider: config.agent.llmProvider,
+        model: config.agent.model,
+        status: 'READY'
+      });
+      job.agentId = agent.id;
+      job.updatedAt = new Date().toISOString();
+      await db.factoryJobs.update(job);
+    }
 
     const draft = await getLatestVersion(agent.id);
     if (!draft) throw new Error('No draft version was created for the agent.');
@@ -237,7 +306,16 @@ export async function submitDesignToFactory(designId: string, idempotencyKey: st
     job = await advanceJob(job, 'PUBLISHING');
     await stepEvent('PUBLISHING');
     try {
-      await publishVersion(targetVersionId, agent.id);
+      // On retry the target version may already be PUBLISHED from the prior
+      // attempt — re-publishing is then a no-op (the gate already ran), not a
+      // failure. Only DRAFT/TESTING versions go through publishVersion.
+      const existingVersion = await db.agentVersions.find(v => v.id === targetVersionId);
+      if (existingVersion && existingVersion.status === 'PUBLISHED') {
+        await stepEvent('PUBLISHING', 'already published (retry)');
+      } else {
+        await publishVersion(targetVersionId, agent.id);
+        await stepEvent('PUBLISHING', 'published');
+      }
     } catch (e: any) {
       await markDeadLetter(job, 'Publish evaluation gate blocked.');
       await recordOrchestrationEvent({
@@ -250,7 +328,6 @@ export async function submitDesignToFactory(designId: string, idempotencyKey: st
       });
       return job;
     }
-    await stepEvent('PUBLISHING', 'published');
 
     // --- Step ACTIVATING (readiness gate stays authoritative) --------------
     job = await advanceJob(job, 'ACTIVATING');

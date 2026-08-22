@@ -20,7 +20,9 @@ export const FACTORY_JOB_TRANSITIONS: Record<FactoryJobStatus, FactoryJobStatus[
   PUBLISHING: ['ACTIVATING', 'FAILED', 'DEAD_LETTERED'],
   ACTIVATING: ['COMPLETED', 'FAILED', 'DEAD_LETTERED'],
   COMPLETED: [],
-  FAILED: [],
+  // FAILED may return to SUBMITTING ONLY via the bounded retry path
+  // (retryFactoryJob) — attempt-limited, row-locked, never automatic.
+  FAILED: ['SUBMITTING'],
   DEAD_LETTERED: []
 };
 
