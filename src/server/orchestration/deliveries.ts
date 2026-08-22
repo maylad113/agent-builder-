@@ -1,6 +1,7 @@
 import { db } from '../db';
 import { Delivery, Acceptance, FactoryJob, Prospect, OnboardingArtifact, OnboardingChannel } from '../../types';
 import { recordOrchestrationEvent } from '../telemetry';
+import { platformPublicOrigin, normalizeWidgetOriginList } from '../widgetSecurity';
 
 /**
  * Deliveries + acceptances. A delivery record is created exactly once — by
@@ -71,10 +72,12 @@ export async function getDelivery(id: string): Promise<Delivery | undefined> {
  * delivery. PURE READ of persisted platform state (delivery + business +
  * agent + channels + acceptance) — repeated returns are equivalent, nothing
  * is created or mutated, and no customer contact occurs. The embed snippet
- * interpolates ONLY the tenant business id (the existing public widget
- * identifier, allow-listed id-shaped) into the platform-controlled
- * /widget.js template; other channels are honestly NOT configured with no
- * snippet. No secrets/credentials/keys ever appear.
+ * interpolates ONLY the platform's public origin (PLATFORM_PUBLIC_URL,
+ * localhost fallback in dev) and the tenant business id (the existing public
+ * widget identifier, allow-listed id-shaped) into the platform-controlled
+ * widget.js template — an ABSOLUTE URL, because a relative one would resolve
+ * against the customer's own domain. Other channels are honestly NOT
+ * configured with no snippet. No secrets/credentials/keys ever appear.
  */
 export async function buildOnboardingArtifact(deliveryId: string): Promise<OnboardingArtifact> {
   const delivery = await db.deliveries.find(d => d.id === deliveryId);
@@ -83,6 +86,8 @@ export async function buildOnboardingArtifact(deliveryId: string): Promise<Onboa
   const agent = await db.agents.find(a => a.id === delivery.agentId);
   const tenantChannels = await db.channels.filter(c => c.businessId === delivery.businessId);
   const acceptance = await db.acceptances.find(a => a.deliveryId === delivery.id);
+  const widgetOrigin = platformPublicOrigin();
+  const allowedOrigins = normalizeWidgetOriginList(business?.allowedWidgetOrigins);
 
   const channels: OnboardingChannel[] = tenantChannels
     .map(c => {
@@ -91,7 +96,8 @@ export async function buildOnboardingArtifact(deliveryId: string): Promise<Onboa
           type: 'web_chat',
           status: c.status,
           note: 'Website chat widget is available.',
-          embedSnippet: `<script src="/widget.js" data-business-id="${business?.id}"></script>`
+          embedSnippet: `<script src="${widgetOrigin}/widget.js" data-business-id="${business?.id}"></script>`,
+          allowedOrigins
         };
       }
       return {
@@ -115,6 +121,11 @@ export async function buildOnboardingArtifact(deliveryId: string): Promise<Onboa
   }
   if (web?.embedSnippet) {
     instructions.push('To add the website chat widget to your site, paste the embed snippet shown under the web_chat channel into your website HTML.');
+    if (web.allowedOrigins && web.allowedOrigins.length > 0) {
+      instructions.push(`The widget is allow-listed for these website origins: ${web.allowedOrigins.join(', ')}. Embed it only on those sites.`);
+    } else {
+      instructions.push('No website origin is allow-listed yet — the widget will be blocked until your website origin is configured.');
+    }
   } else {
     instructions.push('The website chat widget is not configured yet — configure web_chat to enable customer chat on your site.');
   }

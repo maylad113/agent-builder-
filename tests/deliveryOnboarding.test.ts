@@ -100,11 +100,12 @@ describe('buildOnboardingArtifact (deterministic, LLM-free)', () => {
     expect(art.agent.capabilities).toContain('Answer FAQs');
     expect(Array.isArray(art.instructions)).toBe(true);
     expect(art.instructions.length).toBeGreaterThan(2);
-    // web_chat: the only configured channel → REAL snippet with the tenant id,
-    // never invented URLs, only the platform widget.js route.
+    // web_chat: the only configured channel → REAL ABSOLUTE snippet with the
+    // tenant id, never invented URLs, only the platform widget.js route.
     const web = art.channels.find((c: any) => c.type === 'web_chat');
     expect(web.status).toBe('connected');
-    expect(web.embedSnippet).toContain('<script src="/widget.js"');
+    expect(web.embedSnippet).toMatch(/^<script src="https?:\/\/[^/"]+\/widget\.js"/);
+    expect(web.embedSnippet).toContain('widget.js');
     expect(web.embedSnippet).toContain(`data-business-id="${business.id}"`);
     // Others remain honestly NOT CONFIGURED with NO snippet.
     for (const other of ['instagram', 'sms', 'voice']) {

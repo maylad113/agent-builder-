@@ -611,4 +611,68 @@ pgDescribe('PostgreSQL transaction integrity (real PG)', () => {
     const telemetry = JSON.stringify(await state.db.telemetry.toJSON());
     expect(telemetry).not.toContain(withPassword[0].temporaryPassword);
   }, 30000);
+
+  it('widget origins on PG: JSON round-trip, factory derivation, merge without erase', async () => {
+    const { createBusinessTenant } = await import('../src/server/agentLifecycle');
+    const { createProspect } = await import('../src/server/orchestration/prospects');
+    const { createDesign, approveDesign } = await import('../src/server/orchestration/design');
+    const { submitDesignToFactory } = await import('../src/server/orchestration/factorySubmitter');
+    const { normalizeWidgetOriginList, deriveOriginFromWebsite, isOriginAllowed } = await import('../src/server/widgetSecurity');
+    const now = new Date().toISOString();
+
+    // JSON round-trip: createBusinessTenant normalizes + persists on PG.
+    // Services are required by the activation readiness gate (checked against
+    // the business row, not the design config).
+    const biz = await createBusinessTenant({
+      name: 'PG Widget Co.', type: 'barbershop', description: 'A real barbershop.',
+      services: [{ name: 'Haircut', price: 20, durationMinutes: 30 }],
+      allowedWidgetOrigins: ['https://owner-added.example/', 'javascript:alert(1)', 'https://owner-added.example']
+    });
+    const readBack = await state.db.businesses.find((b: any) => b.id === biz.id);
+    expect(readBack.allowedWidgetOrigins).toEqual(['https://owner-added.example']);
+
+    // Origin guard works against the PG-persisted list.
+    expect(await isOriginAllowed(biz.id, 'https://owner-added.example')).toBe(true);
+    expect(await isOriginAllowed(biz.id, 'https://foreign.example')).toBe(false);
+
+    // Factory derivation + merge on PG: an existing tenant (owner origin) +
+    // a prospect website -> both origins, deduped, owner origin preserved.
+    const prospect = await createProspect({ businessName: 'PG Widget Co.', website: 'https://customer.example/about' });
+    prospect.businessId = biz.id;
+    await state.db.prospects.update(prospect);
+    const design = await createDesign(prospect, {
+      title: 'PG widget design', problemStatement: 'P', proposedSolution: 'S',
+      configuration: {
+        business: { name: 'PG Widget Co.', type: 'barbershop', services: [{ name: 'Haircut', price: 20, durationMinutes: 30 }] },
+        agent: {
+          name: 'PG AI', systemPrompt: 'You are the receptionist.',
+          structuredConfig: {
+            personality: { tone: 'friendly', behavior: 'service', language: 'en' },
+            goals: ['Answer FAQs'], allowedActions: ['get_business_information', 'transfer_to_human'],
+            restrictedActions: [], escalationRules: ['Customer asks for human'],
+            bookingRules: '', orderRules: '', refundRules: '',
+            toolsEnabled: ['get_business_information', 'transfer_to_human']
+          }
+        },
+        scenarios: [
+          { id: 'sc-handoff', name: 'escalates', userMessage: 'hello', dimension: 'handoff', severity: 'critical', expectHandoff: true },
+          { id: 'sc-nofab', name: 'no fabrication', userMessage: 'hello', dimension: 'hallucination', severity: 'critical', mustNotContain: ['zz-fabricated-claim-0001'] }
+        ],
+        knowledge: [{ title: 'FAQ', content: 'Open 9-5.' }]
+      }
+    } as any);
+    await approveDesign(prospect, design);
+    const job = await submitDesignToFactory(design.id, `pg-widget-${now}`);
+    expect(job.status).toBe('COMPLETED');
+    const merged = await state.db.businesses.find((b: any) => b.id === biz.id);
+    expect(merged.allowedWidgetOrigins).toEqual(['https://owner-added.example', 'https://customer.example']);
+
+    // Idempotent re-submit: same job, origins unchanged.
+    const again = await submitDesignToFactory(design.id, `pg-widget-${now}`);
+    expect(again.id).toBe(job.id);
+    const after = await state.db.businesses.find((b: any) => b.id === biz.id);
+    expect(after.allowedWidgetOrigins).toEqual(['https://owner-added.example', 'https://customer.example']);
+    expect(normalizeWidgetOriginList(after.allowedWidgetOrigins)).toEqual(after.allowedWidgetOrigins);
+    expect(deriveOriginFromWebsite('https://customer.example/about')).toBe('https://customer.example');
+  }, 60000);
 });

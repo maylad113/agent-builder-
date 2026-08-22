@@ -783,8 +783,10 @@ export interface OnboardingChannel {
   status: string;
   /** Configured capability statement (web_chat only) or an honest not-configured note. */
   note?: string;
-  /** Platform-controlled embed snippet (web_chat only when connected). */
+  /** Platform-controlled ABSOLUTE embed snippet (web_chat only when connected). */
   embedSnippet?: string;
+  /** Normalized widget origin allow-list (web_chat only; public, no secrets). */
+  allowedOrigins?: string[];
 }
 
 export interface OnboardingArtifact {

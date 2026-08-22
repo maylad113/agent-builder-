@@ -18,6 +18,7 @@ import { runEvaluation } from '../evaluation';
 import { runSelfCorrection } from '../correction';
 import { recordOrchestrationEvent } from '../telemetry';
 import { safeError } from '../logSanitizer';
+import { deriveOriginFromWebsite, normalizeWidgetOriginList } from '../widgetSecurity';
 
 /**
  * The ONLY orchestration bridge into the factory lifecycle. It drives the
@@ -124,18 +125,35 @@ export async function submitDesignToFactory(designId: string, idempotencyKey: st
     const config = design.configuration!;
 
     // --- Step SUBMITTING: tenant + agent + draft version -------------------
+    // Widget origin: derive the customer's website origin from the EXISTING
+    // prospect website data (validated by the widget security rules; absent or
+    // invalid website -> no origin, never a guess). Safe merge semantics:
+    // design-config origins and owner-added origins are preserved, duplicates
+    // removed, and an existing tenant's allow-list is never overwritten.
+    const websiteOrigin = deriveOriginFromWebsite(prospect.website);
     let business = prospect.businessId
       ? await db.businesses.find(b => b.id === prospect.businessId)
       : undefined;
     if (!business) {
       business = await createBusinessTenant({
         ...config.business,
-        name: config.business.name || prospect.businessName
+        name: config.business.name || prospect.businessName,
+        allowedWidgetOrigins: normalizeWidgetOriginList([
+          ...(Array.isArray(config.business.allowedWidgetOrigins) ? config.business.allowedWidgetOrigins : []),
+          ...(websiteOrigin ? [websiteOrigin] : [])
+        ])
       });
       prospect = await db.prospects.find(p => p.id === prospect.id) as Prospect;
       prospect.businessId = business.id;
       prospect.updatedAt = new Date().toISOString();
       await db.prospects.update(prospect);
+    } else if (websiteOrigin) {
+      const existing = normalizeWidgetOriginList(business.allowedWidgetOrigins);
+      if (!existing.includes(websiteOrigin)) {
+        business.allowedWidgetOrigins = [...existing, websiteOrigin];
+        business.updatedAt = new Date().toISOString();
+        await db.businesses.update(business);
+      }
     }
     job.businessId = business.id;
     job.updatedAt = new Date().toISOString();

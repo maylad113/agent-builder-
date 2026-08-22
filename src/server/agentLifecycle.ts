@@ -3,6 +3,7 @@ import { Agent, AgentStatus, Business, StructuredAgentConfig } from '../types';
 import { createInitialDraft } from './agentVersions';
 import { resolveProviderAndModel, SUPPORTED_LLM_PROVIDERS } from './llmProvider';
 import { assertActivatable } from './readiness';
+import { normalizeWidgetOriginList } from './widgetSecurity';
 
 /**
  * Authoritative factory lifecycle operations extracted (unchanged) from the
@@ -87,7 +88,7 @@ export async function createBusinessTenant(input: CreateBusinessInput): Promise<
     },
     communicationStyle: input.communicationStyle || 'Friendly, courteous, and efficient.',
     status: 'ACTIVE',
-    allowedWidgetOrigins: Array.isArray(input.allowedWidgetOrigins) ? input.allowedWidgetOrigins : [],
+    allowedWidgetOrigins: normalizeWidgetOriginList(input.allowedWidgetOrigins),
     holidays: [],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()

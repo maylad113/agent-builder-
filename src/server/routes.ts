@@ -15,7 +15,7 @@ import {
   getProvider, runValidation, storeCredentials, getCredentials, clearCredentials,
   sanitizeIntegrationForClient
 } from './integrations';
-import { widgetCorsHeaders } from './widgetSecurity';
+import { widgetCorsHeaders, normalizeWidgetOriginList } from './widgetSecurity';
 import { createBusinessTenant, createAgentWithInitialDraft, transitionAgentStatus, AGENT_STATUS_TRANSITIONS, AGENT_STATUSES } from './agentLifecycle';
 import { orchestrationRouter } from './orchestration/orchestrationRoutes';
 import { runEvaluation, getLatestEvaluation, listEvaluationsForAgent } from './evaluation';
@@ -239,7 +239,9 @@ router.put(
     if (typeof communicationStyle === 'string') biz.communicationStyle = communicationStyle;
     if (status) biz.status = status;
     if (Array.isArray(holidays)) biz.holidays = holidays;
-    if (Array.isArray(allowedWidgetOrigins)) biz.allowedWidgetOrigins = allowedWidgetOrigins;
+    // Strict origin validation: invalid entries are dropped (never wildcards,
+    // never credentials) so the widget allow-list stays enforceable.
+    if (Array.isArray(allowedWidgetOrigins)) biz.allowedWidgetOrigins = normalizeWidgetOriginList(allowedWidgetOrigins);
     biz.updatedAt = new Date().toISOString();
     await db.businesses.update(biz);
     res.json(biz);
