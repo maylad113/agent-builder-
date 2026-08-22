@@ -1,11 +1,23 @@
 import React, { useEffect, useState } from 'react';
-import { Prospect, DesignProposal, FactoryJob, Delivery, OnboardingArtifact } from '../types';
+import { Prospect, DesignProposal, FactoryJob, Delivery, OnboardingArtifact, DiscoveryRun, DiscoveryResult, LeadResearchReport } from '../types';
 import { DeliveryHandoffPanel, ProvisionState } from './DeliveryHandoffPanel';
+import { PipelineFrontPanel, PlacesUsageView } from './PipelineFrontPanel';
 import {
   PROVISION_ENDPOINT,
   ONBOARDING_ENDPOINT,
   provisionResultFromResponse
 } from './deliveryHandoffLogic';
+import {
+  DISCOVERY_RUNS_ENDPOINT,
+  DISCOVERY_USAGE_ENDPOINT,
+  ACCEPT_RESULT_ENDPOINT,
+  DISMISS_RESULT_ENDPOINT,
+  RESEARCH_ENDPOINT,
+  ANALYZE_ENDPOINT,
+  GENERATE_DESIGN_ENDPOINT,
+  parseManualCandidates,
+  prospectWebsiteValue
+} from './orchestrationPipelineLogic';
 
 /** Minimal owner UI for the orchestration MVP: prospects, designs, factory
  *  jobs, deliveries, acceptance. Self-fetching (platform-owner session). */
@@ -28,7 +40,16 @@ export const OrchestrationView: React.FC = () => {
   const [error, setError] = useState<AsyncError>(null);
   const [busy, setBusy] = useState(false);
 
-  const [prospectForm, setProspectForm] = useState({ businessName: '', contactName: '', contactPhone: '' });
+  const [prospectForm, setProspectForm] = useState({ businessName: '', contactName: '', contactPhone: '', website: '' });
+
+  // Task 27 — pipeline front half. All server-driven: quota, dedupe,
+  // acceptance, research/analysis/design idempotency and preconditions remain
+  // enforced by the existing routes; the UI only loads and displays state.
+  const [discoveryRuns, setDiscoveryRuns] = useState<DiscoveryRun[]>([]);
+  const [discoveryResults, setDiscoveryResults] = useState<Record<string, DiscoveryResult[]>>({});
+  const [placesUsage, setPlacesUsage] = useState<PlacesUsageView | null>(null);
+  const [researchReports, setResearchReports] = useState<LeadResearchReport[]>([]);
+  const [pipelineBusy, setPipelineBusy] = useState(false);
   const [designForm, setDesignForm] = useState({
     title: '',
     problemStatement: '',
@@ -55,19 +76,50 @@ export const OrchestrationView: React.FC = () => {
     if (dRes.ok) setDeliveries(await dRes.json());
   };
 
+  // Discovery front half: runs + per-run results + read-only Places usage.
+  const loadDiscovery = async () => {
+    const [rRes, uRes] = await Promise.all([
+      fetch(DISCOVERY_RUNS_ENDPOINT),
+      fetch(DISCOVERY_USAGE_ENDPOINT)
+    ]);
+    if (rRes.ok) {
+      const list: DiscoveryRun[] = await rRes.json();
+      setDiscoveryRuns(list);
+      const entries = await Promise.all(
+        list.map(async run => {
+          const res = await fetch(`${DISCOVERY_RUNS_ENDPOINT}/${run.id}`);
+          if (!res.ok) return [run.id, []] as const;
+          const body = await res.json();
+          return [run.id, body.results || []] as const;
+        })
+      );
+      setDiscoveryResults(Object.fromEntries(entries));
+    }
+    if (uRes.ok) setPlacesUsage(await uRes.json());
+  };
+
+  // Research reports for the currently selected prospect.
+  const loadResearch = async (prospectId: string) => {
+    const res = await fetch(RESEARCH_ENDPOINT(prospectId));
+    if (res.ok) setResearchReports(await res.json());
+  };
+
   useEffect(() => {
     load();
+    loadDiscovery();
   }, []);
 
   useEffect(() => {
     if (!selectedId) {
       setDesigns([]);
+      setResearchReports([]);
       return;
     }
     fetch(`/api/orchestration/prospects/${selectedId}/designs`)
       .then(r => (r.ok ? r.json() : []))
       .then(setDesigns)
       .catch(() => setDesigns([]));
+    loadResearch(selectedId).catch(() => setResearchReports([]));
   }, [selectedId]);
 
   const apiCall = async (url: string, method: string, body?: any): Promise<boolean> => {
@@ -101,10 +153,12 @@ export const OrchestrationView: React.FC = () => {
     const ok = await apiCall('/api/orchestration/prospects', 'POST', {
       businessName: prospectForm.businessName.trim(),
       contactName: prospectForm.contactName.trim() || undefined,
-      contactPhone: prospectForm.contactPhone.trim() || undefined
+      contactPhone: prospectForm.contactPhone.trim() || undefined,
+      // Task 24: the website feeds widget-origin derivation at factory submit.
+      website: prospectWebsiteValue(prospectForm.website)
     });
     if (ok) {
-      setProspectForm({ businessName: '', contactName: '', contactPhone: '' });
+      setProspectForm({ businessName: '', contactName: '', contactPhone: '', website: '' });
       await load();
     }
   };
@@ -211,6 +265,99 @@ export const OrchestrationView: React.FC = () => {
     setOnboardingByDelivery(s => ({ ...s, [deliveryId]: null }));
   };
 
+  // --- Task 27 pipeline front-half actions ----------------------------------
+  // Each calls the EXISTING server route and refreshes the affected state.
+  // Errors surface via the shared error banner (existing convention).
+
+  const runDiscoveryAction = async (input: { provider: string; query?: string; location?: string; candidatesText?: string }) => {
+    setPipelineBusy(true);
+    setError(null);
+    try {
+      const body: any = {
+        idempotencyKey: `ui-discovery-${Date.now()}`,
+        provider: input.provider
+      };
+      if (input.provider === 'manual_list') {
+        body.candidates = parseManualCandidates(input.candidatesText || '') ?? undefined;
+      } else {
+        if (input.query) body.query = input.query;
+        if (input.location) body.location = input.location;
+      }
+      const res = await fetch(DISCOVERY_RUNS_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data.error || `Request failed (${res.status})`);
+        return;
+      }
+      await loadDiscovery();
+    } catch {
+      setError('Network error.');
+    } finally {
+      setPipelineBusy(false);
+    }
+  };
+
+  const triageResult = async (endpoint: string) => {
+    setPipelineBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(endpoint, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data.error || `Request failed (${res.status})`);
+        return;
+      }
+      await Promise.all([loadDiscovery(), load()]);
+    } catch {
+      setError('Network error.');
+    } finally {
+      setPipelineBusy(false);
+    }
+  };
+
+  const acceptResult = (resultId: string) => triageResult(ACCEPT_RESULT_ENDPOINT(resultId));
+  const dismissResult = (resultId: string) => triageResult(DISMISS_RESULT_ENDPOINT(resultId));
+
+  const prospectAction = async (endpoint: string, payload: Record<string, unknown> = {}) => {
+    if (!selectedId) return;
+    setPipelineBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data.error || `Request failed (${res.status})`);
+        return;
+      }
+      await Promise.all([loadResearch(selectedId), load()]);
+      // Refresh the design list too (generation adds a proposal).
+      const dRes = await fetch(`/api/orchestration/prospects/${selectedId}/designs`);
+      if (dRes.ok) setDesigns(await dRes.json());
+    } catch {
+      setError('Network error.');
+    } finally {
+      setPipelineBusy(false);
+    }
+  };
+
+  const runResearch = (input: { inputText: string }) =>
+    // Research requires BOTH inputText and an idempotency key (UNIQUE-backed
+    // replay protection); the key makes a double-click resubmit harmless.
+    prospectAction(RESEARCH_ENDPOINT(selectedId!), {
+      inputText: input.inputText,
+      idempotencyKey: `ui-research-${selectedId}-${Date.now()}`
+    });
+  const runAnalyze = () => prospectAction(ANALYZE_ENDPOINT(selectedId!));
+  const runGenerateDesign = () => prospectAction(GENERATE_DESIGN_ENDPOINT(selectedId!));
+
   const selected = prospects.find(p => p.id === selectedId) || null;
 
   return (
@@ -218,6 +365,24 @@ export const OrchestrationView: React.FC = () => {
       {error && (
         <div className="bg-red-50 border border-red-200 text-red-700 text-sm rounded-xl px-4 py-3">{error}</div>
       )}
+
+      {/* Task 27 — pipeline front half: discovery + research/analysis/design */}
+      <PipelineFrontPanel
+        runs={discoveryRuns}
+        resultsByRun={discoveryResults}
+        usage={placesUsage}
+        busy={pipelineBusy}
+        onRunDiscovery={runDiscoveryAction}
+        onAccept={acceptResult}
+        onDismiss={dismissResult}
+        prospect={selected}
+        researchReports={researchReports}
+        designs={designs}
+        onResearch={runResearch}
+        onAnalyze={runAnalyze}
+        onGenerateDesign={runGenerateDesign}
+        onApproveDesign={approveDesign}
+      />
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Prospects */}
@@ -241,6 +406,13 @@ export const OrchestrationView: React.FC = () => {
               placeholder="Contact phone"
               value={prospectForm.contactPhone}
               onChange={e => setProspectForm({ ...prospectForm, contactPhone: e.target.value })}
+            />
+            <input
+              className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm"
+              placeholder="Website (e.g. https://business.com)"
+              aria-label="Prospect website"
+              value={prospectForm.website}
+              onChange={e => setProspectForm({ ...prospectForm, website: e.target.value })}
             />
             <button
               onClick={createProspect}
