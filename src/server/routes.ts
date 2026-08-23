@@ -18,6 +18,7 @@ import {
 import { widgetCorsHeaders, normalizeWidgetOriginList } from './widgetSecurity';
 import { createBusinessTenant, createAgentWithInitialDraft, transitionAgentStatus, AGENT_STATUS_TRANSITIONS, AGENT_STATUSES } from './agentLifecycle';
 import { orchestrationRouter } from './orchestration/orchestrationRoutes';
+import { salesRouter } from './sales/routes';
 import { runEvaluation, getLatestEvaluation, listEvaluationsForAgent } from './evaluation';
 import { runSelfCorrection, listCorrectionsForAgent } from './correction';
 import { listTelemetryEvents, computeMetrics, listConversationsFromTelemetry, getConversationTimeline } from './telemetry';
@@ -43,6 +44,7 @@ export const router = Router();
 
 // Sales & Delivery Orchestrator — owner-gated sub-router (platform owner only).
 router.use('/orchestration', orchestrationRouter);
+router.use('/sales', salesRouter);
 
 /**
  * Cap a list response to bound memory and protect against unbounded result

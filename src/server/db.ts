@@ -26,6 +26,8 @@ import {
   Prospect,
   DesignProposal,
   FactoryJob,
+  SalesWorker,
+  SalesTask,
   Delivery,
   Acceptance,
   LeadResearchReport,
@@ -40,6 +42,7 @@ import { initEvaluationTable } from './evaluation';
 import { initCorrectionTable } from './correction';
 import { initTelemetryTable } from './telemetry';
 import { initOrchestrationTables } from './orchestration/tables';
+import { initSalesWorkforceTables } from './sales/tables';
 import { DbClient, SqliteClient, PostgresClient } from './dbClient';
 
 /**
@@ -210,6 +213,16 @@ const TABLES: Record<string, TableConfig> = {
   acceptances: {
     table: 'acceptances',
     jsonColumns: ['metadata'],
+    booleanColumns: []
+  },
+  salesWorkers: {
+    table: 'sales_workers',
+    jsonColumns: ['schedule', 'limits'],
+    booleanColumns: []
+  },
+  salesTasks: {
+    table: 'sales_tasks',
+    jsonColumns: ['payload'],
     booleanColumns: []
   },
   leadResearchReports: {
@@ -577,6 +590,8 @@ export class AppDatabase {
   public factoryJobs!: Collection<FactoryJob>;
   public deliveries!: Collection<Delivery>;
   public acceptances!: Collection<Acceptance>;
+  public salesWorkers!: Collection<SalesWorker>;
+  public salesTasks!: Collection<SalesTask>;
   public leadResearchReports!: Collection<LeadResearchReport>;
   public discoveryRuns!: Collection<DiscoveryRun>;
   public discoveryResults!: Collection<DiscoveryResult>;
@@ -640,6 +655,8 @@ export class AppDatabase {
     this.factoryJobs = new Collection<FactoryJob>(this.client, TABLES.factoryJobs);
     this.deliveries = new Collection<Delivery>(this.client, TABLES.deliveries);
     this.acceptances = new Collection<Acceptance>(this.client, TABLES.acceptances);
+    this.salesWorkers = new Collection<SalesWorker>(this.client, TABLES.salesWorkers);
+    this.salesTasks = new Collection<SalesTask>(this.client, TABLES.salesTasks);
     this.leadResearchReports = new Collection<LeadResearchReport>(this.client, TABLES.leadResearchReports);
     this.discoveryRuns = new Collection<DiscoveryRun>(this.client, TABLES.discoveryRuns);
     this.discoveryResults = new Collection<DiscoveryResult>(this.client, TABLES.discoveryResults);
@@ -665,6 +682,7 @@ export class AppDatabase {
     await initCorrectionTable(this.client);
     await initTelemetryTable(this.client);
     await initOrchestrationTables(this.client);
+    await initSalesWorkforceTables(this.client);
 
     if (shouldSeed) {
       await this.seed();

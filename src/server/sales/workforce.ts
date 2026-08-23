@@ -1,0 +1,350 @@
+import { db } from '../db';
+import {
+  SalesWorker, SalesWorkerRole, SalesWorkerStatus, SalesChannelType,
+  SalesWorkerSchedule, SalesWorkerLimits,
+  SalesTask, SalesTaskStatus
+} from '../../types';
+import { recordOrchestrationEvent } from '../telemetry';
+import { executeChannelTask } from './noopChannel';
+
+/**
+ * Sales workforce execution substrate (Phase A / Task 34).
+ *
+ * Durable, crash-safe, idempotent execution for future sales workers. Workers
+ * are INSTANCES of one architecture (role + config drive behavior — never a
+ * per-worker class). Durable tasks are persisted before execution, claimed
+ * atomically (FOR UPDATE SKIP LOCKED on PG; SQLite serializes on the
+ * connection mutex), executed through a pluggable channel (no-op/test channel
+ * in this phase), retried with a hard bound, and recovered from crashes by a
+ * deterministic stale-task reaper.
+ *
+ * PLATFORM_OWNER-only; platform-level entities (NOT customer tenants). No
+ * phone/Instagram/outreach — this is execution infrastructure only.
+ */
+
+export const WORKER_TRANSITIONS: Record<SalesWorkerStatus, SalesWorkerStatus[]> = {
+  IDLE: ['RUNNING', 'PAUSED', 'OFFLINE'],
+  RUNNING: ['IDLE', 'PAUSED', 'OFFLINE'],
+  PAUSED: ['IDLE', 'OFFLINE'],
+  OFFLINE: ['IDLE']
+};
+
+export const TASK_TRANSITIONS: Record<SalesTaskStatus, SalesTaskStatus[]> = {
+  QUEUED: ['RUNNING', 'DEAD_LETTERED'],
+  RUNNING: ['SUCCEEDED', 'FAILED', 'DEAD_LETTERED'],
+  SUCCEEDED: [],
+  // FAILED is retryable: returns to QUEUED (bounded), else DEAD_LETTERED.
+  FAILED: ['QUEUED', 'DEAD_LETTERED'],
+  DEAD_LETTERED: []
+};
+
+/** Hard attempt ceiling per task (initial + retries). */
+export const MAX_TASK_ATTEMPTS = 3;
+/** A claimed/running task older than this is considered crashed/stale. */
+export const STALE_TASK_MS = 5 * 60 * 1000; // 5 minutes
+/** Base backoff for a retryable failure (attempt^2 * base). */
+const RETRY_BACKOFF_BASE_MS = 1000;
+
+function genId(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+const DAY_NAMES = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+
+// ---------------------------------------------------------------------------
+// Worker registry
+// ---------------------------------------------------------------------------
+
+export async function createWorker(input: {
+  role: SalesWorkerRole;
+  objective?: string;
+  channel: SalesChannelType;
+  schedule?: Partial<SalesWorkerSchedule>;
+  limits?: Partial<SalesWorkerLimits>;
+  strategyVersionId?: string;
+}): Promise<SalesWorker> {
+  if (!input.role || !input.channel) throw new Error('role and channel are required.');
+  const now = new Date().toISOString();
+  const worker: SalesWorker = {
+    id: genId('wk'),
+    role: input.role,
+    status: 'IDLE',
+    objective: input.objective,
+    channel: input.channel,
+    schedule: {
+      enabled: input.schedule?.enabled ?? true,
+      windows: input.schedule?.windows ?? [],
+      timezone: input.schedule?.timezone
+    },
+    limits: {
+      maxConcurrentTasks: input.limits?.maxConcurrentTasks ?? 2,
+      maxAttempts: input.limits?.maxAttempts ?? MAX_TASK_ATTEMPTS
+    },
+    strategyVersionId: input.strategyVersionId,
+    createdAt: now,
+    updatedAt: now
+  };
+  await db.salesWorkers.push(worker);
+  return worker;
+}
+
+export async function getWorker(id: string): Promise<SalesWorker | undefined> {
+  return db.salesWorkers.find(w => w.id === id);
+}
+
+export async function listWorkers(): Promise<SalesWorker[]> {
+  return db.salesWorkers.toJSON();
+}
+
+export async function transitionWorkerStatus(id: string, next: SalesWorkerStatus): Promise<SalesWorker> {
+  const w = await getWorker(id);
+  if (!w) throw new Error('Worker not found.');
+  if (next !== w.status && !WORKER_TRANSITIONS[w.status].includes(next)) {
+    throw new Error(`Invalid worker transition: ${w.status} -> ${next}.`);
+  }
+  w.status = next;
+  w.updatedAt = new Date().toISOString();
+  await db.salesWorkers.update(w);
+  return w;
+}
+
+/** A worker may execute now when it is not paused/offline and its schedule
+ *  (if it has windows) includes the current minute. Deterministic, testable. */
+export function isWorkerRunnableNow(w: SalesWorker, now: Date = new Date()): boolean {
+  if (w.status === 'PAUSED' || w.status === 'OFFLINE') return false;
+  if (!w.schedule.enabled) return false;
+  if (!w.schedule.windows || w.schedule.windows.length === 0) return true;
+  const day = DAY_NAMES[now.getUTCDay()];
+  const minute = now.getUTCHours() * 60 + now.getUTCMinutes();
+  return w.schedule.windows.some(win =>
+    (win.day === '*' || win.day === day) && minute >= win.startMin && minute < win.endMin
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Tasks
+// ---------------------------------------------------------------------------
+
+export async function enqueueTask(input: {
+  workerId: string;
+  type: string;
+  payload?: Record<string, any>;
+  idempotencyKey: string;
+  availableAt?: string;
+}): Promise<SalesTask> {
+  if (!input.workerId || !input.type) throw new Error('workerId and type are required.');
+  if (!input.idempotencyKey || typeof input.idempotencyKey !== 'string') {
+    throw new Error('idempotencyKey is required.');
+  }
+  const existing = await db.salesTasks.find(t => t.idempotencyKey === input.idempotencyKey);
+  if (existing) return existing; // idempotent — never duplicate logical work
+  const now = new Date().toISOString();
+  const task: SalesTask = {
+    id: genId('wtask'),
+    workerId: input.workerId,
+    type: input.type,
+    payload: input.payload,
+    status: 'QUEUED',
+    attemptCount: 0,
+    availableAt: input.availableAt ?? now,
+    idempotencyKey: input.idempotencyKey,
+    createdAt: now,
+    updatedAt: now
+  };
+  try {
+    await db.salesTasks.push(task);
+  } catch {
+    // UNIQUE(idempotency_key) backstop — a concurrent enqueue won; return it.
+    const raced = await db.salesTasks.find(t => t.idempotencyKey === input.idempotencyKey);
+    if (raced) return raced;
+    throw new Error('Task could not be enqueued.');
+  }
+  return task;
+}
+
+export async function getTask(id: string): Promise<SalesTask | undefined> {
+  return db.salesTasks.find(t => t.id === id);
+}
+
+export async function advanceTask(id: string, next: SalesTaskStatus): Promise<SalesTask> {
+  const t = await getTask(id);
+  if (!t) throw new Error('Task not found.');
+  if (next !== t.status && !TASK_TRANSITIONS[t.status].includes(next)) {
+    throw new Error(`Invalid task transition: ${t.status} -> ${next}.`);
+  }
+  t.status = next;
+  t.updatedAt = new Date().toISOString();
+  await db.salesTasks.update(t);
+  return t;
+}
+
+// ---------------------------------------------------------------------------
+// Claiming (concurrency-safe, atomic)
+// ---------------------------------------------------------------------------
+
+/**
+ * Atomically claim the next runnable task for a worker. Inside one
+ * transaction: lock the candidate row (FOR UPDATE SKIP LOCKED on PG — a
+ * racing claimer skips it; SQLite serializes), re-verify it is still QUEUED
+ * and within the worker's concurrency budget, then mark it RUNNING and bump
+ * the attempt count. ONE TASK = ONE ACTIVE CLAIM.
+ */
+export async function claimNextTask(workerId: string, now: Date = new Date()): Promise<SalesTask | null> {
+  const worker = await getWorker(workerId);
+  if (!worker) return null;
+  const maxConcurrent = worker.limits?.maxConcurrentTasks ?? 2;
+
+  return db.client.transaction(async () => {
+    const inFlight = await db.client.query(
+      'SELECT COUNT(*) AS n FROM sales_tasks WHERE worker_id = ? AND status = ?',
+      [workerId, 'RUNNING']
+    );
+    const running = Number(inFlight.rows[0]?.n ?? 0);
+    if (running >= maxConcurrent) return null;
+
+    const due = await db.client.query(
+      `SELECT id FROM sales_tasks
+       WHERE worker_id = ? AND status = ? AND available_at <= ?
+       ORDER BY created_at ASC
+       LIMIT 1 FOR UPDATE SKIP LOCKED`,
+      [workerId, 'QUEUED', now.toISOString()]
+    );
+    const row = due.rows[0];
+    if (!row) return null;
+
+    const task = await db.salesTasks.find(t => t.id === row.id);
+    if (!task || task.status !== 'QUEUED') return null; // lost the race
+    task.status = 'RUNNING';
+    task.attemptCount += 1;
+    task.claimedAt = now.toISOString();
+    task.updatedAt = now.toISOString();
+    await db.salesTasks.update(task);
+    return task;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Stale-task reaper (crash recovery)
+// ---------------------------------------------------------------------------
+
+/**
+ * Recover tasks claimed (RUNNING) but never completed because the process
+ * crashed. Stale = claimedAt older than STALE_TASK_MS. Deterministic +
+ * bounded: below the attempt cap the task returns to QUEUED for a retry; at
+ * the cap it DEAD_LETTERs. Row-locked so the reaper cannot race a live completer.
+ */
+export async function reapStaleTasks(now: Date = new Date()): Promise<number> {
+  const threshold = new Date(now.getTime() - STALE_TASK_MS).toISOString();
+  return db.client.transaction(async () => {
+    const stale = await db.client.query(
+      `SELECT id FROM sales_tasks
+       WHERE status = ? AND claimed_at IS NOT NULL AND claimed_at < ?
+       FOR UPDATE SKIP LOCKED`,
+      ['RUNNING', threshold]
+    );
+    let recovered = 0;
+    for (const row of stale.rows) {
+      const t = await db.salesTasks.find(x => x.id === row.id);
+      if (!t || t.status !== 'RUNNING') continue; // completed concurrently
+      const cap = (await getWorker(t.workerId))?.limits?.maxAttempts ?? MAX_TASK_ATTEMPTS;
+      if (t.attemptCount >= cap) {
+        t.status = 'DEAD_LETTERED';
+        t.lastError = 'Stale after crash; attempt limit reached.';
+        t.completedAt = now.toISOString();
+      } else {
+        t.status = 'QUEUED';
+        t.lastError = 'Recovered from stale (crashed) claim.';
+        t.availableAt = now.toISOString();
+      }
+      t.claimedAt = undefined;
+      t.updatedAt = now.toISOString();
+      await db.salesTasks.update(t);
+      recovered++;
+    }
+    return recovered;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Completion / failure recording
+// ---------------------------------------------------------------------------
+
+async function completeTask(task: SalesTask, now: Date): Promise<SalesTask> {
+  return db.client.transaction(async () => {
+    const t = await db.salesTasks.find(x => x.id === task.id);
+    if (!t || t.status !== 'RUNNING') return t ?? task; // already reaped/resolved
+    t.status = 'SUCCEEDED';
+    t.completedAt = now.toISOString();
+    t.lastError = undefined;
+    t.updatedAt = now.toISOString();
+    await db.salesTasks.update(t);
+    return t;
+  });
+}
+
+async function failTask(task: SalesTask, error: string, permanent: boolean, now: Date): Promise<SalesTask> {
+  const worker = await getWorker(task.workerId);
+  const cap = worker?.limits?.maxAttempts ?? MAX_TASK_ATTEMPTS;
+  return db.client.transaction(async () => {
+    const t = await db.salesTasks.find(x => x.id === task.id);
+    if (!t || t.status !== 'RUNNING') return t ?? task;
+    t.lastError = error.slice(0, 500);
+    t.claimedAt = undefined;
+    if (permanent || t.attemptCount >= cap) {
+      t.status = 'DEAD_LETTERED';
+      t.completedAt = now.toISOString();
+    } else {
+      // Retryable: back to QUEUED with exponential backoff.
+      t.status = 'QUEUED';
+      t.availableAt = new Date(now.getTime() + Math.pow(t.attemptCount, 2) * RETRY_BACKOFF_BASE_MS).toISOString();
+    }
+    t.updatedAt = now.toISOString();
+    await db.salesTasks.update(t);
+    return t;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Tick dispatcher
+// ---------------------------------------------------------------------------
+
+/**
+ * The smallest viable dispatcher: for each runnable worker, claim up to its
+ * concurrency budget and execute each claimed task through the channel,
+ * recording success / retryable-failure (backoff) / permanent-failure
+ * (dead-letter). Single-process, I/O-bound, DB-backed. Thin by design.
+ */
+export async function runDispatcherTick(now: Date = new Date()): Promise<{ claimed: number; succeeded: number; failed: number }> {
+  const workers = (await listWorkers()).filter(w => isWorkerRunnableNow(w, now));
+  let claimed = 0, succeeded = 0, failed = 0;
+
+  for (const worker of workers) {
+    const budget = worker.limits?.maxConcurrentTasks ?? 2;
+    for (let i = 0; i < budget; i++) {
+      const task = await claimNextTask(worker.id, now);
+      if (!task) break;
+      claimed++;
+      const started = Date.now();
+      try {
+        const result = await executeChannelTask(worker, task);
+        if (result.ok) {
+          await completeTask(task, now);
+          succeeded++;
+        } else {
+          await failTask(task, result.error || 'channel failure', !!result.permanent, now);
+          failed++;
+        }
+      } catch (e: any) {
+        await failTask(task, e?.message || 'execution error', false, now);
+        failed++;
+      }
+      const durationMs = Date.now() - started;
+      await recordOrchestrationEvent({
+        eventType: 'FACTORY_JOB_STEP',
+        metadata: { jobId: task.id },
+        summary: `sales worker ${worker.role} task ${task.type} attempt ${task.attemptCount} (${durationMs}ms)`
+      }).catch(() => {});
+    }
+  }
+  return { claimed, succeeded, failed };
+}

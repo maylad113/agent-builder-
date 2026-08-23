@@ -757,6 +757,78 @@ export interface FactoryJob {
   updatedAt: string;
 }
 
+// ---------------------------------------------------------------------------
+// Sales workforce execution substrate (Phase A / Task 34)
+// ---------------------------------------------------------------------------
+
+/** Platform-level autonomous worker. INSTANCES of one architecture — role and
+ *  config drive behavior; never a per-worker class. PLATFORM_OWNER-only. */
+export type SalesWorkerRole = 'DISCOVERY_RESEARCH' | 'PHONE_SALES' | 'INSTAGRAM_SALES';
+
+export type SalesWorkerStatus = 'IDLE' | 'RUNNING' | 'PAUSED' | 'OFFLINE';
+
+export type SalesChannelType = 'noop' | 'phone' | 'instagram_dm';
+
+export interface SalesWorkerScheduleWindow {
+  /** '*' or a weekday name; startMin/endMin are minutes-from-midnight. */
+  day: string;
+  startMin: number;
+  endMin: number;
+  activity: string;
+}
+
+export interface SalesWorkerSchedule {
+  enabled: boolean;
+  windows: SalesWorkerScheduleWindow[];
+  timezone?: string;
+}
+
+export interface SalesWorkerLimits {
+  maxConcurrentTasks: number;
+  maxAttempts: number;
+}
+
+export interface SalesWorker {
+  id: string;
+  role: SalesWorkerRole;
+  status: SalesWorkerStatus;
+  objective?: string;
+  channel: SalesChannelType;
+  schedule: SalesWorkerSchedule;
+  limits: SalesWorkerLimits;
+  strategyVersionId?: string;
+  currentTaskId?: string;
+  lastActivityAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Durable execution unit. Persisted before execution; claimed atomically. */
+export type SalesTaskStatus =
+  | 'QUEUED'
+  | 'RUNNING'
+  | 'SUCCEEDED'
+  | 'FAILED'
+  | 'DEAD_LETTERED';
+
+export interface SalesTask {
+  id: string;
+  workerId: string;
+  type: string;
+  payload?: Record<string, any>;
+  status: SalesTaskStatus;
+  attemptCount: number;
+  /** Earliest time the task may be claimed (backoff window). */
+  availableAt: string;
+  claimedAt?: string;
+  completedAt?: string;
+  lastError?: string;
+  /** UNIQUE — one logical task; duplicate enqueue returns the existing task. */
+  idempotencyKey: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export type DeliveryStatus = 'PENDING' | 'DELIVERED' | 'ACCEPTED';
 
 export interface Delivery {

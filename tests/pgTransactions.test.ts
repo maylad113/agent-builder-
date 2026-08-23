@@ -835,4 +835,35 @@ pgDescribe('PostgreSQL transaction integrity (real PG)', () => {
     // Repeated delete is safe.
     expect((await ownerA.delete(`/api/knowledge/${chunkId}`)).status).toBe(404);
   }, 30000);
+
+  it('sales workforce on PG: concurrent claim yields ONE winner; idempotent enqueue; stale reaper recovers', async () => {
+    const { createWorker, enqueueTask, claimNextTask, reapStaleTasks, getTask, STALE_TASK_MS } = await import('../src/server/sales/workforce');
+    const cfg = {
+      role: 'DISCOVERY_RESEARCH' as const, objective: 'research', channel: 'noop' as const,
+      schedule: { enabled: true, windows: [] }, limits: { maxConcurrentTasks: 2, maxAttempts: 3 }
+    };
+    const worker = await createWorker(cfg);
+
+    // Idempotent enqueue: duplicate key returns the same task.
+    const t1 = await enqueueTask({ workerId: worker.id, type: 'research', payload: {}, idempotencyKey: 'pg-sw-dup' });
+    const t2 = await enqueueTask({ workerId: worker.id, type: 'research', payload: {}, idempotencyKey: 'pg-sw-dup' });
+    expect(t2.id).toBe(t1.id);
+
+    // Concurrent claim of the SAME task: exactly one winner (SKIP LOCKED).
+    const [c1, c2] = await Promise.all([claimNextTask(worker.id), claimNextTask(worker.id)]);
+    const winners = [c1, c2].filter(Boolean);
+    expect(winners.length).toBe(1);
+    expect(winners[0]!.status).toBe('RUNNING');
+    expect(winners[0]!.attemptCount).toBe(1);
+
+    // Stale reaper: simulate a crashed claim (old claimed_at), recover it.
+    await state.db.client.query(
+      'UPDATE sales_tasks SET claimed_at = ? WHERE id = ?',
+      [new Date(Date.now() - STALE_TASK_MS - 5000).toISOString(), t1.id]
+    );
+    const recovered = await reapStaleTasks();
+    expect(recovered).toBeGreaterThanOrEqual(1);
+    const after = await getTask(t1.id);
+    expect(['QUEUED', 'FAILED', 'DEAD_LETTERED']).toContain(after!.status);
+  }, 60000);
 });
