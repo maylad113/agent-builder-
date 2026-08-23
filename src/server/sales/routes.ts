@@ -5,6 +5,7 @@ import {
   createWorker, listWorkers, getWorker, transitionWorkerStatus,
   enqueueTask, getTask, runDispatcherTick, reapStaleTasks
 } from './workforce';
+import { startScheduler, stopScheduler, schedulerIsRunning } from './scheduler';
 import { SalesWorkerRole, SalesChannelType } from '../../types';
 
 /**
@@ -74,4 +75,22 @@ salesRouter.post('/dispatch/tick', requireAuth, requireRole('PLATFORM_OWNER'), a
 
 salesRouter.post('/dispatch/reap-stale', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (_req: Request, res: Response) => {
   res.json({ recovered: await reapStaleTasks() });
+}));
+
+// Scheduler control (Task 35) — PLATFORM_OWNER-only. The controlled tick loop
+// (configurable interval, no overlap, graceful start/stop) driving the
+// existing dispatcher. No public/customer surface.
+salesRouter.post('/scheduler/start', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  const intervalMs = Number(req.body?.intervalMs) || undefined;
+  startScheduler({ intervalMs });
+  res.json({ running: true });
+}));
+
+salesRouter.post('/scheduler/stop', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (_req: Request, res: Response) => {
+  stopScheduler();
+  res.json({ running: false });
+}));
+
+salesRouter.get('/scheduler/status', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (_req: Request, res: Response) => {
+  res.json({ running: schedulerIsRunning() });
 }));

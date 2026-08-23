@@ -6,6 +6,7 @@ import {
 } from '../../types';
 import { recordOrchestrationEvent } from '../telemetry';
 import { executeChannelTask } from './noopChannel';
+import { scheduleWindowIncludes, zonedMinuteInDay, globalRunningTaskCount, globalCapacityAvailable } from './scheduler';
 
 /**
  * Sales workforce execution substrate (Phase A / Task 34).
@@ -48,8 +49,6 @@ const RETRY_BACKOFF_BASE_MS = 1000;
 function genId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
-
-const DAY_NAMES = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
 
 // ---------------------------------------------------------------------------
 // Worker registry
@@ -108,18 +107,20 @@ export async function transitionWorkerStatus(id: string, next: SalesWorkerStatus
   return w;
 }
 
-/** A worker may execute now when it is not paused/offline and its schedule
- *  (if it has windows) includes the current minute. Deterministic, testable. */
-export function isWorkerRunnableNow(w: SalesWorker, now: Date = new Date()): boolean {
+/** AUTHORITATIVE worker eligibility (Task 35): not paused/offline, schedule
+ *  enabled, and (when windows exist) the current minute — in the worker's own
+ *  timezone — falls inside a working window. Deterministic, single source. */
+export function isWorkerEligibleNow(w: SalesWorker, now: Date = new Date()): boolean {
   if (w.status === 'PAUSED' || w.status === 'OFFLINE') return false;
   if (!w.schedule.enabled) return false;
   if (!w.schedule.windows || w.schedule.windows.length === 0) return true;
-  const day = DAY_NAMES[now.getUTCDay()];
-  const minute = now.getUTCHours() * 60 + now.getUTCMinutes();
-  return w.schedule.windows.some(win =>
-    (win.day === '*' || win.day === day) && minute >= win.startMin && minute < win.endMin
-  );
+  const tz = w.schedule.timezone || 'UTC';
+  const { day, minute } = zonedMinuteInDay(now, tz);
+  return w.schedule.windows.some(win => scheduleWindowIncludes(win, day, minute));
 }
+
+// Back-compat alias for the Task 34 name (same authoritative decision).
+export const isWorkerRunnableNow = isWorkerEligibleNow;
 
 // ---------------------------------------------------------------------------
 // Tasks
@@ -315,12 +316,15 @@ async function failTask(task: SalesTask, error: string, permanent: boolean, now:
  * (dead-letter). Single-process, I/O-bound, DB-backed. Thin by design.
  */
 export async function runDispatcherTick(now: Date = new Date()): Promise<{ claimed: number; succeeded: number; failed: number }> {
-  const workers = (await listWorkers()).filter(w => isWorkerRunnableNow(w, now));
+  const workers = (await listWorkers()).filter(w => isWorkerEligibleNow(w, now));
   let claimed = 0, succeeded = 0, failed = 0;
 
   for (const worker of workers) {
     const budget = worker.limits?.maxConcurrentTasks ?? 2;
     for (let i = 0; i < budget; i++) {
+      // Global safety ceiling (Task 35): never exceed the workforce-wide
+      // concurrency cap, so one scheduling bug can't execute unlimited work.
+      if (!globalCapacityAvailable(await globalRunningTaskCount())) return { claimed, succeeded, failed };
       const task = await claimNextTask(worker.id, now);
       if (!task) break;
       claimed++;

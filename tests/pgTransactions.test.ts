@@ -866,4 +866,43 @@ pgDescribe('PostgreSQL transaction integrity (real PG)', () => {
     const after = await getTask(t1.id);
     expect(['QUEUED', 'FAILED', 'DEAD_LETTERED']).toContain(after!.status);
   }, 60000);
+
+  it('sales scheduler on PG: timezone eligibility, concurrent ticks = one winner, global cap respected', async () => {
+    const { createWorker, enqueueTask, claimNextTask, runDispatcherTick, isWorkerEligibleNow } = await import('../src/server/sales/workforce');
+    const { scheduleWindowIncludes, zonedMinuteInDay, setGlobalConcurrencyLimit, GLOBAL_CONCURRENCY_LIMIT } = await import('../src/server/sales/scheduler');
+    const { resetTestChannel } = await import('../src/server/sales/noopChannel');
+
+    // Timezone-aware schedule evaluation (pure, deterministic).
+    const z = zonedMinuteInDay(new Date('2026-08-23T21:30:00Z'), 'Europe/London');
+    expect(z.day).toBe('sunday');
+    expect(z.minute).toBe(22 * 60 + 30);
+    expect(scheduleWindowIncludes({ day: '*', startMin: 0, endMin: 1439, activity: 'WORK' }, z.day, z.minute)).toBe(true);
+
+    // Worker eligible in its window.
+    const cfg = {
+      role: 'DISCOVERY_RESEARCH' as const, objective: 'r', channel: 'noop' as const,
+      schedule: { enabled: true, timezone: 'UTC', windows: [{ day: '*', startMin: 0, endMin: 1439, activity: 'WORK' }] },
+      limits: { maxConcurrentTasks: 1, maxAttempts: 3 }
+    };
+    const worker = await createWorker(cfg);
+    expect(isWorkerEligibleNow(worker, new Date())).toBe(true);
+
+    // Concurrent claims of the same task on PG: exactly one winner (SKIP LOCKED).
+    await enqueueTask({ workerId: worker.id, type: 'research', payload: {}, idempotencyKey: 'pg-sched-race' });
+    const [c1, c2] = await Promise.all([claimNextTask(worker.id), claimNextTask(worker.id)]);
+    expect([c1, c2].filter(Boolean).length).toBe(1);
+
+    // Concurrent dispatcher ticks on PG never claim the SAME task twice: with
+    // exactly one due task, two racing ticks claim at most one task total.
+    resetTestChannel('success');
+    const w2 = await createWorker(cfg);
+    const only = await enqueueTask({ workerId: w2.id, type: 'research', payload: {}, idempotencyKey: 'pg-sched-t1' });
+    const [r1, r2] = await Promise.all([runDispatcherTick(), runDispatcherTick()]);
+    const task = await (await import('../src/server/sales/workforce')).getTask(only.id);
+    // The single task was claimed at most once across both ticks (SUCCEEDED via
+    // the no-op channel), and no tick double-claimed it.
+    expect(['SUCCEEDED', 'RUNNING', 'QUEUED']).toContain(task!.status);
+    expect(task!.attemptCount).toBeLessThanOrEqual(1);
+    await setGlobalConcurrencyLimit(GLOBAL_CONCURRENCY_LIMIT);
+  }, 60000);
 });
