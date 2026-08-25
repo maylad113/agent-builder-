@@ -46,7 +46,7 @@ export async function executeChannelTask(_worker: SalesWorker, _task: SalesTask,
     case 'permanent':
       return { outcome: 'REJECTED', success: false, retryable: false, attemptKey, error: 'simulated permanent failure' };
     case 'timeout':
-      return { outcome: 'TIMEOUT', success: true, retryable: true, attemptKey, error: 'simulated ambiguous timeout', providerId: `noop-provider-${attemptKey}` };
+      return { outcome: 'TIMEOUT', success: false, retryable: true, attemptKey, error: 'simulated ambiguous timeout', providerId: `noop-provider-${attemptKey}` };
     case 'slow':
       await new Promise(r => setTimeout(r, 50));
       return { outcome: 'CONNECTED', success: true, retryable: false, attemptKey };

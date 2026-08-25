@@ -289,7 +289,7 @@ describe('attempt recording', () => {
     await runDispatcherTick();
     const { attempts } = await listContactHistory(contact.id);
     expect(attempts.length).toBe(1);
-    expect(attempts[0].outcome).toBe('SUCCEEDED');
+    expect(attempts[0].outcome).toBe('CONNECTED'); // structured success outcome (Task 40: ledger records actual outcome)
     expect(attempts[0].taskId).toBe(task!.id);
     expect((await getSalesContact(contact.id))!.status).toBe('COMPLETED');
     // Historical attempts remain queryable after completion.

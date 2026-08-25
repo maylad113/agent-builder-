@@ -344,7 +344,11 @@ export async function runDispatcherTick(now: Date = new Date()): Promise<{ claim
         // server/task state. Client never sees/controls it.
         const dispatch: ChannelDispatch = { attemptKey: `${task.id}:${task.attemptCount}`, payload: task.payload };
         const result = await executeChannelTask(worker, task, dispatch);
-        if (result.success) {
+        // Classification is authoritative from the structured outcome, not the
+        // success boolean: ambiguous acceptance (TIMEOUT) MUST NOT complete
+        // the task, the ledger, or the contact.
+        const isSuccess = result.outcome === 'CONNECTED' || result.outcome === 'DELIVERED';
+        if (isSuccess) {
           await completeTask(task, now);
           succeeded++;
         } else {
@@ -352,17 +356,16 @@ export async function runDispatcherTick(now: Date = new Date()): Promise<{ claim
           failed++;
         }
         if (isOutreach) {
-          const outcome: SalesAttemptOutcome = (result.success ? 'SUCCEEDED' : result.outcome) as SalesAttemptOutcome;
           await recordAttempt({
-            taskId: task.id, attemptNumber: task.attemptCount, outcome,
-            error: result.success ? undefined : result.error,
+            taskId: task.id, attemptNumber: task.attemptCount, outcome: result.outcome,
+            error: isSuccess ? undefined : result.error,
             providerId: result.providerId, conversationId: result.conversationId
           });
-          if (result.success) await finalizeContact(String(task.payload.contactId), 'SUCCEEDED');
+          if (isSuccess) await finalizeContact(String(task.payload.contactId), 'SUCCEEDED');
           await recordOrchestrationEvent({
             eventType: 'OUTREACH_COMPLETED',
             metadata: { jobId: task.id },
-            summary: `outreach ${(result.success ? 'succeeded' : result.outcome.toLowerCase())} (attempt ${task.attemptCount})`
+            summary: `outreach ${result.outcome.toLowerCase()} (attempt ${task.attemptCount})`
           }).catch(() => {});
         }
       } catch (e: any) {

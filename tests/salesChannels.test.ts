@@ -55,10 +55,10 @@ describe('structured channel envelope (noop)', () => {
     expect(r.retryable).toBe(false);
   });
 
-  it('TIMEOUT is retryable (ambiguous accept)', async () => {
+  it('TIMEOUT is retryable failure (ambiguous accept is never a success)', async () => {
     resetTestChannel('timeout');
     const r = await executeChannelTask(await mkWorker(), {} as any, { attemptKey: 'k' });
-    expect(r.success).toBe(true); // provider may have accepted — ambiguous success, retryable key preservation
+    expect(r.success).toBe(false); // ambiguous acceptance must NOT count as success
     expect(r.outcome).toBe('TIMEOUT');
     expect(r.retryable).toBe(true);
   });
@@ -120,5 +120,66 @@ describe('attempt persistence with envelope', () => {
     expect(() => assertOutreachPayload({ prospectId: 'p', contactId: 'c' })).toThrow();
     expect(() => assertOutreachPayload({ prospectId: 'p', contactId: 'c', channel: 'noop' })).not.toThrow();
     expect(() => assertOutreachPayload({ prospectId: '', contactId: 'c', channel: 'noop' })).toThrow();
+  });
+});
+
+describe('dispatcher TIMEOUT semantics (end-to-end)', () => {
+  it('TIMEOUT → task retried, ledger TIMEOUT (never SUCCEEDED), contact stays ACTIVE', async () => {
+    resetTestChannel('timeout');
+    const p = await mkProspect();
+    const w = await mkWorker();
+    const { contact, task } = await enqueueOutreach(p.id, w.id);
+    const t1 = await runDispatcherTick();
+    // claimed counts every claim in the tick (TIMEOUT requeues; backoff 0ms in test env)
+    expect(t1.succeeded).toBe(0);
+    expect(t1.failed).toBeGreaterThanOrEqual(1);
+    // task retried (still QUEUED; attempts remain)
+    const t = await db.salesTasks.find(x => x.id === task!.id);
+    expect(t!.status).toBe('QUEUED');
+    expect(t!.attemptCount).toBe(1);
+    // ledger records the structured outcome — never SUCCEEDED
+    const { attempts } = await listContactHistory(contact.id);
+    expect(attempts.length).toBe(1);
+    expect(attempts[0].outcome).toBe('TIMEOUT');
+    expect(attempts[0].outcome).not.toBe('SUCCEEDED');
+    // contact NOT finalized
+    expect(contact.status).toBe('ACTIVE');
+    const after = await db.salesContacts.find(c => c.id === contact.id);
+    expect(after!.status).toBe('ACTIVE');
+  });
+
+  it('REJECTED → permanent DEAD_LETTERED, ledger REJECTED', async () => {
+    resetTestChannel('permanent');
+    const p = await mkProspect();
+    const w = await mkWorker();
+    const { contact } = await enqueueOutreach(p.id, w.id);
+    const t = await runDispatcherTick();
+    expect(t).toEqual({ claimed: 1, succeeded: 0, failed: 1 });
+    const { attempts } = await listContactHistory(contact.id);
+    expect(attempts[0].outcome).toBe('REJECTED');
+  });
+
+  it('ERROR → retryable requeue while attempts remain', async () => {
+    resetTestChannel('retryable');
+    const p = await mkProspect();
+    const w = await mkWorker();
+    const { contact, task } = await enqueueOutreach(p.id, w.id);
+    await runDispatcherTick();
+    const t = await db.salesTasks.find(x => x.id === task!.id);
+    expect(t!.status).toBe('QUEUED');
+    expect((await listContactHistory(contact.id)).attempts[0].outcome).toBe('ERROR');
+  });
+
+  it('CONNECTED → successful task + ledger + contact completion', async () => {
+    resetTestChannel('success');
+    const p = await mkProspect();
+    const w = await mkWorker();
+    const { contact, task } = await enqueueOutreach(p.id, w.id);
+    const t = await runDispatcherTick();
+    expect(t).toEqual({ claimed: 1, succeeded: 1, failed: 0 });
+    expect((await db.salesTasks.find(x => x.id === task!.id))!.status).toBe('SUCCEEDED');
+    const { attempts } = await listContactHistory(contact.id);
+    expect(attempts[0].outcome).toBe('CONNECTED');
+    expect((await db.salesContacts.find(c => c.id === contact.id))!.status).toBe('COMPLETED');
   });
 });
