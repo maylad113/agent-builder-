@@ -296,7 +296,7 @@ describe('attempt recording', () => {
     expect((await listContactHistory(contact.id)).attempts.length).toBe(1);
   });
 
-  it('retryable failure records a RETRYABLE_FAILURE attempt', async () => {
+  it('retryable failure records an ERROR (retryable) attempt', async () => {
     resetTestChannel('retryable');
     const p = await makeProspect();
     const w = await makeWorker();
@@ -304,11 +304,11 @@ describe('attempt recording', () => {
     await runDispatcherTick();
     const { attempts } = await listContactHistory(contact.id);
     expect(attempts.length).toBe(1);
-    expect(attempts[0].outcome).toBe('RETRYABLE_FAILURE');
+    expect(attempts[0].outcome).toBe('ERROR');
     expect(attempts[0].safeSummary).toBeTruthy();
   });
 
-  it('permanent failure records a PERMANENT_FAILURE attempt (no retry)', async () => {
+  it('permanent failure records a REJECTED (non-retryable) attempt (no retry)', async () => {
     resetTestChannel('permanent');
     const p = await makeProspect();
     const w = await makeWorker();
@@ -316,7 +316,7 @@ describe('attempt recording', () => {
     await runDispatcherTick();
     const { attempts } = await listContactHistory(contact.id);
     expect(attempts.length).toBe(1);
-    expect(attempts[0].outcome).toBe('PERMANENT_FAILURE');
+    expect(attempts[0].outcome).toBe('REJECTED');
   });
 
   it('each retry is a distinguishable new attempt row (history preserved)', async () => {
@@ -331,7 +331,7 @@ describe('attempt recording', () => {
     const { attempts } = await listContactHistory(contact.id);
     expect(attempts.length).toBe(MAX_TASK_ATTEMPTS);
     expect(new Set(attempts.map(a => a.id)).size).toBe(MAX_TASK_ATTEMPTS);
-    expect(attempts.every(a => a.outcome === 'RETRYABLE_FAILURE')).toBe(true);
+    expect(attempts.every(a => a.outcome === 'ERROR')).toBe(true);
     // final task state is DEAD_LETTERED by the substrate (unchanged behavior)
     const t = await db.salesTasks.find(x => x.id === task!.id);
     expect(t!.status).toBe('DEAD_LETTERED');

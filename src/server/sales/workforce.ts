@@ -2,12 +2,12 @@ import { db } from '../db';
 import {
   SalesWorker, SalesWorkerRole, SalesWorkerStatus, SalesChannelType,
   SalesWorkerSchedule, SalesWorkerLimits,
-  SalesTask, SalesTaskStatus
+  SalesTask, SalesTaskStatus, SalesAttemptOutcome
 } from '../../types';
 import { recordOrchestrationEvent } from '../telemetry';
-import { executeChannelTask } from './noopChannel';
+import { executeChannelTask, ChannelDispatch } from './noopChannel';
 import { scheduleWindowIncludes, zonedMinuteInDay, globalRunningTaskCount, globalCapacityAvailable } from './scheduler';
-import { recordAttempt, finalizeContact } from './contacts';
+import { recordAttempt, finalizeContact, assertOutreachPayload } from './contacts';
 
 /**
  * Sales workforce execution substrate (Phase A / Task 34).
@@ -331,6 +331,7 @@ export async function runDispatcherTick(now: Date = new Date()): Promise<{ claim
       claimed++;
       const started = Date.now();
       const isOutreach = Boolean(task.payload?.contactId);
+      if (isOutreach) assertOutreachPayload(task.payload); // strict shape before dispatch (never mutates task)
       try {
         if (isOutreach) {
           await recordOrchestrationEvent({
@@ -339,33 +340,40 @@ export async function runDispatcherTick(now: Date = new Date()): Promise<{ claim
             summary: `sales worker ${worker.role} outreach attempt ${task.attemptCount}`
           }).catch(() => {});
         }
-        const result = await executeChannelTask(worker, task);
-        if (result.ok) {
+        // Deterministic attempt-scoped idempotency key from authoritative
+        // server/task state. Client never sees/controls it.
+        const dispatch: ChannelDispatch = { attemptKey: `${task.id}:${task.attemptCount}`, payload: task.payload };
+        const result = await executeChannelTask(worker, task, dispatch);
+        if (result.success) {
           await completeTask(task, now);
           succeeded++;
         } else {
-          await failTask(task, result.error || 'channel failure', !!result.permanent, now);
+          await failTask(task, result.error || result.outcome, !result.retryable, now);
           failed++;
         }
         if (isOutreach) {
-          const outcome = result.ok ? 'SUCCEEDED' : (result.permanent ? 'PERMANENT_FAILURE' : 'RETRYABLE_FAILURE');
-          await recordAttempt({ taskId: task.id, attemptNumber: task.attemptCount, outcome, error: result.ok ? undefined : result.error });
-          if (result.ok) await finalizeContact(String(task.payload!.contactId), 'SUCCEEDED');
+          const outcome: SalesAttemptOutcome = (result.success ? 'SUCCEEDED' : result.outcome) as SalesAttemptOutcome;
+          await recordAttempt({
+            taskId: task.id, attemptNumber: task.attemptCount, outcome,
+            error: result.success ? undefined : result.error,
+            providerId: result.providerId, conversationId: result.conversationId
+          });
+          if (result.success) await finalizeContact(String(task.payload.contactId), 'SUCCEEDED');
           await recordOrchestrationEvent({
             eventType: 'OUTREACH_COMPLETED',
             metadata: { jobId: task.id },
-            summary: `outreach ${outcome.toLowerCase()} (attempt ${task.attemptCount})`
+            summary: `outreach ${(result.success ? 'succeeded' : result.outcome.toLowerCase())} (attempt ${task.attemptCount})`
           }).catch(() => {});
         }
       } catch (e: any) {
         await failTask(task, e?.message || 'execution error', false, now);
         failed++;
         if (isOutreach) {
-          await recordAttempt({ taskId: task.id, attemptNumber: task.attemptCount, outcome: 'RETRYABLE_FAILURE', error: e?.message || 'execution error' });
+          await recordAttempt({ taskId: task.id, attemptNumber: task.attemptCount, outcome: 'ERROR', error: e?.message || 'execution error' });
           await recordOrchestrationEvent({
             eventType: 'OUTREACH_COMPLETED',
             metadata: { jobId: task.id },
-            summary: `outreach retryable_failure (attempt ${task.attemptCount})`
+            summary: `outreach error (attempt ${task.attemptCount})`
           }).catch(() => {});
         }
       }

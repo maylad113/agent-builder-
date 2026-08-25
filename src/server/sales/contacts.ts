@@ -41,6 +41,18 @@ function safeSummarize(text: string | undefined, max = SUMMARY_MAX): string | un
   return trimmed.length > max ? trimmed.slice(0, max) + '…' : trimmed;
 }
 
+/** Strict outreach payload shape — protects a future real channel from
+ *  malformed/arbitrary payloads (id fields must be non-empty strings). */
+export function assertOutreachPayload(payload: Record<string, any> | undefined): { prospectId: string; contactId: string; channel: string } {
+  const p = payload as any;
+  if (!p || typeof p !== 'object') throw new Error('outreach payload missing');
+  const { prospectId, contactId, channel } = p;
+  if (typeof prospectId !== 'string' || !prospectId) throw new Error('invalid outreach payload (prospectId)');
+  if (typeof contactId !== 'string' || !contactId) throw new Error('invalid outreach payload (contactId)');
+  if (typeof channel !== 'string' || !channel) throw new Error('invalid outreach payload (channel)');
+  return { prospectId, contactId, channel };
+}
+
 // ---------------------------------------------------------------------------
 // Reads
 // ---------------------------------------------------------------------------
@@ -132,18 +144,17 @@ export async function enqueueOutreach(prospectId: string, workerId: string, now:
   const channel: SalesChannelType = worker.channel;
   const idempotencyKey = `outreach:${prospect.id}:${channel}`;
 
-  const existingContact = await db.salesContacts.find(c => c.prospectId === prospect.id && c.channel === channel);
-  if (existingContact) {
-    const last = await lastAttemptAt(existingContact.id);
-    if (cooldownActive(last, now)) {
-      throw new Error('Outreach cooldown active: a recent attempt exists; retry later.');
-    }
-  }
-
+  // Task 38: cooldown is rechecked INSIDE the transaction (contact row-based
+  // proof-of-cooldown becomes durable within the same atomic unit as the
+  // idempotent return) — closes the check-then-act slot race.
   const attempt = async (): Promise<OutreachAssignment> =>
     db.client.transaction(async () => {
       const contact = await db.salesContacts.find(c => c.prospectId === prospect.id && c.channel === channel);
       if (contact) {
+        const last = await lastAttemptAt(contact.id);
+        if (cooldownActive(last, now)) {
+          throw new Error('Outreach cooldown active: a recent attempt exists; retry later.');
+        }
         const task = await db.salesTasks.find(t => t.idempotencyKey === idempotencyKey);
         return { contact, task: task ?? undefined, created: false };
       }
@@ -180,6 +191,8 @@ export async function enqueueOutreach(prospectId: string, workerId: string, now:
     }
     return result;
   } catch (e: any) {
+    // Cooldown errors must propagate — they are not UNIQUE races.
+    if (/cooldown/i.test(e?.message || '')) throw e;
     // UNIQUE(prospect_id, channel) race backstop: the concurrent call won.
     const raced = await db.salesContacts.find(c => c.prospectId === prospect.id && c.channel === channel);
     if (raced) {
@@ -206,6 +219,8 @@ export async function recordAttempt(input: {
   attemptNumber: number;
   outcome: SalesAttemptOutcome;
   error?: string;
+  providerId?: string;
+  conversationId?: string;
 }): Promise<void> {
   try {
     const task = await getTask(input.taskId);
@@ -219,6 +234,8 @@ export async function recordAttempt(input: {
       taskId: input.taskId,
       attemptNumber: input.attemptNumber,
       outcome: input.outcome,
+      providerId: input.providerId,
+      conversationId: input.conversationId,
       safeSummary: safeSummarize(input.error),
       createdAt: new Date().toISOString()
     };

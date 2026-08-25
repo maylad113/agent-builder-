@@ -852,17 +852,44 @@ export interface SalesContact {
   updatedAt: string;
 }
 
-export type SalesAttemptOutcome = 'SUCCEEDED' | 'RETRYABLE_FAILURE' | 'PERMANENT_FAILURE';
+/** Structured channel execution outcome (Task 38). DELIVERED/CONNECTED are
+ *  success; REJECTED is non-retryable; TIMEOUT and ERROR are retryable. */
+export type ChannelOutcome = 'DELIVERED' | 'CONNECTED' | 'REJECTED' | 'TIMEOUT' | 'ERROR';
+
+/** Ledger-historical attempt outcome. SUCCEEDED (pre-Task-38 rows) or the
+ *  structured ChannelOutcome. Both remain readable (legacy compatibility). */
+export type SalesAttemptOutcome = 'SUCCEEDED' | 'RETRYABLE_FAILURE' | 'PERMANENT_FAILURE' | ChannelOutcome;
+
+/** Structured result envelope every sales channel must return (Task 38).
+ *  A future real provider uses attemptKey as its external request-id (safe
+ *  idempotent retry after crash/ambiguous timeout). outcome + retryable are
+ *  explicit so the dispatcher/ledger never re-derive them. */
+export interface ChannelResult {
+  outcome: ChannelOutcome;
+  success: boolean;
+  /** false = non-retryable (dead-letter). */
+  retryable: boolean;
+  /** Attempt-scoped idempotency receipt from the channel/provider. */
+  attemptKey?: string;
+  /** Provider message/call id (nullable). */
+  providerId?: string;
+  /** Future conversation binder (nullable). */
+  conversationId?: string;
+  error?: string;
+}
 
 /** Append-only outreach attempt ledger row. One row per REAL channel execution
  *  (attemptNumber mirrors the task's attemptCount at claim); a retry is a
- *  distinguishable new row. Never removed when a contact completes. */
+ *  distinguishable new row. Never removed when a contact completes.
+ *  providerId/conversationId are nullable (nullable-by-routine rule). */
 export interface SalesAttempt {
   id: string;
   contactId: string;
   taskId: string;
   attemptNumber: number;
   outcome: SalesAttemptOutcome;
+  providerId?: string;
+  conversationId?: string;
   safeSummary?: string;
   createdAt: string;
 }

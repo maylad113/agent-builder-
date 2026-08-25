@@ -1,23 +1,22 @@
-import { SalesWorker, SalesTask } from '../../types';
+import { SalesWorker, SalesTask, ChannelResult } from '../../types';
 
 /**
- * No-op / test execution channel (Phase A / Task 34).
- *
- * Proves the execution substrate WITHOUT any external integration. Configurable
- * in tests to simulate success, retryable failure, permanent failure, slow
- * execution, and duplicate invocation. NOT a production sales channel and never
- * customer-facing. Counts invocations so tests can assert exactly-once-per-claim
- * execution (at-least-once task execution with idempotent enqueue).
+ * No-op / test execution channel (Phase A / Task 34, hardened in Task 38).
+ * Implements the structured envelope contract: it RECEIVES the attempt-scoped
+ * idempotency key (attemptKey) and echoes it back, exactly as a future real
+ * provider must use it as its external request-id. Deterministic and never
+ * customer-facing.
  */
 
-export interface ChannelResult {
-  ok: boolean;
-  error?: string;
-  /** true = non-retryable (dead-letter immediately); false/undefined = retryable. */
-  permanent?: boolean;
+/** Outbound dispatch context. attemptKey is the deterministic server-side key
+ *  ({taskId}:{attemptNumber}) — a future provider must use it as its external
+ *  idempotency/request ID so ambiguous accept/timeout/retry never double-fires. */
+export interface ChannelDispatch {
+  attemptKey: string;
+  payload?: Record<string, any>;
 }
 
-export type TestChannelMode = 'success' | 'retryable' | 'permanent' | 'slow';
+export type TestChannelMode = 'success' | 'retryable' | 'permanent' | 'timeout' | 'slow';
 
 let mode: TestChannelMode = 'success';
 let calls = 0;
@@ -35,19 +34,23 @@ export function testChannelCalls(): number {
   return calls;
 }
 
-export async function executeChannelTask(_worker: SalesWorker, _task: SalesTask): Promise<ChannelResult> {
+export async function executeChannelTask(_worker: SalesWorker, _task: SalesTask, dispatch?: ChannelDispatch): Promise<ChannelResult> {
   calls++;
+  const attemptKey = dispatch?.attemptKey ?? 'unknown';
+  const payload = dispatch?.payload ?? _task.payload ?? {};
   switch (mode) {
     case 'success':
-      return { ok: true };
+      return { outcome: 'CONNECTED', success: true, retryable: false, attemptKey, providerId: `noop-provider-${attemptKey}`, conversationId: payload.conversationId as string | undefined };
     case 'retryable':
-      return { ok: false, error: 'simulated retryable failure', permanent: false };
+      return { outcome: 'ERROR', success: false, retryable: true, attemptKey, error: 'simulated retryable failure' };
     case 'permanent':
-      return { ok: false, error: 'simulated permanent failure', permanent: true };
+      return { outcome: 'REJECTED', success: false, retryable: false, attemptKey, error: 'simulated permanent failure' };
+    case 'timeout':
+      return { outcome: 'TIMEOUT', success: true, retryable: true, attemptKey, error: 'simulated ambiguous timeout', providerId: `noop-provider-${attemptKey}` };
     case 'slow':
       await new Promise(r => setTimeout(r, 50));
-      return { ok: true };
+      return { outcome: 'CONNECTED', success: true, retryable: false, attemptKey };
     default:
-      return { ok: true };
+      return { outcome: 'CONNECTED', success: true, retryable: false, attemptKey };
   }
 }

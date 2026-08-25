@@ -67,9 +67,20 @@ export async function initSalesWorkforceTables(client: DbClient): Promise<void> 
     task_id       TEXT NOT NULL,
     attempt_number INTEGER NOT NULL,
     outcome       TEXT NOT NULL,
+    provider_id   TEXT,
+    conversation_id TEXT,
     safe_summary  TEXT,
     created_at    TEXT NOT NULL,
     UNIQUE (task_id, attempt_number)
   )`);
   await client.exec('CREATE INDEX IF NOT EXISTS idx_sales_attempts_contact ON sales_attempts(contact_id, created_at)');
+
+  // Self-heal for pre-Task-38 databases (migration 025/pg-026 equivalent).
+  const attemptCols = await client.getColumns('sales_attempts');
+  if (!attemptCols.includes('provider_id')) {
+    await client.exec('ALTER TABLE sales_attempts ADD COLUMN provider_id TEXT');
+  }
+  if (!attemptCols.includes('conversation_id')) {
+    await client.exec('ALTER TABLE sales_attempts ADD COLUMN conversation_id TEXT');
+  }
 }
