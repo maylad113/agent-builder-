@@ -7,7 +7,7 @@ import {
 import { recordOrchestrationEvent } from '../telemetry';
 import { executeChannelTask, ChannelDispatch } from './noopChannel';
 import { scheduleWindowIncludes, zonedMinuteInDay, globalRunningTaskCount, globalCapacityAvailable } from './scheduler';
-import { recordAttempt, finalizeContact, assertOutreachPayload } from './contacts';
+import { recordAttempt, finalizeContact, assertOutreachPayload, assertProspectEligible, assertDiscoveryNotDismissed } from './contacts';
 import { ensureConversation, assertAutomatable, HumanGateError } from './conversations';
 
 /**
@@ -394,6 +394,31 @@ export async function runDispatcherTick(now: Date = new Date()): Promise<{ claim
           // concurrent first binds resolve to the SAME conversation row).
           const contact = await db.salesContacts.find(c => c.id === String(task.payload.contactId));
           if (!contact) throw new Error('Outreach contact not found.');
+          // Task 46: dispatch-time prospect lifecycle recheck — the SAME
+          // authoritative eligibility as assignment, re-verified at the final
+          // boundary before the channel executes. A stale task (prospect
+          // became REJECTED/CONVERTED/business-linked/dismissed after
+          // assignment) is TERMINALLY refused: no channel call, no retry, no
+          // retry-attempt consumption, contact never finalized.
+          try {
+            const prospect = await db.prospects.find(p => p.id === contact.prospectId);
+            assertProspectEligible(prospect);
+            await assertDiscoveryNotDismissed(prospect!);
+          } catch {
+            const reason = 'Prospect no longer eligible for outreach.';
+            await failTask(task, reason, true, now); // permanent — terminal DEAD_LETTERED
+            failed++;
+            await recordAttempt({
+              taskId: task.id, attemptNumber: task.attemptCount, outcome: 'PERMANENT_FAILURE',
+              error: reason
+            });
+            await recordOrchestrationEvent({
+              eventType: 'OUTREACH_COMPLETED',
+              metadata: { jobId: task.id },
+              summary: `outreach refused: prospect no longer eligible (attempt ${task.attemptCount})`
+            }).catch(() => {});
+            continue;
+          }
           await ensureConversation(contact);
           await recordOrchestrationEvent({
             eventType: 'OUTREACH_ATTEMPTED',

@@ -89,7 +89,9 @@ export function assertProspectEligible(prospect: Prospect | undefined): Prospect
   return prospect;
 }
 
-async function assertDiscoveryNotDismissed(prospect: Prospect): Promise<void> {
+/** Reused by the dispatch-time eligibility recheck (Task 46) — same
+ *  authoritative rule as assignment; do not duplicate. */
+export async function assertDiscoveryNotDismissed(prospect: Prospect): Promise<void> {
   if (!prospect.discoveryResultId) return;
   const result = await db.discoveryResults.find(r => r.id === prospect.discoveryResultId);
   if (result?.dismissedAt) throw new Error('Prospect source is dismissed and not eligible for outreach.');
