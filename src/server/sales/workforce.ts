@@ -8,7 +8,7 @@ import { recordOrchestrationEvent } from '../telemetry';
 import { executeChannelTask, ChannelDispatch } from './noopChannel';
 import { scheduleWindowIncludes, zonedMinuteInDay, globalRunningTaskCount, globalCapacityAvailable } from './scheduler';
 import { recordAttempt, finalizeContact, assertOutreachPayload } from './contacts';
-import { ensureConversation, assertAutomatable } from './conversations';
+import { ensureConversation, assertAutomatable, HumanGateError } from './conversations';
 
 /**
  * Sales workforce execution substrate (Phase A / Task 34).
@@ -34,7 +34,11 @@ export const WORKER_TRANSITIONS: Record<SalesWorkerStatus, SalesWorkerStatus[]> 
 
 export const TASK_TRANSITIONS: Record<SalesTaskStatus, SalesTaskStatus[]> = {
   QUEUED: ['RUNNING', 'DEAD_LETTERED'],
-  RUNNING: ['SUCCEEDED', 'FAILED', 'DEAD_LETTERED'],
+  // BLOCKED (Task 44): parked awaiting human conversation resolution.
+  RUNNING: ['SUCCEEDED', 'FAILED', 'DEAD_LETTERED', 'BLOCKED'],
+  // Resumed (→ QUEUED) only by conversation close; dead-letterable as an
+  // operator escape hatch. Never claimed, never reaped, never retried.
+  BLOCKED: ['QUEUED', 'DEAD_LETTERED'],
   SUCCEEDED: [],
   // FAILED is retryable: returns to QUEUED (bounded), else DEAD_LETTERED.
   FAILED: ['QUEUED', 'DEAD_LETTERED'],
@@ -272,6 +276,39 @@ export async function reapStaleTasks(now: Date = new Date()): Promise<number> {
 // Completion / failure recording
 // ---------------------------------------------------------------------------
 
+/**
+ * Park a claimed task because its conversation requires a human (Task 44).
+ * RUNNING → BLOCKED. NOT a retry: attemptCount unchanged, no backoff, no new
+ * task, payload/idempotency key/contact untouched. Re-locks the conversation
+ * row inside the transaction so a concurrent conversation close serializes
+ * (a task is never stranded BLOCKED after the conversation already closed).
+ * Only parks while the conversation is still NEEDS_HUMAN — otherwise throws
+ * and the caller falls back to the normal failure path.
+ */
+export async function blockTaskForHuman(taskId: string, reason: string, now: Date = new Date()): Promise<SalesTask> {
+  return db.client.transaction(async () => {
+    const t = await db.salesTasks.find(x => x.id === taskId);
+    if (!t || t.status !== 'RUNNING') throw new Error('Task is not running; cannot park.');
+    const contactId = t.payload?.contactId as string | undefined;
+    const conv = contactId
+      ? await db.salesConversations.find(c => c.contactId === contactId)
+      : undefined;
+    if (conv) {
+      await db.client.query('SELECT id FROM sales_conversations WHERE id = ? FOR UPDATE', [conv.id]);
+      const fresh = await db.salesConversations.find(c => c.id === conv.id);
+      if (!fresh || fresh.status !== 'NEEDS_HUMAN') {
+        throw new Error('Conversation no longer requires human review.');
+      }
+    }
+    t.status = 'BLOCKED';
+    t.claimedAt = undefined;
+    t.lastError = reason.slice(0, 500);
+    t.updatedAt = now.toISOString();
+    await db.salesTasks.update(t);
+    return t;
+  });
+}
+
 async function completeTask(task: SalesTask, now: Date): Promise<SalesTask> {
   return db.client.transaction(async () => {
     const t = await db.salesTasks.find(x => x.id === task.id);
@@ -335,9 +372,24 @@ export async function runDispatcherTick(now: Date = new Date()): Promise<{ claim
       if (isOutreach) assertOutreachPayload(task.payload); // strict shape before dispatch (never mutates task)
       try {
         if (isOutreach) {
-          // Task 42 human gate: a NEEDS_HUMAN/CLOSED conversation refuses
-          // automated outreach. Thrown pre-execution → failTask(retryable).
-          await assertAutomatable(String(task.payload.contactId));
+          // Task 42/44 human gate: a NEEDS_HUMAN conversation PARKS the task
+          // (no channel execution, no attempt consumption, no retry, no
+          // dead-letter). A CLOSED conversation keeps the Task-42 refusal
+          // semantics (generic failure path).
+          try {
+            await assertAutomatable(String(task.payload.contactId));
+          } catch (gateErr: any) {
+            if (gateErr instanceof HumanGateError) {
+              await blockTaskForHuman(task.id, gateErr.message, now);
+              await recordOrchestrationEvent({
+                eventType: 'SALES_TASK_PARKED',
+                metadata: { jobId: task.id },
+                summary: `sales task parked for human review (attempt ${task.attemptCount})`
+              }).catch(() => {});
+              continue; // next claim slot — task is visibly parked
+            }
+            throw gateErr;
+          }
           // Bind the contact's durable conversation (idempotent — retries and
           // concurrent first binds resolve to the SAME conversation row).
           const contact = await db.salesContacts.find(c => c.id === String(task.payload.contactId));

@@ -130,7 +130,9 @@ export async function recordOrchestrationEvent(params: {
     | 'OUTREACH_COMPLETED'
     | 'SALES_CONVERSATION_OPENED'
     | 'SALES_CONVERSATION_ESCALATED'
-    | 'SALES_CONVERSATION_CLOSED';
+    | 'SALES_CONVERSATION_CLOSED'
+    | 'SALES_TASK_PARKED'
+    | 'SALES_TASK_RESUMED';
   /** Absent for pre-prospect discovery events. */
   prospectId?: string;
   businessId?: string;

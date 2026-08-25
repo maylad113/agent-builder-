@@ -5,6 +5,11 @@ import {
 } from '../../types';
 import { recordOrchestrationEvent } from '../telemetry';
 
+/** Distinct error for the NEEDS_HUMAN automation gate (Task 44). The
+ *  dispatcher treats this as "park the task", NOT as a provider failure —
+ *  it never consumes a retry attempt. */
+export class HumanGateError extends Error {}
+
 /**
  * Platform-level sales conversation + human-escalation substrate (Task 42).
  *
@@ -192,19 +197,46 @@ export async function escalateConversation(id: string, reason?: string): Promise
 }
 
 /** Human resolution — NEEDS_HUMAN → CLOSED (or OPEN → CLOSED for direct close).
- *  Never auto-reopens; CLOSED is terminal. */
+ *  Never auto-reopens; CLOSED is terminal. Double-close is an idempotent no-op.
+ *  Task 44: closing a conversation RESUMES its parked (BLOCKED) outreach tasks
+ *  back to QUEUED in the SAME transaction — no new task, same id/payload/key,
+ *  attemptCount untouched, no retry penalty. The conversation row is locked
+ *  (FOR UPDATE on PG; mutex-serialized on SQLite) so a concurrent park
+ *  serializes deterministically — a task can never be stranded BLOCKED after
+ *  the conversation closed. */
 export async function closeConversation(id: string): Promise<SalesConversation> {
-  const conv = await getConversation(id);
-  if (!conv) throw new Error('Conversation not found.');
-  assertConversationTransition(conv.status, 'CLOSED');
-  const updated: SalesConversation = { ...conv, status: 'CLOSED', updatedAt: new Date().toISOString() };
-  await db.salesConversations.update(updated);
-  await recordOrchestrationEvent({
-    eventType: 'SALES_CONVERSATION_CLOSED',
-    metadata: { jobId: conv.contactId },
-    summary: `sales conversation closed (contact ${conv.contactId})`
-  }).catch(() => {});
-  return updated;
+  return db.client.transaction(async () => {
+    const conv = await getConversation(id);
+    if (!conv) throw new Error('Conversation not found.');
+    if (conv.status === 'CLOSED') return conv; // idempotent: no dup event/resume
+    assertConversationTransition(conv.status, 'CLOSED');
+    await db.client.query('SELECT id FROM sales_conversations WHERE id = ? FOR UPDATE', [id]);
+    const now = new Date().toISOString();
+    const updated: SalesConversation = { ...conv, status: 'CLOSED', updatedAt: now };
+    await db.salesConversations.update(updated);
+    // Resume ONLY parked outreach tasks tied to THIS conversation's contact.
+    const parked = (await db.salesTasks.toJSON())
+      .filter(t => t.status === 'BLOCKED' && t.payload?.contactId === conv.contactId);
+    for (const t of parked) {
+      t.status = 'QUEUED';
+      t.availableAt = now;
+      t.claimedAt = undefined;
+      t.lastError = undefined;
+      t.updatedAt = now;
+      await db.salesTasks.update(t);
+      await recordOrchestrationEvent({
+        eventType: 'SALES_TASK_RESUMED',
+        metadata: { jobId: t.id },
+        summary: `sales task resumed after human resolution (contact ${conv.contactId})`
+      }).catch(() => {});
+    }
+    await recordOrchestrationEvent({
+      eventType: 'SALES_CONVERSATION_CLOSED',
+      metadata: { jobId: conv.contactId },
+      summary: `sales conversation closed (contact ${conv.contactId})`
+    }).catch(() => {});
+    return updated;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -221,9 +253,13 @@ export async function assertAutomatable(contactId: string): Promise<void> {
   const conv = await db.salesConversations.find(c => c.contactId === contactId);
   if (!conv) return;
   if (conv.status === 'NEEDS_HUMAN') {
-    throw new Error('Conversation requires human review; automated outreach is blocked.');
+    throw new HumanGateError('Conversation requires human review; automated outreach is blocked.');
   }
-  if (conv.status === 'CLOSED') {
+  if (conv.status === 'CLOSED' && !conv.escalationReason) {
+    // Directly-closed (never escalated) conversation = terminal refusal.
+    // A conversation closed AFTER an escalation (escalationReason present)
+    // means the human RESOLVED the gate — automation may proceed (Task 44:
+    // this is what lets a resumed task execute normally).
     throw new Error('Conversation is closed; automated outreach is blocked.');
   }
 }

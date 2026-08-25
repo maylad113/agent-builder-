@@ -610,7 +610,10 @@ export type TelemetryEventType =
 // Sales conversation + human escalation (platform-level, ids + safe summaries only).
   | 'SALES_CONVERSATION_OPENED'
   | 'SALES_CONVERSATION_ESCALATED'
-  | 'SALES_CONVERSATION_CLOSED';
+  | 'SALES_CONVERSATION_CLOSED'
+// Human-gate task parking (platform-level, ids + safe summaries only).
+  | 'SALES_TASK_PARKED'
+  | 'SALES_TASK_RESUMED';
 
 export interface TelemetryEvent {
   id: string;
@@ -811,10 +814,14 @@ export interface SalesWorker {
   updatedAt: string;
 }
 
-/** Durable execution unit. Persisted before execution; claimed atomically. */
+/** Durable execution unit. Persisted before execution; claimed atomically.
+ *  BLOCKED (Task 44) = parked awaiting human resolution of the conversation;
+ *  does NOT consume attempts, is NOT claimed, and is resumed to QUEUED when
+ *  the conversation closes. */
 export type SalesTaskStatus =
   | 'QUEUED'
   | 'RUNNING'
+  | 'BLOCKED'
   | 'SUCCEEDED'
   | 'FAILED'
   | 'DEAD_LETTERED';

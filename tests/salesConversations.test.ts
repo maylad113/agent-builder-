@@ -194,7 +194,7 @@ describe('binding + dispatcher integration', () => {
     expect(conv!.contactId).toBe(contact.id);
   });
 
-  it('R: NEEDS_HUMAN blocks automated continuation (task fails, never succeeds)', async () => {
+  it('R: NEEDS_HUMAN parks automated continuation (Task 44: no burn, never succeeds silently)', async () => {
     resetTestChannel('success');
     const p = await mkProspect();
     const w = await mkWorker();
@@ -203,13 +203,13 @@ describe('binding + dispatcher integration', () => {
     const conv = (await db.salesConversations.filter(c => c.contactId === contact.id))[0];
     await escalateConversation(conv.id, 'customer asked to call back later');
     await expect(assertAutomatable(contact.id)).rejects.toThrow(/human review/);
-    // A new manual task on the same contact must fail (not silently succeed).
+    // A new manual task on the same contact is PARKED (not failed/retried).
     const t2 = await enqueueTask({ workerId: w.id, type: 'outreach', payload: { prospectId: p.id, contactId: contact.id, channel: 'noop' }, idempotencyKey: `manual-${Date.now()}-${seq++}` });
     const tick = await runDispatcherTick();
     expect(tick.succeeded).toBe(0);
-    expect(tick.failed).toBeGreaterThanOrEqual(1);
+    expect(tick.failed).toBe(0); // parked, not failed
     const t2row = await db.salesTasks.find(t => t.id === t2.id);
-    expect(t2row!.status).not.toBe('SUCCEEDED');
+    expect(t2row!.status).toBe('BLOCKED');
   });
 
   it('S: resolve closes the escalation', async () => {
@@ -222,7 +222,9 @@ describe('binding + dispatcher integration', () => {
     await escalateConversation(conv.id, 'needs pricing approval');
     const resolved = await closeConversation(conv.id);
     expect(resolved.status).toBe('CLOSED');
-    await expect(assertAutomatable(contact.id)).rejects.toThrow(/closed/);
+    // Task 44: closing AFTER an escalation means the human resolved the gate —
+    // automation is permitted again (the resumed task executes normally).
+    await expect(assertAutomatable(contact.id)).resolves.toBeUndefined();
   });
 
   it('Z: Task-40 TIMEOUT behavior unchanged with conversation binding', async () => {
