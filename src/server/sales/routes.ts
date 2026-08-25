@@ -6,6 +6,7 @@ import {
   enqueueTask, getTask, runDispatcherTick, reapStaleTasks
 } from './workforce';
 import { enqueueOutreach, getSalesContact, listContactHistory } from './contacts';
+import { getConversation, listConversations, listEscalationQueue, listTurns, closeConversation } from './conversations';
 import { startScheduler, stopScheduler, schedulerIsRunning } from './scheduler';
 import { SalesWorkerRole, SalesChannelType } from '../../types';
 
@@ -131,4 +132,41 @@ salesRouter.get('/contacts/:id/history', requireAuth, requireRole('PLATFORM_OWNE
   if (!contact) return res.status(404).json({ error: 'Not found.' });
   const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
   res.json({ contact, attempts: attempts.slice(-limit) });
+}));
+
+// ---------------------------------------------------------------------------
+// Task 42: sales conversations + human escalation (PLATFORM_OWNER-only).
+// Read-only conversation views + the human resolution route. Escalation is
+// initiated by server-side logic; routes never set conversation ids, provider
+// ids, or bypass the state machine.
+// ---------------------------------------------------------------------------
+
+salesRouter.get('/conversations', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
+  res.json(await listConversations(limit));
+}));
+
+salesRouter.get('/conversations/escalations', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
+  res.json(await listEscalationQueue(limit));
+}));
+
+salesRouter.get('/conversations/:id', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  const id = String(req.params.id || '');
+  if (!id || id.length > 200) return res.status(400).json({ error: 'A valid conversation id is required.' });
+  const conversation = await getConversation(id);
+  if (!conversation) return res.status(404).json({ error: 'Not found.' });
+  const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), 1000);
+  const turns = await listTurns(id, limit);
+  res.json({ conversation, turns });
+}));
+
+salesRouter.post('/conversations/:id/resolve', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const id = String(req.params.id || '');
+    if (!id || id.length > 200) return res.status(400).json({ error: 'A valid conversation id is required.' });
+    res.json(await closeConversation(id));
+  } catch (e: any) {
+    replyError(res, e);
+  }
 }));

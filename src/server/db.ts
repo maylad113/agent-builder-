@@ -30,6 +30,8 @@ import {
   SalesTask,
   SalesContact,
   SalesAttempt,
+  SalesConversation,
+  SalesConversationTurn,
   Delivery,
   Acceptance,
   LeadResearchReport,
@@ -234,6 +236,16 @@ const TABLES: Record<string, TableConfig> = {
   },
   salesAttempts: {
     table: 'sales_attempts',
+    jsonColumns: [],
+    booleanColumns: []
+  },
+  salesConversations: {
+    table: 'sales_conversations',
+    jsonColumns: [],
+    booleanColumns: []
+  },
+  salesConversationTurns: {
+    table: 'sales_conversation_turns',
     jsonColumns: [],
     booleanColumns: []
   },
@@ -606,6 +618,8 @@ export class AppDatabase {
   public salesTasks!: Collection<SalesTask>;
   public salesContacts!: Collection<SalesContact>;
   public salesAttempts!: Collection<SalesAttempt>;
+  public salesConversations!: Collection<SalesConversation>;
+  public salesConversationTurns!: Collection<SalesConversationTurn>;
   public leadResearchReports!: Collection<LeadResearchReport>;
   public discoveryRuns!: Collection<DiscoveryRun>;
   public discoveryResults!: Collection<DiscoveryResult>;
@@ -673,6 +687,8 @@ export class AppDatabase {
     this.salesTasks = new Collection<SalesTask>(this.client, TABLES.salesTasks);
     this.salesContacts = new Collection<SalesContact>(this.client, TABLES.salesContacts);
     this.salesAttempts = new Collection<SalesAttempt>(this.client, TABLES.salesAttempts);
+    this.salesConversations = new Collection<SalesConversation>(this.client, TABLES.salesConversations);
+    this.salesConversationTurns = new Collection<SalesConversationTurn>(this.client, TABLES.salesConversationTurns);
     this.leadResearchReports = new Collection<LeadResearchReport>(this.client, TABLES.leadResearchReports);
     this.discoveryRuns = new Collection<DiscoveryRun>(this.client, TABLES.discoveryRuns);
     this.discoveryResults = new Collection<DiscoveryResult>(this.client, TABLES.discoveryResults);

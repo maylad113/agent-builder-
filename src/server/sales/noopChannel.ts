@@ -16,7 +16,7 @@ export interface ChannelDispatch {
   payload?: Record<string, any>;
 }
 
-export type TestChannelMode = 'success' | 'retryable' | 'permanent' | 'timeout' | 'slow';
+export type TestChannelMode = 'success' | 'retryable' | 'permanent' | 'timeout' | 'slow' | 'success-conv';
 
 let mode: TestChannelMode = 'success';
 let calls = 0;
@@ -41,6 +41,8 @@ export async function executeChannelTask(_worker: SalesWorker, _task: SalesTask,
   switch (mode) {
     case 'success':
       return { outcome: 'CONNECTED', success: true, retryable: false, attemptKey, providerId: `noop-provider-${attemptKey}`, conversationId: payload.conversationId as string | undefined };
+    case 'success-conv': // test support: simulates a provider returning its own conversation/thread id
+      return { outcome: 'CONNECTED', success: true, retryable: false, attemptKey, providerId: `noop-provider-${attemptKey}`, conversationId: `noop-conv-${attemptKey}` };
     case 'retryable':
       return { outcome: 'ERROR', success: false, retryable: true, attemptKey, error: 'simulated retryable failure' };
     case 'permanent':

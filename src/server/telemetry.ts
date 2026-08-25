@@ -127,7 +127,10 @@ export async function recordOrchestrationEvent(params: {
     | 'DESIGN_GENERATE_FAILED'
     | 'SALES_ASSIGNED'
     | 'OUTREACH_ATTEMPTED'
-    | 'OUTREACH_COMPLETED';
+    | 'OUTREACH_COMPLETED'
+    | 'SALES_CONVERSATION_OPENED'
+    | 'SALES_CONVERSATION_ESCALATED'
+    | 'SALES_CONVERSATION_CLOSED';
   /** Absent for pre-prospect discovery events. */
   prospectId?: string;
   businessId?: string;

@@ -606,7 +606,11 @@ export type TelemetryEventType =
 // Sales contact assignment + outreach ledger (platform-level, ids + safe summaries only).
   | 'SALES_ASSIGNED'
   | 'OUTREACH_ATTEMPTED'
-  | 'OUTREACH_COMPLETED';
+  | 'OUTREACH_COMPLETED'
+// Sales conversation + human escalation (platform-level, ids + safe summaries only).
+  | 'SALES_CONVERSATION_OPENED'
+  | 'SALES_CONVERSATION_ESCALATED'
+  | 'SALES_CONVERSATION_CLOSED';
 
 export interface TelemetryEvent {
   id: string;
@@ -881,7 +885,8 @@ export interface ChannelResult {
 /** Append-only outreach attempt ledger row. One row per REAL channel execution
  *  (attemptNumber mirrors the task's attemptCount at claim); a retry is a
  *  distinguishable new row. Never removed when a contact completes.
- *  providerId/conversationId are nullable (nullable-by-routine rule). */
+ *  providerId/conversationId are nullable (nullable-by-routine rule).
+ *  conversationId is the INTERNAL sales_conversations.id (never a provider id). */
 export interface SalesAttempt {
   id: string;
   contactId: string;
@@ -891,6 +896,43 @@ export interface SalesAttempt {
   providerId?: string;
   conversationId?: string;
   safeSummary?: string;
+  createdAt: string;
+}
+
+// ---------------------------------------------------------------------------
+// Sales conversation + human escalation (Task 42, platform-level)
+// ---------------------------------------------------------------------------
+
+/** Deterministic conversation status machine: OPEN → NEEDS_HUMAN → CLOSED;
+ *  OPEN → CLOSED allowed. No CLOSED → * reopening. */
+export type SalesConversationStatus = 'OPEN' | 'NEEDS_HUMAN' | 'CLOSED';
+
+export type SalesTurnDirection = 'INBOUND' | 'OUTBOUND';
+/** Only these actors may author turns; arbitrary strings rejected. */
+export type SalesTurnActor = 'WORKER' | 'PROSPECT' | 'HUMAN' | 'SYSTEM';
+
+/** Platform-level sales conversation. Internal `id` is the durable identity
+ *  (attempts reference it); `providerConversationId` is the future provider's
+ *  thread/call id — a distinct, nullable, non-client-settable value. */
+export interface SalesConversation {
+  id: string;
+  contactId: string;
+  channel: SalesChannelType;
+  providerConversationId?: string;
+  status: SalesConversationStatus;
+  escalationReason?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Append-only conversation turn. safeContent is bounded + safe (never raw
+ *  provider payloads/secrets/prompts). */
+export interface SalesConversationTurn {
+  id: string;
+  conversationId: string;
+  direction: SalesTurnDirection;
+  actor: SalesTurnActor;
+  safeContent?: string;
   createdAt: string;
 }
 

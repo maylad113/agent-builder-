@@ -8,6 +8,7 @@ import { recordOrchestrationEvent } from '../telemetry';
 import { executeChannelTask, ChannelDispatch } from './noopChannel';
 import { scheduleWindowIncludes, zonedMinuteInDay, globalRunningTaskCount, globalCapacityAvailable } from './scheduler';
 import { recordAttempt, finalizeContact, assertOutreachPayload } from './contacts';
+import { ensureConversation, assertAutomatable } from './conversations';
 
 /**
  * Sales workforce execution substrate (Phase A / Task 34).
@@ -334,6 +335,14 @@ export async function runDispatcherTick(now: Date = new Date()): Promise<{ claim
       if (isOutreach) assertOutreachPayload(task.payload); // strict shape before dispatch (never mutates task)
       try {
         if (isOutreach) {
+          // Task 42 human gate: a NEEDS_HUMAN/CLOSED conversation refuses
+          // automated outreach. Thrown pre-execution → failTask(retryable).
+          await assertAutomatable(String(task.payload.contactId));
+          // Bind the contact's durable conversation (idempotent — retries and
+          // concurrent first binds resolve to the SAME conversation row).
+          const contact = await db.salesContacts.find(c => c.id === String(task.payload.contactId));
+          if (!contact) throw new Error('Outreach contact not found.');
+          await ensureConversation(contact);
           await recordOrchestrationEvent({
             eventType: 'OUTREACH_ATTEMPTED',
             metadata: { jobId: task.id },
@@ -348,6 +357,17 @@ export async function runDispatcherTick(now: Date = new Date()): Promise<{ claim
         // success boolean: ambiguous acceptance (TIMEOUT) MUST NOT complete
         // the task, the ledger, or the contact.
         const isSuccess = result.outcome === 'CONNECTED' || result.outcome === 'DELIVERED';
+        // Persist a provider-returned conversation id onto the contact's
+        // durable conversation (distinct from our internal id); internal id
+        // is what attempts reference.
+        let internalConversationId: string | undefined;
+        if (isOutreach) {
+          const contact = await db.salesContacts.find(c => c.id === String(task.payload.contactId));
+          if (contact) {
+            const conv = await ensureConversation(contact, result.conversationId);
+            internalConversationId = conv.id;
+          }
+        }
         if (isSuccess) {
           await completeTask(task, now);
           succeeded++;
@@ -359,7 +379,7 @@ export async function runDispatcherTick(now: Date = new Date()): Promise<{ claim
           await recordAttempt({
             taskId: task.id, attemptNumber: task.attemptCount, outcome: result.outcome,
             error: isSuccess ? undefined : result.error,
-            providerId: result.providerId, conversationId: result.conversationId
+            providerId: result.providerId, conversationId: internalConversationId
           });
           if (isSuccess) await finalizeContact(String(task.payload.contactId), 'SUCCEEDED');
           await recordOrchestrationEvent({
