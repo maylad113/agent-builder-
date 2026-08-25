@@ -5,6 +5,7 @@ import {
   createWorker, listWorkers, getWorker, transitionWorkerStatus,
   enqueueTask, getTask, runDispatcherTick, reapStaleTasks
 } from './workforce';
+import { enqueueOutreach, getSalesContact, listContactHistory } from './contacts';
 import { startScheduler, stopScheduler, schedulerIsRunning } from './scheduler';
 import { SalesWorkerRole, SalesChannelType } from '../../types';
 
@@ -22,7 +23,10 @@ const VALID_CHANNELS: SalesChannelType[] = ['noop', 'phone', 'instagram_dm'];
 
 function replyError(res: Response, e: any): void {
   const msg = e?.message || 'Request failed.';
-  const status = /not found/i.test(msg) ? 404 : /invalid|required|transition/i.test(msg) ? 400 : 500;
+  const status = /not found/i.test(msg) ? 404
+    : /cooldown active/i.test(msg) ? 409
+    : /invalid|required|transition|not eligible|dismissed/i.test(msg) ? 400
+    : 500;
   res.status(status).json({ error: msg });
 }
 
@@ -93,4 +97,38 @@ salesRouter.post('/scheduler/stop', requireAuth, requireRole('PLATFORM_OWNER'), 
 
 salesRouter.get('/scheduler/status', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (_req: Request, res: Response) => {
   res.json({ running: schedulerIsRunning() });
+}));
+
+// ---------------------------------------------------------------------------
+// Task 37: sales contact assignment + outreach ledger (PLATFORM_OWNER-only).
+// The channel is derived server-side from the WORKER row — a client-supplied
+// `channel` in the body is ignored. Eligibility is derived from the prospect row.
+// ---------------------------------------------------------------------------
+
+salesRouter.post('/prospects/:id/assign', rateLimit({ ...RATE_LIMITS.generate, prefix: 'sales-assign' }), requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const prospectId = String(req.params.id || '');
+    const workerId = String(req.body?.workerId || '');
+    if (!prospectId || prospectId.length > 200) return res.status(400).json({ error: 'A valid prospect id is required.' });
+    if (!workerId || workerId.length > 200) return res.status(400).json({ error: 'A valid workerId is required.' });
+    const result = await enqueueOutreach(prospectId, workerId);
+    res.status(result.created ? 201 : 200).json({ contact: result.contact, task: result.task, created: result.created });
+  } catch (e: any) {
+    replyError(res, e);
+  }
+}));
+
+salesRouter.get('/contacts/:id', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  const contact = await getSalesContact(String(req.params.id));
+  if (!contact) return res.status(404).json({ error: 'Not found.' });
+  res.json(contact);
+}));
+
+salesRouter.get('/contacts/:id/history', requireAuth, requireRole('PLATFORM_OWNER'), asyncHandler(async (req: Request, res: Response) => {
+  const id = String(req.params.id || '');
+  if (!id || id.length > 200) return res.status(400).json({ error: 'A valid contact id is required.' });
+  const { contact, attempts } = await listContactHistory(id);
+  if (!contact) return res.status(404).json({ error: 'Not found.' });
+  const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
+  res.json({ contact, attempts: attempts.slice(-limit) });
 }));

@@ -602,7 +602,11 @@ export type TelemetryEventType =
 // Designer proposal generation (DRAFT only — approval stays human).
   | 'DESIGN_GENERATE_RUN'
   | 'DESIGN_GENERATE_COMPLETED'
-  | 'DESIGN_GENERATE_FAILED';
+  | 'DESIGN_GENERATE_FAILED'
+// Sales contact assignment + outreach ledger (platform-level, ids + safe summaries only).
+  | 'SALES_ASSIGNED'
+  | 'OUTREACH_ATTEMPTED'
+  | 'OUTREACH_COMPLETED';
 
 export interface TelemetryEvent {
   id: string;
@@ -827,6 +831,40 @@ export interface SalesTask {
   idempotencyKey: string;
   createdAt: string;
   updatedAt: string;
+}
+
+// ---------------------------------------------------------------------------
+// Sales contact assignment + outreach ledger (Task 37)
+// ---------------------------------------------------------------------------
+
+export type SalesContactStatus = 'ACTIVE' | 'COMPLETED';
+
+/** Durable CURRENT relationship prospect <-> worker/channel. One ACTIVE contact
+ *  per (prospect, channel); UNIQUE(prospect_id, channel) is the race backstop. */
+export interface SalesContact {
+  id: string;
+  prospectId: string;
+  workerId: string;
+  channel: SalesChannelType;
+  status: SalesContactStatus;
+  assignedAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type SalesAttemptOutcome = 'SUCCEEDED' | 'RETRYABLE_FAILURE' | 'PERMANENT_FAILURE';
+
+/** Append-only outreach attempt ledger row. One row per REAL channel execution
+ *  (attemptNumber mirrors the task's attemptCount at claim); a retry is a
+ *  distinguishable new row. Never removed when a contact completes. */
+export interface SalesAttempt {
+  id: string;
+  contactId: string;
+  taskId: string;
+  attemptNumber: number;
+  outcome: SalesAttemptOutcome;
+  safeSummary?: string;
+  createdAt: string;
 }
 
 export type DeliveryStatus = 'PENDING' | 'DELIVERED' | 'ACCEPTED';

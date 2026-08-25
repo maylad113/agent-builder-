@@ -45,4 +45,31 @@ export async function initSalesWorkforceTables(client: DbClient): Promise<void> 
   await client.exec('CREATE INDEX IF NOT EXISTS idx_sales_tasks_worker_status ON sales_tasks(worker_id, status)');
   await client.exec('CREATE INDEX IF NOT EXISTS idx_sales_tasks_runnable ON sales_tasks(status, available_at)');
   await client.exec('CREATE INDEX IF NOT EXISTS idx_sales_tasks_stale ON sales_tasks(status, claimed_at)');
+
+  // Task 37: contact assignment + outreach attempt ledger.
+  await client.exec(`CREATE TABLE IF NOT EXISTS sales_contacts (
+    id            TEXT PRIMARY KEY,
+    prospect_id   TEXT NOT NULL,
+    worker_id     TEXT NOT NULL REFERENCES sales_workers(id),
+    channel       TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    assigned_at   TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    UNIQUE (prospect_id, channel)
+  )`);
+  await client.exec('CREATE INDEX IF NOT EXISTS idx_sales_contacts_worker ON sales_contacts(worker_id, status)');
+  await client.exec('CREATE INDEX IF NOT EXISTS idx_sales_contacts_prospect ON sales_contacts(prospect_id)');
+
+  await client.exec(`CREATE TABLE IF NOT EXISTS sales_attempts (
+    id            TEXT PRIMARY KEY,
+    contact_id    TEXT NOT NULL REFERENCES sales_contacts(id),
+    task_id       TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    outcome       TEXT NOT NULL,
+    safe_summary  TEXT,
+    created_at    TEXT NOT NULL,
+    UNIQUE (task_id, attempt_number)
+  )`);
+  await client.exec('CREATE INDEX IF NOT EXISTS idx_sales_attempts_contact ON sales_attempts(contact_id, created_at)');
 }

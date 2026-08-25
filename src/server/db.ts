@@ -28,6 +28,8 @@ import {
   FactoryJob,
   SalesWorker,
   SalesTask,
+  SalesContact,
+  SalesAttempt,
   Delivery,
   Acceptance,
   LeadResearchReport,
@@ -223,6 +225,16 @@ const TABLES: Record<string, TableConfig> = {
   salesTasks: {
     table: 'sales_tasks',
     jsonColumns: ['payload'],
+    booleanColumns: []
+  },
+  salesContacts: {
+    table: 'sales_contacts',
+    jsonColumns: [],
+    booleanColumns: []
+  },
+  salesAttempts: {
+    table: 'sales_attempts',
+    jsonColumns: [],
     booleanColumns: []
   },
   leadResearchReports: {
@@ -592,6 +604,8 @@ export class AppDatabase {
   public acceptances!: Collection<Acceptance>;
   public salesWorkers!: Collection<SalesWorker>;
   public salesTasks!: Collection<SalesTask>;
+  public salesContacts!: Collection<SalesContact>;
+  public salesAttempts!: Collection<SalesAttempt>;
   public leadResearchReports!: Collection<LeadResearchReport>;
   public discoveryRuns!: Collection<DiscoveryRun>;
   public discoveryResults!: Collection<DiscoveryResult>;
@@ -657,6 +671,8 @@ export class AppDatabase {
     this.acceptances = new Collection<Acceptance>(this.client, TABLES.acceptances);
     this.salesWorkers = new Collection<SalesWorker>(this.client, TABLES.salesWorkers);
     this.salesTasks = new Collection<SalesTask>(this.client, TABLES.salesTasks);
+    this.salesContacts = new Collection<SalesContact>(this.client, TABLES.salesContacts);
+    this.salesAttempts = new Collection<SalesAttempt>(this.client, TABLES.salesAttempts);
     this.leadResearchReports = new Collection<LeadResearchReport>(this.client, TABLES.leadResearchReports);
     this.discoveryRuns = new Collection<DiscoveryRun>(this.client, TABLES.discoveryRuns);
     this.discoveryResults = new Collection<DiscoveryResult>(this.client, TABLES.discoveryResults);

@@ -7,6 +7,7 @@ import {
 import { recordOrchestrationEvent } from '../telemetry';
 import { executeChannelTask } from './noopChannel';
 import { scheduleWindowIncludes, zonedMinuteInDay, globalRunningTaskCount, globalCapacityAvailable } from './scheduler';
+import { recordAttempt, finalizeContact } from './contacts';
 
 /**
  * Sales workforce execution substrate (Phase A / Task 34).
@@ -329,7 +330,15 @@ export async function runDispatcherTick(now: Date = new Date()): Promise<{ claim
       if (!task) break;
       claimed++;
       const started = Date.now();
+      const isOutreach = Boolean(task.payload?.contactId);
       try {
+        if (isOutreach) {
+          await recordOrchestrationEvent({
+            eventType: 'OUTREACH_ATTEMPTED',
+            metadata: { jobId: task.id },
+            summary: `sales worker ${worker.role} outreach attempt ${task.attemptCount}`
+          }).catch(() => {});
+        }
         const result = await executeChannelTask(worker, task);
         if (result.ok) {
           await completeTask(task, now);
@@ -338,16 +347,36 @@ export async function runDispatcherTick(now: Date = new Date()): Promise<{ claim
           await failTask(task, result.error || 'channel failure', !!result.permanent, now);
           failed++;
         }
+        if (isOutreach) {
+          const outcome = result.ok ? 'SUCCEEDED' : (result.permanent ? 'PERMANENT_FAILURE' : 'RETRYABLE_FAILURE');
+          await recordAttempt({ taskId: task.id, attemptNumber: task.attemptCount, outcome, error: result.ok ? undefined : result.error });
+          if (result.ok) await finalizeContact(String(task.payload!.contactId), 'SUCCEEDED');
+          await recordOrchestrationEvent({
+            eventType: 'OUTREACH_COMPLETED',
+            metadata: { jobId: task.id },
+            summary: `outreach ${outcome.toLowerCase()} (attempt ${task.attemptCount})`
+          }).catch(() => {});
+        }
       } catch (e: any) {
         await failTask(task, e?.message || 'execution error', false, now);
         failed++;
+        if (isOutreach) {
+          await recordAttempt({ taskId: task.id, attemptNumber: task.attemptCount, outcome: 'RETRYABLE_FAILURE', error: e?.message || 'execution error' });
+          await recordOrchestrationEvent({
+            eventType: 'OUTREACH_COMPLETED',
+            metadata: { jobId: task.id },
+            summary: `outreach retryable_failure (attempt ${task.attemptCount})`
+          }).catch(() => {});
+        }
       }
       const durationMs = Date.now() - started;
-      await recordOrchestrationEvent({
-        eventType: 'FACTORY_JOB_STEP',
-        metadata: { jobId: task.id },
-        summary: `sales worker ${worker.role} task ${task.type} attempt ${task.attemptCount} (${durationMs}ms)`
-      }).catch(() => {});
+      if (!isOutreach) {
+        await recordOrchestrationEvent({
+          eventType: 'FACTORY_JOB_STEP',
+          metadata: { jobId: task.id },
+          summary: `sales worker ${worker.role} task ${task.type} attempt ${task.attemptCount} (${durationMs}ms)`
+        }).catch(() => {});
+      }
     }
   }
   return { claimed, succeeded, failed };
