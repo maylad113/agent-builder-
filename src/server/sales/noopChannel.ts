@@ -10,8 +10,11 @@ import { SalesProviderAdapter, checkProspectEligibilityHelper } from './provider
  */
 
 /** Outbound dispatch context. attemptKey is the deterministic server-side key
- *  ({taskId}:{attemptNumber}) — a future provider must use it as its external
- *  idempotency/request ID so ambiguous accept/timeout/retry never double-fires. */
+ *  derived from the task's id (attemptKey = task.id). The same logical task
+ *  keeps the same attemptKey across retries and stale-reaper recovery — a
+ *  future provider must use it as its external idempotency/request ID so
+ *  ambiguous accept/timeout/retry never double-fires. The claim/ledger
+ *  attempt number (task.attemptCount) is deliberately NOT part of the key. */
 export interface ChannelDispatch {
   attemptKey: string;
   payload?: Record<string, any>;
