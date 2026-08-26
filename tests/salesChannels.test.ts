@@ -482,5 +482,95 @@ describe('Task 54 — provider eligibility contract', () => {
     expect(res.attemptKey).toBe('wtask-contract-echo');
     expect(res.providerId).toBe('noop-provider-wtask-contract-echo');
   });
+
+  // ---------------------------------------------------------------------------
+  // Task 54 audit finding: the provider seam must be ENFORCED — the pre-send
+  // eligibility check runs inside execute(), and dispatch routes through the
+  // adapter (never into the raw executor). No transaction/lock is held across
+  // the provider call; the check is a plain read before send.
+  // ---------------------------------------------------------------------------
+
+  it('adapter execute() refuses a deterministically ineligible prospect pre-send (no provider execution)', async () => {
+    const { noopAdapter } = await import('../src/server/sales/noopChannel');
+    resetTestChannel('success');
+    const p = await mkProspect();
+    const cur: any = await db.prospects.find((x: any) => x.id === p.id);
+    cur.status = 'REJECTED';
+    await db.prospects.update(cur);
+    const w: any = await mkWorker();
+    const t: any = { id: 'wtask-pre-send-refusal', payload: { prospectId: p.id } };
+    const before = testChannelCalls();
+    const res = await noopAdapter.execute(w, t, { attemptKey: t.id, payload: t.payload });
+    expect(res.outcome).toBe('REJECTED');
+    expect(res.retryable).toBe(false);
+    expect(res.error).toBe('Prospect no longer eligible for outreach.');
+    expect(testChannelCalls()).toBe(before); // external side effect never executed
+  });
+
+  it('adapter execute() performs the check and sends when the prospect is eligible', async () => {
+    const { noopAdapter } = await import('../src/server/sales/noopChannel');
+    resetTestChannel('success');
+    const p = await mkProspect();
+    const w: any = await mkWorker();
+    const t: any = { id: 'wtask-pre-send-ok', payload: { prospectId: p.id } };
+    const before = testChannelCalls();
+    const res = await noopAdapter.execute(w, t, { attemptKey: t.id, payload: t.payload });
+    expect(res.outcome).toBe('CONNECTED');
+    expect(testChannelCalls()).toBe(before + 1);
+  });
+
+  it('transient eligibility-check error in execute() propagates (retryable), never misclassified as ineligibility', async () => {
+    const { noopAdapter } = await import('../src/server/sales/noopChannel');
+    const p = await mkProspect();
+    const w: any = await mkWorker();
+    const t: any = { id: 'wtask-pre-send-transient', payload: { prospectId: p.id } };
+    const orig = db.prospects.find;
+    (db.prospects as any).find = async () => { throw new Error('simulated transient db error'); };
+    const before = testChannelCalls();
+    await expect(noopAdapter.execute(w, t, { attemptKey: t.id, payload: t.payload })).rejects.toThrow(/simulated transient/);
+    (db.prospects as any).find = orig;
+    expect(testChannelCalls()).toBe(before);
+  });
+
+  it('non-outreach payload (no prospectId) skips the pre-send check and executes', async () => {
+    const { noopAdapter } = await import('../src/server/sales/noopChannel');
+    resetTestChannel('success');
+    const w: any = await mkWorker();
+    const t: any = { id: 'wtask-no-prospect', payload: { anything: 'x' } };
+    const before = testChannelCalls();
+    const res = await noopAdapter.execute(w, t, { attemptKey: t.id, payload: t.payload });
+    expect(res.outcome).toBe('CONNECTED');
+    expect(testChannelCalls()).toBe(before + 1);
+  });
+
+  it('dispatch seam: prospect becomes ineligible between preflight and send → DEAD_LETTERED as REJECTED, provider never executed', async () => {
+    resetTestChannel('success');
+    const p = await mkProspect();
+    const w = await mkWorker();
+    const { contact, task } = await enqueueOutreach(p.id, w.id);
+    const orig = db.prospects.find.bind(db.prospects);
+    let prospectReads = 0;
+    // First read (dispatcher preflight) sees eligible; any later read (the
+    // adapter's pre-send check) sees REJECTED — simulating the TOCTOU race.
+    (db.prospects as any).find = async (pred: any) => {
+      prospectReads++;
+      const prospect = await orig(pred);
+      if (prospectReads >= 2 && prospect) return { ...(prospect as any), status: 'REJECTED' };
+      return prospect;
+    };
+    const callsBefore = testChannelCalls();
+    await runDispatcherTick();
+    (db.prospects as any).find = orig;
+    const t: any = await db.salesTasks.find((x: any) => x.id === task!.id);
+    expect(t.status).toBe('DEAD_LETTERED');
+    expect(t.lastError).toBe('Prospect no longer eligible for outreach.');
+    expect(testChannelCalls()).toBe(callsBefore); // no side effect executed
+    const c: any = await db.salesContacts.find((x: any) => x.id === contact.id);
+    expect(c.status).toBe('ACTIVE');
+    const { attempts } = await listContactHistory(contact.id);
+    expect(attempts.length).toBe(1);
+    expect(attempts[0].outcome).toBe('REJECTED');
+    expect(attempts[0].attemptNumber).toBe(1);
+  });
 });
 

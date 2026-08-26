@@ -34,23 +34,6 @@ export function isChannelImplemented(channel: unknown): channel is SalesChannelT
   return typeof channel === 'string' && IMPLEMENTED_CHANNELS.has(channel as SalesChannelType);
 }
 
-/**
- * Authoritative channel-gated dispatch. `noop` (and only `noop`) executes the
- * existing test channel — unchanged. Any other channel label is a real channel
- * without a provider adapter: this returns a structured PERMANENT refusal
- * (REJECTED, retryable=false) and NEVER invokes the noop executor, NEVER
- * fabricates a providerId/conversationId, and NEVER reports success. The
- * dispatcher feeds this into the existing permanent failTask path
- * (DEAD_LETTERED; contact stays ACTIVE). An unknown/unsupported label fails
- * the same way — it never falls through to noop.
- */
-export async function executeChannelDispatch(worker: SalesWorker, task: SalesTask, dispatch: ChannelDispatch): Promise<ChannelResult> {
-  if (!isChannelImplemented(worker?.channel)) {
-    return { outcome: 'REJECTED', success: false, retryable: false, error: CHANNEL_NOT_IMPLEMENTED };
-  }
-  return executeChannelTask(worker, task, dispatch);
-}
-
 export type TestChannelMode = 'success' | 'retryable' | 'permanent' | 'timeout' | 'slow' | 'success-conv';
 
 let mode: TestChannelMode = 'success';
@@ -93,13 +76,17 @@ export async function executeChannelTask(_worker: SalesWorker, _task: SalesTask,
 }
 
 // ---------------------------------------------------------------------------
-// Task 54: Provider Eligibility Contract (Noop Adapter Implementation)
+// Task 54: Provider Eligibility Contract — the seam is ENFORCED, not advisory.
 // ---------------------------------------------------------------------------
 
 /**
- * The noop channel satisfies the SalesProviderAdapter contract.
- * It uses the same underlying executor, echoing the stable attemptKey, and
- * implements a best-effort pre-send eligibility check.
+ * The noop channel satisfies the SalesProviderAdapter contract. The contract
+ * (providerContract.ts + docs/sales-toctou.md) REQUIRES every adapter to run
+ * the best-effort pre-send eligibility check in execute() immediately before
+ * the outbound provider call — narrowing the TOCTOU window without holding
+ * any DB transaction or lock across the external boundary. A missing prospect
+ * id (non-outreach task) skips the check. A transient check error propagates
+ * so the dispatcher drives the retryable path (never misclassified).
  */
 export class NoopProviderAdapter implements SalesProviderAdapter {
   readonly channel = 'noop';
@@ -109,8 +96,44 @@ export class NoopProviderAdapter implements SalesProviderAdapter {
   }
 
   async execute(worker: SalesWorker, task: SalesTask, dispatch: ChannelDispatch): Promise<ChannelResult> {
+    const prospectId = dispatch.payload?.prospectId ?? task.payload?.prospectId;
+    if (typeof prospectId === 'string' && prospectId) {
+      const eligible = await this.checkEligibilityBeforeSend(prospectId);
+      // Deterministic business refusal — permanent, no side effect executed.
+      if (!eligible) {
+        return { outcome: 'REJECTED', success: false, retryable: false, error: 'Prospect no longer eligible for outreach.' };
+      }
+    }
     return executeChannelTask(worker, task, dispatch);
   }
 }
 
 export const noopAdapter = new NoopProviderAdapter();
+
+/** Registered provider adapters keyed by channel. The dispatch seam routes
+ *  through these adapters (not the raw executor) so the eligibility contract
+ *  cannot be bypassed (Task 54 audit finding). */
+const PROVIDER_ADAPTERS: Partial<Record<SalesChannelType, SalesProviderAdapter>> = {
+  noop: noopAdapter
+};
+
+/**
+ * Authoritative channel-gated dispatch. A channel label without an adapter is
+ * a real channel without a provider implementation: this returns a structured
+ * PERMANENT refusal (REJECTED, retryable=false) and NEVER invokes the noop
+ * executor, NEVER fabricates a providerId/conversationId, and NEVER reports
+ * success. The dispatcher feeds this into the existing permanent failTask
+ * path (DEAD_LETTERED; contact stays ACTIVE). An implemented channel (today:
+ * only noop) executes through its registered SalesProviderAdapter, which
+ * enforces the pre-send eligibility contract — the seam cannot be skipped.
+ */
+export async function executeChannelDispatch(worker: SalesWorker, task: SalesTask, dispatch: ChannelDispatch): Promise<ChannelResult> {
+  if (!isChannelImplemented(worker?.channel)) {
+    return { outcome: 'REJECTED', success: false, retryable: false, error: CHANNEL_NOT_IMPLEMENTED };
+  }
+  const adapter = PROVIDER_ADAPTERS[worker.channel as SalesChannelType];
+  if (!adapter) {
+    return { outcome: 'REJECTED', success: false, retryable: false, error: CHANNEL_NOT_IMPLEMENTED };
+  }
+  return adapter.execute(worker, task, dispatch);
+}
