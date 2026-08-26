@@ -222,3 +222,87 @@ describe('dispatch-time eligibility recheck (stale-task window closed)', () => {
     expect(attempts[0].attemptNumber).toBe(1); // the claim's attempt number
   });
 });
+
+// ---------------------------------------------------------------------------
+// Task 52 — eligibility failure classification: deterministic ineligibility is
+// permanent; transient/unexpected DB errors are retryable (never DEAD_LETTERED
+// as "no longer eligible").
+// ---------------------------------------------------------------------------
+
+describe('Task 52 — eligibility error classification', () => {
+  it('transient DB error in eligibility recheck -> retryable QUEUED, NOT DEAD_LETTERED, contact ACTIVE', async () => {
+    const { contact, task } = await setup();
+    const orig = db.prospects.find;
+    (db.prospects as any).find = async () => { throw new Error('simulated transient db error'); };
+    await runDispatcherTick();
+    (db.prospects as any).find = orig;
+    const t: any = await db.salesTasks.find((x: any) => x.id === task!.id);
+    expect(t.status).toBe('QUEUED');
+    expect(t.attemptCount).toBe(1);
+    expect(t.lastError).toMatch(/simulated transient db error/);
+    expect(t.lastError).not.toBe('Prospect no longer eligible for outreach.');
+    const c: any = await db.salesContacts.find((x: any) => x.id === contact.id);
+    expect(c.status).toBe('ACTIVE');
+    const { attempts } = await listContactHistory(contact.id);
+    expect(attempts.length).toBe(1);
+    expect(attempts[0].outcome).toBe('ERROR');
+    expect(attempts[0].providerId ?? null).toBeNull();
+  });
+
+  it('transient error disappears -> next retry can execute normally (noop success)', async () => {
+    resetTestChannel('success');
+    const { contact, task } = await setup();
+    const orig = db.prospects.find;
+    (db.prospects as any).find = async () => { throw new Error('simulated transient db error'); };
+    await runDispatcherTick();
+    (db.prospects as any).find = orig;
+    let t: any = await db.salesTasks.find((x: any) => x.id === task!.id);
+    expect(t.status).toBe('QUEUED');
+    t.availableAt = new Date(Date.now() - 1000).toISOString();
+    await db.salesTasks.update(t);
+    await runDispatcherTick();
+    t = await db.salesTasks.find((x: any) => x.id === task!.id);
+    expect(t.status).toBe('SUCCEEDED');
+    const { attempts } = await listContactHistory(contact.id);
+    expect(attempts.map((a: any) => a.outcome)).toEqual(['ERROR', 'CONNECTED']);
+    expect(new Set(attempts.map((a: any) => a.providerId).filter(Boolean)).size).toBe(1); // same stable Task 50 key
+  });
+
+  it('transient error during discovery-dismissal recheck -> retryable, NOT DEAD_LETTERED', async () => {
+    // link a discovery result so assertDiscoveryNotDismissed actually queries it
+    const run = await runDiscovery({ idempotencyKey: `t52-disc-${Date.now()}-${seq++}`, candidates: [{ businessName: `T52-Src-${Date.now()}` }] });
+    const result = (await db.discoveryResults.filter(r => r.runId === run.id))[0];
+    const p = await mkProspect();
+    await db.prospects.update({ ...p, discoveryResultId: result.id });
+    const pLinked = await db.prospects.find(x => x.id === p.id);
+    const w = await createWorker(CFG);
+    const { contact, task } = await enqueueOutreach(pLinked!.id, w.id);
+    const orig = db.discoveryResults.find;
+    (db.discoveryResults as any).find = async () => { throw new Error('simulated transient db error'); };
+    await runDispatcherTick();
+    (db.discoveryResults as any).find = orig;
+    const t: any = await db.salesTasks.find((x: any) => x.id === task!.id);
+    expect(t.status).toBe('QUEUED');
+    expect(t.lastError).toMatch(/simulated transient db error/);
+    expect(t.lastError).not.toBe('Prospect no longer eligible for outreach.');
+    const c: any = await db.salesContacts.find((x: any) => x.id === contact.id);
+    expect(c.status).toBe('ACTIVE');
+  });
+
+  it('genuine ineligibility still DEAD_LETTERED permanently (typed error), error never retryable', async () => {
+    resetTestChannel('success');
+    const { contact, task } = await setup();
+    await setProspectState((await db.salesContacts.find((c: any) => c.id === contact.id)).prospectId, { status: 'REJECTED' });
+    const c0 = testChannelCalls();
+    await runDispatcherTick();
+    const t: any = await db.salesTasks.find((x: any) => x.id === task!.id);
+    expect(testChannelCalls()).toBe(c0);
+    expect(t.status).toBe('DEAD_LETTERED');
+    expect(t.lastError).toBe('Prospect no longer eligible for outreach.');
+    const { attempts } = await listContactHistory(contact.id);
+    expect(attempts.length).toBe(1);
+    expect(attempts[0].outcome).toBe('PERMANENT_FAILURE');
+    expect(attempts[0].providerId ?? null).toBeNull();
+  });
+});
+

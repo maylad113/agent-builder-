@@ -81,11 +81,23 @@ export async function listContactHistory(contactId: string): Promise<{
  *  missing, REJECTED, and CONVERTED prospects, prospects already linked to a
  *  real customer tenant (businessId set), and prospects whose discovery result
  *  was dismissed. Never trusts the caller. */
+/**
+ * Deterministic business ineligibility — thrown ONLY by the eligibility
+ * assertions for the genuine prospect lifecycle states below. Never a
+ * transient/infrastructure error. The dispatcher keys permanent refusal off
+ * this type, so a DB/connection fault is never misclassified as ineligibility.
+ */
+export class ProspectIneligibleError extends Error {}
+
+export function isProspectIneligibleError(e: unknown): e is ProspectIneligibleError {
+  return e instanceof ProspectIneligibleError;
+}
+
 export function assertProspectEligible(prospect: Prospect | undefined): Prospect {
-  if (!prospect) throw new Error('Prospect not found.');
-  if (prospect.status === 'REJECTED') throw new Error('Prospect is rejected and not eligible for outreach.');
-  if (prospect.status === 'CONVERTED') throw new Error('Prospect is converted and not eligible for outreach.');
-  if (prospect.businessId) throw new Error('Prospect is linked to a customer tenant and not eligible for outreach.');
+  if (!prospect) throw new ProspectIneligibleError('Prospect not found.');
+  if (prospect.status === 'REJECTED') throw new ProspectIneligibleError('Prospect is rejected and not eligible for outreach.');
+  if (prospect.status === 'CONVERTED') throw new ProspectIneligibleError('Prospect is converted and not eligible for outreach.');
+  if (prospect.businessId) throw new ProspectIneligibleError('Prospect is linked to a customer tenant and not eligible for outreach.');
   return prospect;
 }
 
@@ -94,7 +106,7 @@ export function assertProspectEligible(prospect: Prospect | undefined): Prospect
 export async function assertDiscoveryNotDismissed(prospect: Prospect): Promise<void> {
   if (!prospect.discoveryResultId) return;
   const result = await db.discoveryResults.find(r => r.id === prospect.discoveryResultId);
-  if (result?.dismissedAt) throw new Error('Prospect source is dismissed and not eligible for outreach.');
+  if (result?.dismissedAt) throw new ProspectIneligibleError('Prospect source is dismissed and not eligible for outreach.');
 }
 
 function assertWorkerEligible(worker: SalesWorker | undefined): SalesWorker {

@@ -7,7 +7,7 @@ import {
 import { recordOrchestrationEvent } from '../telemetry';
 import { executeChannelDispatch, ChannelDispatch } from './noopChannel';
 import { scheduleWindowIncludes, zonedMinuteInDay, globalRunningTaskCount, globalCapacityAvailable } from './scheduler';
-import { recordAttempt, finalizeContact, assertOutreachPayload, assertProspectEligible, assertDiscoveryNotDismissed } from './contacts';
+import { recordAttempt, finalizeContact, assertOutreachPayload, assertProspectEligible, assertDiscoveryNotDismissed, isProspectIneligibleError } from './contacts';
 import { ensureConversation, assertAutomatable, HumanGateError } from './conversations';
 
 /**
@@ -400,11 +400,17 @@ export async function runDispatcherTick(now: Date = new Date()): Promise<{ claim
           // became REJECTED/CONVERTED/business-linked/dismissed after
           // assignment) is TERMINALLY refused: no channel call, no retry, no
           // retry-attempt consumption, contact never finalized.
+          // Task 52: classify eligibility failures — permanent refusal ONLY for
+          // a ProspectIneligibleError thrown by the deterministic asserts. Any
+          // other (transient/infrastructure) error is rethrown into the outer
+          // retryable-failure path; it is NEVER misclassified as ineligibility.
           try {
             const prospect = await db.prospects.find(p => p.id === contact.prospectId);
             assertProspectEligible(prospect);
             await assertDiscoveryNotDismissed(prospect!);
-          } catch {
+          } catch (elErr: any) {
+            if (!isProspectIneligibleError(elErr)) throw elErr; // transient -> retryable
+            
             const reason = 'Prospect no longer eligible for outreach.';
             await failTask(task, reason, true, now); // permanent — terminal DEAD_LETTERED
             failed++;
