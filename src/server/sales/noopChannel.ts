@@ -1,4 +1,5 @@
 import { SalesWorker, SalesTask, ChannelResult, SalesChannelType } from '../../types';
+import { SalesProviderAdapter, checkProspectEligibilityHelper } from './providerContract';
 
 /**
  * No-op / test execution channel (Phase A / Task 34, hardened in Task 38).
@@ -90,3 +91,26 @@ export async function executeChannelTask(_worker: SalesWorker, _task: SalesTask,
       return { outcome: 'CONNECTED', success: true, retryable: false, attemptKey };
   }
 }
+
+// ---------------------------------------------------------------------------
+// Task 54: Provider Eligibility Contract (Noop Adapter Implementation)
+// ---------------------------------------------------------------------------
+
+/**
+ * The noop channel satisfies the SalesProviderAdapter contract.
+ * It uses the same underlying executor, echoing the stable attemptKey, and
+ * implements a best-effort pre-send eligibility check.
+ */
+export class NoopProviderAdapter implements SalesProviderAdapter {
+  readonly channel = 'noop';
+
+  async checkEligibilityBeforeSend(prospectId: string): Promise<boolean> {
+    return checkProspectEligibilityHelper(prospectId);
+  }
+
+  async execute(worker: SalesWorker, task: SalesTask, dispatch: ChannelDispatch): Promise<ChannelResult> {
+    return executeChannelTask(worker, task, dispatch);
+  }
+}
+
+export const noopAdapter = new NoopProviderAdapter();

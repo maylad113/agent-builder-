@@ -416,3 +416,71 @@ describe('Task 50 — stable provider idempotency key', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Task 54 — Provider Eligibility Contract
+// ---------------------------------------------------------------------------
+
+describe('Task 54 — provider eligibility contract', () => {
+  it('contract module exposes the eligibility check seam', async () => {
+    const pc = await import('../src/server/sales/providerContract');
+    expect(typeof pc.checkProspectEligibilityHelper).toBe('function');
+  });
+
+  it('noop adapter satisfies the SalesProviderAdapter contract', async () => {
+    const { noopAdapter } = await import('../src/server/sales/noopChannel');
+    expect(noopAdapter.channel).toBe('noop');
+    expect(typeof noopAdapter.checkEligibilityBeforeSend).toBe('function');
+    expect(typeof noopAdapter.execute).toBe('function');
+    // structural contract check: a SalesProviderAdapter reference is satisfied
+    const adapter: import('../src/server/sales/providerContract').SalesProviderAdapter = noopAdapter;
+    expect(adapter.channel).toBe('noop');
+  });
+
+  it('noop eligibility check returns the CURRENT eligibility state (best-effort, not atomic)', async () => {
+    const { noopAdapter } = await import('../src/server/sales/noopChannel');
+    const p = await mkProspect();
+    expect(await noopAdapter.checkEligibilityBeforeSend(p.id)).toBe(true);
+    const cur: any = await db.prospects.find((x: any) => x.id === p.id);
+    cur.status = 'REJECTED';
+    await db.prospects.update(cur);
+    expect(await noopAdapter.checkEligibilityBeforeSend(p.id)).toBe(false);
+  });
+
+  it('noop eligibility check returns false for a missing prospect', async () => {
+    const { noopAdapter } = await import('../src/server/sales/noopChannel');
+    expect(await noopAdapter.checkEligibilityBeforeSend('prsp-does-not-exist')).toBe(false);
+  });
+
+  it('transient DB error during noop eligibility check propagates (retryable), not misclassified', async () => {
+    const { noopAdapter } = await import('../src/server/sales/noopChannel');
+    const p = await mkProspect();
+    const orig = db.prospects.find;
+    (db.prospects as any).find = async () => { throw new Error('simulated transient db error'); };
+    await expect(noopAdapter.checkEligibilityBeforeSend(p.id)).rejects.toThrow(/simulated transient/);
+    (db.prospects as any).find = orig;
+  });
+
+  it('channel gate behavior unchanged: phone still refused, noop still executes', async () => {
+    expect(isChannelImplemented('noop')).toBe(true);
+    expect(isChannelImplemented('phone')).toBe(false);
+    expect(isChannelImplemented('instagram_dm')).toBe(false);
+    expect(isChannelImplemented('whatsapp')).toBe(false);
+    resetTestChannel('success');
+    const w: any = await mkWorker({ channel: 'phone' });
+    const t: any = { id: 'wtask-gate-check', payload: {} };
+    const res = await executeChannelDispatch(w, t, { attemptKey: t.id });
+    expect(res.outcome).toBe('REJECTED');
+    expect(res.retryable).toBe(false);
+  });
+
+  it('noop adapter execute() echoes the stable Task 50 attemptKey', async () => {
+    const { noopAdapter } = await import('../src/server/sales/noopChannel');
+    resetTestChannel('success');
+    const w: any = await mkWorker();
+    const t: any = { id: 'wtask-contract-echo', payload: {} };
+    const res = await noopAdapter.execute(w, t, { attemptKey: t.id });
+    expect(res.attemptKey).toBe('wtask-contract-echo');
+    expect(res.providerId).toBe('noop-provider-wtask-contract-echo');
+  });
+});
+
