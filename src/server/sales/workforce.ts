@@ -5,7 +5,7 @@ import {
   SalesTask, SalesTaskStatus, SalesAttemptOutcome
 } from '../../types';
 import { recordOrchestrationEvent } from '../telemetry';
-import { executeChannelTask, ChannelDispatch } from './noopChannel';
+import { executeChannelDispatch, ChannelDispatch } from './noopChannel';
 import { scheduleWindowIncludes, zonedMinuteInDay, globalRunningTaskCount, globalCapacityAvailable } from './scheduler';
 import { recordAttempt, finalizeContact, assertOutreachPayload, assertProspectEligible, assertDiscoveryNotDismissed } from './contacts';
 import { ensureConversation, assertAutomatable, HumanGateError } from './conversations';
@@ -429,7 +429,9 @@ export async function runDispatcherTick(now: Date = new Date()): Promise<{ claim
         // Deterministic attempt-scoped idempotency key from authoritative
         // server/task state. Client never sees/controls it.
         const dispatch: ChannelDispatch = { attemptKey: `${task.id}:${task.attemptCount}`, payload: task.payload };
-        const result = await executeChannelTask(worker, task, dispatch);
+        // Channel-gated (Task 48): an unimplemented real channel returns a
+        // structured PERMANENT refusal here and never reaches the noop executor.
+        const result = await executeChannelDispatch(worker, task, dispatch);
         // Classification is authoritative from the structured outcome, not the
         // success boolean: ambiguous acceptance (TIMEOUT) MUST NOT complete
         // the task, the ledger, or the contact.

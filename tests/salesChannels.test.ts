@@ -16,7 +16,7 @@ delete process.env.GEMINI_API_KEY;
 const { db } = await import('../src/server/db');
 const { createProspect } = await import('../src/server/orchestration/prospects');
 const { createWorker, enqueueTask, claimNextTask, runDispatcherTick } = await import('../src/server/sales/workforce');
-const { executeChannelTask, resetTestChannel } = await import('../src/server/sales/noopChannel');
+const { executeChannelTask, executeChannelDispatch, isChannelImplemented, resetTestChannel, testChannelCalls } = await import('../src/server/sales/noopChannel');
 import type { ChannelDispatch } from '../src/server/sales/noopChannel';
 const { enqueueOutreach, listContactHistory, assertOutreachPayload, recordAttempt } = await import('../src/server/sales/contacts');
 
@@ -183,3 +183,149 @@ describe('dispatcher TIMEOUT semantics (end-to-end)', () => {
     expect((await db.salesContacts.find(c => c.id === contact.id))!.status).toBe('COMPLETED');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Task 48 — channel-gated dispatch: refuse unimplemented real channels.
+// Proves phone / instagram_dm / unknown NEVER reach the noop executor and
+// never fabricate success, while the noop channel is untouched.
+// ---------------------------------------------------------------------------
+
+describe('Task 48 — channel gate (refuse unimplemented channels)', () => {
+  async function mkChannelWorker(channel: 'noop' | 'phone' | 'instagram_dm') {
+    return createWorker({
+      role: 'PHONE_SALES', channel,
+      schedule: { enabled: true, timezone: 'UTC', windows: [] },
+      limits: { maxConcurrentTasks: 2, maxAttempts: 3 }
+    } as any);
+  }
+
+  it('gate boundary: noop executes the noop executor; phone/instagram_dm refuse without calling it', async () => {
+    resetTestChannel('success');
+    const dispatch = { attemptKey: 'gate:1', payload: {} };
+    const noopW = await mkChannelWorker('noop');
+    const c0 = testChannelCalls();
+    const ok = await executeChannelDispatch(noopW, {} as any, dispatch);
+    expect(ok.outcome).toBe('CONNECTED');
+    expect(testChannelCalls()).toBe(c0 + 1); // noop executor invoked
+
+    for (const ch of ['phone', 'instagram_dm'] as const) {
+      const w = await mkChannelWorker(ch);
+      const cN = testChannelCalls();
+      const r = await executeChannelDispatch(w, {} as any, dispatch);
+      expect(testChannelCalls()).toBe(cN); // noop executor NOT invoked
+      expect(r.outcome).toBe('REJECTED');
+      expect(r.success).toBe(false);
+      expect(r.retryable).toBe(false); // permanent
+      expect(r.providerId == null).toBe(true);
+      expect(r.conversationId == null).toBe(true);
+      expect(r.error).toBe('Channel not implemented.');
+      expect(r.error).not.toMatch(/phone|instagram|prospect|noop-provider/i); // bounded, no leak
+    }
+  });
+
+  it('isChannelImplemented: only noop; unknown/unsupported labels are refused', () => {
+    expect(isChannelImplemented('noop')).toBe(true);
+    expect(isChannelImplemented('phone')).toBe(false);
+    expect(isChannelImplemented('instagram_dm')).toBe(false);
+    expect(isChannelImplemented('carrier_pigeon')).toBe(false); // unknown -> never falls through to noop
+    expect(isChannelImplemented(undefined)).toBe(false);
+    expect(isChannelImplemented(123)).toBe(false);
+  });
+
+  it('unknown/unsupported channel label refuses (never silently uses noop)', async () => {
+    resetTestChannel('success');
+    const w = await mkChannelWorker('noop');
+    const forged: any = { ...w, channel: 'carrier_pigeon' }; // bypasses TS + route enum
+    const c0 = testChannelCalls();
+    const r = await executeChannelDispatch(forged, {} as any, { attemptKey: 'gate:2', payload: {} });
+    expect(testChannelCalls()).toBe(c0);
+    expect(r.outcome).toBe('REJECTED');
+    expect(r.retryable).toBe(false);
+  });
+
+  for (const channel of ['phone', 'instagram_dm'] as const) {
+    it(`${channel}: dispatch -> DEAD_LETTERED, no noop call, no success ledger, contact ACTIVE`, async () => {
+      resetTestChannel('success');
+      const p = await mkProspect();
+      const w = await mkChannelWorker(channel);
+      const { contact, task } = await enqueueOutreach(p.id, w.id);
+      const c0 = testChannelCalls();
+      const tick = await runDispatcherTick();
+      expect(testChannelCalls()).toBe(c0); // noop executor NEVER reached
+      expect(tick.succeeded).toBe(0);
+      const t = await db.salesTasks.find(x => x.id === task!.id);
+      expect(t!.status).toBe('DEAD_LETTERED');
+      expect(t!.attemptCount).toBe(1); // single claim; refusal is permanent (no retry consumption)
+      expect(t!.lastError).toBe('Channel not implemented.');
+      const c = await db.salesContacts.find(x => x.id === contact.id);
+      expect(c!.status).toBe('ACTIVE'); // never finalized
+      const { attempts } = await listContactHistory(contact.id);
+      expect(attempts.length).toBe(1);
+      expect(attempts[0].outcome).toBe('REJECTED');
+      expect(attempts[0].outcome).not.toBe('CONNECTED');
+      expect(attempts[0].outcome).not.toBe('DELIVERED');
+      expect(attempts[0].providerId == null).toBe(true); // no fabricated provider id
+      // conversationId is the INTERNAL sales_conversations.id bound after dispatch —
+      // a legitimate internal id, never a fabricated/noop/provider id.
+      expect(attempts[0].conversationId ?? '').not.toMatch(/^noop-/);
+      expect(attempts[0].conversationId ?? '').not.toMatch(/provider/i);
+    });
+
+    it(`${channel}: refusal is permanent — no retry/backoff; repeated ticks are no-ops`, async () => {
+      resetTestChannel('success');
+      const p = await mkProspect();
+      const w = await mkChannelWorker(channel);
+      const { contact, task } = await enqueueOutreach(p.id, w.id);
+      const c0 = testChannelCalls();
+      await runDispatcherTick();
+      for (let i = 0; i < 4; i++) await runDispatcherTick();
+      expect(testChannelCalls()).toBe(c0);
+      const tasks = (await db.salesTasks.toJSON()).filter(x => x.payload?.contactId === contact.id);
+      expect(tasks.length).toBe(1); // no new task
+      expect(tasks[0].status).toBe('DEAD_LETTERED');
+      const { attempts } = await listContactHistory(contact.id);
+      expect(attempts.length).toBe(1); // no duplicate ledger
+    });
+  }
+
+  it('human gate + phone: park -> resolve -> resume -> channel gate refuses (noop never called)', async () => {
+    resetTestChannel('success');
+    const { ensureConversation, escalateConversation, closeConversation } = await import('../src/server/sales/conversations');
+    const p = await mkProspect();
+    const w = await mkChannelWorker('phone');
+    const { contact, task } = await enqueueOutreach(p.id, w.id);
+    const conv = await ensureConversation(contact);
+    await escalateConversation(conv.id, 'gate48');
+    const c0 = testChannelCalls();
+    await runDispatcherTick(); // parks (BLOCKED) before any channel logic
+    let t = await db.salesTasks.find(x => x.id === task!.id);
+    expect(t!.status).toBe('BLOCKED');
+    expect(testChannelCalls()).toBe(c0);
+    await closeConversation(conv.id); // human resolves -> QUEUED
+    t = await db.salesTasks.find(x => x.id === task!.id);
+    expect(t!.status).toBe('QUEUED');
+    await runDispatcherTick(); // resumes -> channel gate refuses
+    t = await db.salesTasks.find(x => x.id === task!.id);
+    expect(t!.status).toBe('DEAD_LETTERED');
+    expect(testChannelCalls()).toBe(c0); // noop NEVER called across the whole lifecycle
+    expect((await db.salesContacts.find(x => x.id === contact.id))!.status).toBe('ACTIVE');
+  });
+
+  it('noop regression: dispatch through the gate executes and succeeds exactly as before', async () => {
+    resetTestChannel('success');
+    const p = await mkProspect();
+    const w = await mkChannelWorker('noop');
+    const { contact, task } = await enqueueOutreach(p.id, w.id);
+    const c0 = testChannelCalls();
+    const tick = await runDispatcherTick();
+    expect(testChannelCalls()).toBe(c0 + 1); // noop executor invoked via the gate
+    expect(tick).toEqual({ claimed: 1, succeeded: 1, failed: 0 });
+    const t = await db.salesTasks.find(x => x.id === task!.id);
+    expect(t!.status).toBe('SUCCEEDED');
+    const { attempts } = await listContactHistory(contact.id);
+    expect(attempts[0].outcome).toBe('CONNECTED');
+    expect(attempts[0].providerId).toBe(`noop-provider-${task!.id}:1`); // existing noop id semantics preserved
+    expect((await db.salesContacts.find(x => x.id === contact.id))!.status).toBe('COMPLETED');
+  });
+});
+
