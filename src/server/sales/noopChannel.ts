@@ -1,4 +1,4 @@
-import { SalesWorker, SalesTask, ChannelResult, SalesChannelType } from '../../types';
+import { SalesWorker, SalesTask, SalesContact, ChannelResult, SalesChannelType } from '../../types';
 import { SalesProviderAdapter, checkProspectEligibilityHelper } from './providerContract';
 
 /**
@@ -95,8 +95,10 @@ export class NoopProviderAdapter implements SalesProviderAdapter {
     return checkProspectEligibilityHelper(prospectId);
   }
 
-  async execute(worker: SalesWorker, task: SalesTask, dispatch: ChannelDispatch): Promise<ChannelResult> {
-    const prospectId = dispatch.payload?.prospectId ?? task.payload?.prospectId;
+  async execute(worker: SalesWorker, task: SalesTask, dispatch: ChannelDispatch, contact?: SalesContact): Promise<ChannelResult> {
+    // Task 56: anchor eligibility on the AUTHORITATIVE contact when supplied;
+    // the payload id is only the test/direct-call fallback.
+    const prospectId = contact?.prospectId ?? dispatch.payload?.prospectId ?? task.payload?.prospectId;
     if (typeof prospectId === 'string' && prospectId) {
       const eligible = await this.checkEligibilityBeforeSend(prospectId);
       // Deterministic business refusal — permanent, no side effect executed.
@@ -127,7 +129,7 @@ const PROVIDER_ADAPTERS: Partial<Record<SalesChannelType, SalesProviderAdapter>>
  * only noop) executes through its registered SalesProviderAdapter, which
  * enforces the pre-send eligibility contract — the seam cannot be skipped.
  */
-export async function executeChannelDispatch(worker: SalesWorker, task: SalesTask, dispatch: ChannelDispatch): Promise<ChannelResult> {
+export async function executeChannelDispatch(worker: SalesWorker, task: SalesTask, dispatch: ChannelDispatch, contact?: SalesContact): Promise<ChannelResult> {
   if (!isChannelImplemented(worker?.channel)) {
     return { outcome: 'REJECTED', success: false, retryable: false, error: CHANNEL_NOT_IMPLEMENTED };
   }
@@ -135,5 +137,5 @@ export async function executeChannelDispatch(worker: SalesWorker, task: SalesTas
   if (!adapter) {
     return { outcome: 'REJECTED', success: false, retryable: false, error: CHANNEL_NOT_IMPLEMENTED };
   }
-  return adapter.execute(worker, task, dispatch);
+  return adapter.execute(worker, task, dispatch, contact);
 }

@@ -10,18 +10,20 @@ Outreach dispatch follows a deterministic preflight sequence:
 
 ```
 T0: claimNextTask (FOR UPDATE SKIP LOCKED → RUNNING)
-T1: assertProspectEligible / assertDiscoveryNotDismissed (preflight check)
-T2: ensureConversation (idempotent conversation binding)
-T3: executeChannelDispatch (channel gate — Task 48)
+T1: assertOutreachPayload + assertAutomatable (human gate)
+T2: load authoritative SalesContact
+    → assertProspectEligible / assertDiscoveryNotDismissed (preflight, contact.prospectId)
+T3: executeChannelDispatch → adapter.checkEligibilityBeforeSend (contact.prospectId)
 T4: External provider HTTP/network request (Twilio, Meta, etc.)
 T5: Provider accepts/executes external side-effect (SMS sent, call initiated)
 T6: Provider responds (or response is lost / timed out)
-T7: completeTask / failTask + recordAttempt (ledger write)
+T7: ensureConversation (post-dispatch, idempotent bind)
+T8: completeTask / failTask + recordAttempt (ledger write)
 ```
 
-The **TOCTOU window** exists between **T1** (when the database is read to verify prospect eligibility) and **T4** (when the external provider actually initiates the outreach).
+The **TOCTOU window** exists between **T2/T3** (eligibility reads anchored on the authoritative `SalesContact.prospectId`) and **T4** (the external provider transmission). Conversation binding (T7) now happens **after** the provider side effect — a refusal never fabricates a conversation row; refusal (pre-execution) vs success (binding) ordering verified.
 
-A prospect could become ineligible (e.g., marked `REJECTED`, `CONVERTED`, linked to a tenant `businessId`, or having their discovery source dismissed) after T1 but before T4.
+A prospect could become ineligible (e.g., marked `REJECTED`, `CONVERTED`, linked to a tenant `businessId`, or having their discovery source dismissed) between the last eligibility read and the external transmission. Eligibility is checked using authoritative server-side contact state; no DB transaction/lock is held across the external provider call; the provider-side final window remains inherently best-effort; provider-side idempotency/deduplication remains required for crash-after-side-effect scenarios. No atomicity is claimed across the external provider.
 
 ---
 

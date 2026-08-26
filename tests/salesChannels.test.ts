@@ -571,6 +571,83 @@ describe('Task 54 — provider eligibility contract', () => {
     expect(attempts.length).toBe(1);
     expect(attempts[0].outcome).toBe('REJECTED');
     expect(attempts[0].attemptNumber).toBe(1);
+    // Task 56: refusal-at-adapter leaves ZERO conversation rows for the contact.
+    const convs = (await db.salesConversations.toJSON()).filter((c: any) => c.contactId === contact.id);
+    expect(convs.length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 56 — authoritative anchor + post-dispatch binding
+// ---------------------------------------------------------------------------
+
+describe('Task 56 — authoritative contact anchor + clean refusal ordering', () => {
+  it('A. adapter anchors on contact.prospectId, ignoring a divergent payload id', async () => {
+    const { noopAdapter } = await import('../src/server/sales/noopChannel');
+    resetTestChannel('success');
+    // eligibleInPayload: payload ids a DIFFERENT eligible prospect; contact is REJECTED → adapter must refuse.
+    const pPayload = await mkProspect(); // stays eligible
+    const pContact = await mkProspect();
+    (pContact as any).status = 'REJECTED';
+    await db.prospects.update(pContact as any);
+    const w: any = await mkWorker();
+    const fakeContact: any = { id: 'sc-diverg', prospectId: pContact.id, channel: 'noop', status: 'ACTIVE' };
+    const t: any = { id: 'wtask-diverg', payload: { prospectId: pPayload.id, contactId: fakeContact.id } };
+    const before = testChannelCalls();
+    const res = await noopAdapter.execute(w, t, { attemptKey: t.id, payload: t.payload }, fakeContact);
+    expect(res.outcome).toBe('REJECTED');
+    // Conversation not created by adapter/dispatch path; extra hypotheses covered below.
+    expect(res.retryable).toBe(false);
+    expect(testChannelCalls()).toBe(before); // no side effect executed (contact-authoritative refusal)
+  });
+
+  it('A2. adapter anchors on contact.prospectId and executes when contact is eligible even if payload points at a REJECTED one', async () => {
+    const { noopAdapter } = await import('../src/server/sales/noopChannel');
+    resetTestChannel('success');
+    const pRejected = await mkProspect();
+    (pRejected as any).status = 'REJECTED';
+    await db.prospects.update(pRejected as any);
+    const pEligible = await mkProspect();
+    const w: any = await mkWorker();
+    const fakeContact: any = { id: 'sc-anchor', prospectId: pEligible.id, channel: 'noop', status: 'ACTIVE' };
+    const t: any = { id: 'wtask-anchor', payload: { prospectId: pRejected.id, contactId: fakeContact.id } };
+    const before = testChannelCalls();
+    const res = await noopAdapter.execute(w, t, { attemptKey: t.id, payload: t.payload }, fakeContact);
+    expect(res.outcome).toBe('CONNECTED'); // contact-authoritative ELIGIBLE → executes despite bad payload id
+    expect(testChannelCalls()).toBe(before + 1);
+  });
+
+  it('B. dispatcher refusal-at-adapter leaves ZERO conversation rows (full path)', async () => {
+    resetTestChannel('success');
+    const p = await mkProspect();
+    const w = await mkWorker();
+    const { contact, task } = await enqueueOutreach(p.id, w.id);
+    // Flip REJECTED through the tick path so adapter refuses (preflight may also catch).
+    const orig = db.prospects.find.bind(db.prospects);
+    let n = 0;
+    (db.prospects as any).find = async (pred: any) => {
+      n++;
+      const prospect: any = await orig(pred);
+      if (n >= 2 && prospect) return { ...prospect, status: 'REJECTED' }; // pass preflight, fail adapter
+      return prospect;
+    };
+    await runDispatcherTick();
+    (db.prospects as any).find = orig;
+    const convs = (await db.salesConversations.toJSON()).filter((c: any) => c.contactId === contact.id);
+    expect(convs.length).toBe(0); // ZERO conversation rows when adapter refuses
+  });
+
+  it('C. successful dispatch binds the conversation post-dispatch (ordering preserved)', async () => {
+    resetTestChannel('success-conv'); // provider returns a conversation id
+    const p = await mkProspect();
+    const w = await mkWorker();
+    const { contact, task } = await enqueueOutreach(p.id, w.id);
+    await runDispatcherTick();
+    const t: any = await db.salesTasks.find((x: any) => x.id === task!.id);
+    expect(t.status).toBe('SUCCEEDED');
+    const convs = (await db.salesConversations.toJSON()).filter((c: any) => c.contactId === contact.id);
+    expect(convs.length).toBe(1);
+    expect(convs[0].providerConversationId).toBe(`noop-conv-${task!.id}`);
   });
 });
 

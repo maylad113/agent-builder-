@@ -1,4 +1,4 @@
-import { SalesWorker, SalesTask, ChannelResult } from '../../types';
+import { SalesWorker, SalesTask, SalesContact, ChannelResult } from '../../types';
 import type { ChannelDispatch } from './noopChannel';
 import { assertProspectEligible, assertDiscoveryNotDismissed, isProspectIneligibleError } from './contacts';
 import { db } from '../db';
@@ -23,8 +23,10 @@ export interface ProviderEligibilityCheck {
    * Returns true if the prospect is still eligible, or false if they have become
    * REJECTED, CONVERTED, linked to a business tenant, or have a dismissed discovery source.
    *
-   * NOTE: This is NOT an atomic lock. It narrows the race window, but cannot eliminate
-   * a race where status changes while the HTTP packet is in flight.
+   * The caller MUST pass the AUTHORITATIVE contact-derived prospect id — never a
+   * client/payload-supplied one. NOTE: This is NOT an atomic lock. It narrows the
+   * race window, but cannot eliminate a race where status changes while the HTTP
+   * packet is in flight.
    */
   checkEligibilityBeforeSend(prospectId: string): Promise<boolean>;
 }
@@ -35,8 +37,11 @@ export interface SalesProviderAdapter extends ProviderEligibilityCheck {
   /**
    * Execute outreach through the external provider.
    * MUST use dispatch.attemptKey as the external idempotency/request key.
+   * `contact` (optional) is the AUTHORITATIVE server-loaded SalesContact; when
+   * present (outreach), eligibility MUST be checked against `contact.prospectId`,
+   * never `dispatch.payload.prospectId`.
    */
-  execute(worker: SalesWorker, task: SalesTask, dispatch: ChannelDispatch): Promise<ChannelResult>;
+  execute(worker: SalesWorker, task: SalesTask, dispatch: ChannelDispatch, contact?: SalesContact): Promise<ChannelResult>;
 }
 
 /**

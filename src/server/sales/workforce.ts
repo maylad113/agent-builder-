@@ -425,7 +425,6 @@ export async function runDispatcherTick(now: Date = new Date()): Promise<{ claim
             }).catch(() => {});
             continue;
           }
-          await ensureConversation(contact);
           await recordOrchestrationEvent({
             eventType: 'OUTREACH_ATTEMPTED',
             metadata: { jobId: task.id },
@@ -438,18 +437,24 @@ export async function runDispatcherTick(now: Date = new Date()): Promise<{ claim
         // attemptCount remains the per-attempt ledger/audit number (the key
         // and the attempt number are deliberately not collapsed).
         const dispatch: ChannelDispatch = { attemptKey: task.id, payload: task.payload };
+        // Load the AUTHORITATIVE contact once, before dispatch, so the adapter
+        // anchors eligibility on contact.prospectId (never the payload).
+        const contactForDispatch = isOutreach
+          ? await db.salesContacts.find(c => c.id === String(task.payload.contactId))
+          : undefined;
         // Channel-gated (Task 48): an unimplemented real channel returns a
         // structured PERMANENT refusal here and never reaches the noop executor.
-        const result = await executeChannelDispatch(worker, task, dispatch);
+        const result = await executeChannelDispatch(worker, task, dispatch, contactForDispatch);
         // Classification is authoritative from the structured outcome, not the
         // success boolean: ambiguous acceptance (TIMEOUT) MUST NOT complete
         // the task, the ledger, or the contact.
         const isSuccess = result.outcome === 'CONNECTED' || result.outcome === 'DELIVERED';
-        // Persist a provider-returned conversation id onto the contact's
-        // durable conversation (distinct from our internal id); internal id
-        // is what attempts reference.
+        // Bind the conversation whenever the provider actually EXECUTED the
+        // attempt (CONNECTED/DELIVERED/TIMEOUT/ERROR). A refusal (REJECTED)
+        // is a pre-execution safety refusal and never fabricates a row.
         let internalConversationId: string | undefined;
-        if (isOutreach) {
+        const executedAttempt = result.outcome !== 'REJECTED';
+        if (isOutreach && executedAttempt) {
           const contact = await db.salesContacts.find(c => c.id === String(task.payload.contactId));
           if (contact) {
             const conv = await ensureConversation(contact, result.conversationId);
