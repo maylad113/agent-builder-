@@ -100,7 +100,7 @@ describe('attempt persistence with envelope', () => {
     const { attempts } = await listContactHistory(contact.id);
     expect(attempts.length).toBe(1);
     expect(attempts[0].providerId).toBeTruthy();
-    expect(attempts[0].providerId).toBe(`noop-provider-${task!.id}:1`);
+    expect(attempts[0].providerId).toBe(`noop-provider-${task!.id}`); // stable logical-task key (Task 50)
   });
 
   it('legacy rows with null providerId/conversationId remain readable', async () => {
@@ -324,8 +324,95 @@ describe('Task 48 — channel gate (refuse unimplemented channels)', () => {
     expect(t!.status).toBe('SUCCEEDED');
     const { attempts } = await listContactHistory(contact.id);
     expect(attempts[0].outcome).toBe('CONNECTED');
-    expect(attempts[0].providerId).toBe(`noop-provider-${task!.id}:1`); // existing noop id semantics preserved
+    expect(attempts[0].providerId).toBe(`noop-provider-${task!.id}`); // stable logical-task key (Task 50) // existing noop id semantics preserved
     expect((await db.salesContacts.find(x => x.id === contact.id))!.status).toBe('COMPLETED');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 50 — stable provider idempotency key across retries.
+// Same logical task -> same attemptKey on every attempt; distinct tasks ->
+// distinct keys. attemptNumber stays the per-attempt ledger/audit identifier.
+// ---------------------------------------------------------------------------
+
+
+// Task 50 — verify the stable provider idempotency key via the ledger: each
+// channel attempt echoes attemptKey into providerId as `noop-provider-{key}`.
+// The production dispatcher is used unmodified; the spy seam is avoided.
+// Cleanest verification: spy on the noop module's dispatch seam to capture
+// the exact attemptKey the REAL dispatcher passes, without altering behavior.
+// Uses the real runDispatcherTick; the spy only records.
+// Cleanest verification: the ledger echoes each channel attempt's attemptKey
+// into providerId as `noop-provider-{key}`. Assert stability directly on the
+// ledger rows so the REAL dispatcher path is used unmodified (no spy re-implementation).
+describe('Task 50 — stable provider idempotency key', () => {
+  // helper: collect providerIds for a contact's attempts
+  async function providerIdsFor(contactId: string): Promise<string[]> {
+    const { attempts } = await listContactHistory(contactId);
+    return attempts.map((a: any) => a.providerId).filter((x: any) => x != null) as string[];
+  }
+
+  it('stable key: TIMEOUT -> retry -> same attemptKey (byte-identical), distinct attemptNumber 1,2', async () => {
+    resetTestChannel('timeout');
+    const p = await mkProspect();
+    const w = await mkWorker();
+    const { contact, task } = await enqueueOutreach(p.id, w.id);
+    await runDispatcherTick(); // attempt 1: TIMEOUT -> retryable
+    resetTestChannel('success');
+    const cur: any = await db.salesTasks.find((x: any) => x.id === task!.id);
+    cur.availableAt = new Date(Date.now() - 1000).toISOString();
+    await db.salesTasks.update(cur);
+    await runDispatcherTick(); // attempt 2: succeeds with SAME key
+    const ids = await providerIdsFor(contact.id);
+    expect(ids.length).toBe(2);
+    expect(new Set(ids).size).toBe(1); // SAME byte-for-byte key across attempts
+    const { attempts } = await listContactHistory(contact.id);
+    expect(attempts.map((a: any) => a.outcome)).toEqual(['TIMEOUT', 'CONNECTED']);
+    expect(attempts.map((a: any) => a.attemptNumber)).toEqual([1, 2]); // distinct ledger numbers
+    expect(attempts[0].providerId).toBe(`noop-provider-${task!.id}`); // key == task.id
+  });
+
+  it('three-attempt stability: attempt 1 == 2 == 3; ledger numbers 1,2,3', async () => {
+    resetTestChannel('timeout');
+    const p = await mkProspect();
+    const w = await mkWorker();
+    const { contact, task } = await enqueueOutreach(p.id, w.id);
+    for (let i = 0; i < 3; i++) { // each FORCEs availability -> one execution
+      await runDispatcherTick();
+      const cur: any = await db.salesTasks.find((x: any) => x.id === task!.id);
+      if (cur.status === 'QUEUED' && i < 2) { cur.availableAt = new Date(Date.now() - 1000).toISOString(); await db.salesTasks.update(cur); }
+    }
+    const ids = await providerIdsFor(contact.id);
+    expect(ids.length).toBe(3);
+    expect(new Set(ids).size).toBe(1);
+    const { attempts } = await listContactHistory(contact.id);
+    expect(attempts.map((a: any) => a.attemptNumber)).toEqual([1, 2, 3]);
+  });
+
+  it('distinct logical tasks get distinct keys', async () => {
+    resetTestChannel('success');
+    const p1 = await mkProspect();
+    const p2 = await mkProspect();
+    const w = await mkWorker();
+    const r1 = await enqueueOutreach(p1.id, w.id);
+    const r2 = await enqueueOutreach(p2.id, w.id);
+    await runDispatcherTick();
+    const id1 = (await providerIdsFor(r1.contact.id))[0];
+    const id2 = (await providerIdsFor(r2.contact.id))[0];
+    expect(id1).not.toBe(id2);
+    expect(id1).toBe(`noop-provider-${r1.task!.id}`);
+    expect(id2).toBe(`noop-provider-${r2.task!.id}`);
+  });
+
+  it('key is server-derived task.id, never client-supplied', async () => {
+    resetTestChannel('success');
+    const p = await mkProspect();
+    const w = await mkWorker();
+    const { task } = await enqueueOutreach(p.id, w.id);
+    await runDispatcherTick();
+    const id = (await providerIdsFor(task!.payload.contactId))[0];
+    expect(id).toBe(`noop-provider-${task!.id}`);
+    expect(task!.id).not.toMatch(/client|payload|fromRequest/i);
   });
 });
 

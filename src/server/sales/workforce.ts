@@ -426,9 +426,12 @@ export async function runDispatcherTick(now: Date = new Date()): Promise<{ claim
             summary: `sales worker ${worker.role} outreach attempt ${task.attemptCount}`
           }).catch(() => {});
         }
-        // Deterministic attempt-scoped idempotency key from authoritative
-        // server/task state. Client never sees/controls it.
-        const dispatch: ChannelDispatch = { attemptKey: `${task.id}:${task.attemptCount}`, payload: task.payload };
+        // Stable provider idempotency key (Task 50): task.id is the unique,
+        // server-derived logical-task identifier — IDENTICAL across retries,
+        // enabling provider-side deduplication. Client never supplies it.
+        // attemptCount remains the per-attempt ledger/audit number (the key
+        // and the attempt number are deliberately not collapsed).
+        const dispatch: ChannelDispatch = { attemptKey: task.id, payload: task.payload };
         // Channel-gated (Task 48): an unimplemented real channel returns a
         // structured PERMANENT refusal here and never reaches the noop executor.
         const result = await executeChannelDispatch(worker, task, dispatch);
